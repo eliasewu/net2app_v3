@@ -1,0 +1,591 @@
+#!/usr/bin/env node
+// NET2APP Hub - Production Server (Final Working Version)
+const express = require('express');
+const { Pool } = require('pg');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const cors = require('cors');
+const path = require('path');
+require('dotenv').config();
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+const JWT_SECRET = process.env.JWT_SECRET || 'net2app-hub-secret-key-2024';
+
+const pool = new Pool({
+  host: process.env.DB_HOST || 'localhost',
+  port: process.env.DB_PORT || 5432,
+  database: process.env.DB_NAME || 'net2app_hub',
+  user: process.env.DB_USER || 'net2app_user',
+  password: process.env.DB_PASS || 'Ariya@2024Net2App',
+});
+
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
+
+// ===================== AUTH MIDDLEWARE =====================
+const auth = (req, res, next) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'No token' });
+  try { 
+    req.user = jwt.verify(token, JWT_SECRET); 
+    next(); 
+  } catch(err) { 
+    res.status(401).json({ error: 'Invalid token' }); 
+  }
+};
+
+// ===================== HEALTH CHECK =====================
+app.get('/api/health', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT NOW()');
+    res.json({ success: true, status: 'healthy', database: 'connected', timestamp: result.rows[0].now });
+  } catch (error) {
+    res.status(500).json({ success: false, status: 'unhealthy', error: error.message });
+  }
+});
+
+// ===================== INTERNAL AUTH =====================
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    const r = await pool.query('SELECT * FROM users WHERE username=$1 AND is_active=true', [username]);
+    if (!r.rows.length) return res.status(401).json({ error: 'Invalid credentials' });
+    const user = r.rows[0];
+    const valid = await bcrypt.compare(password, user.password_hash);
+    if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+    await pool.query('UPDATE users SET last_login=NOW() WHERE id=$1', [user.id]);
+    const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET, { expiresIn: '24h' });
+    const { password_hash, ...safe } = user;
+    res.json({ success: true, token, user: safe });
+  } catch (e) { 
+    res.status(500).json({ error: e.message }); 
+  }
+});
+
+// ===================== CLIENTS API =====================
+app.get('/api/clients', auth, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT * FROM clients ORDER BY created_at DESC');
+    res.json({ success: true, data: r.rows });
+  } catch (e) { 
+    res.status(500).json({ error: e.message }); 
+  }
+});
+
+app.post('/api/clients', auth, async (req, res) => {
+  try {
+    const { client_code, company_name, email, smpp_username, smpp_password, billing_mode, currency, balance, credit_limit } = req.body;
+    const r = await pool.query(`INSERT INTO clients (client_code,company_name,email,smpp_username,smpp_password,billing_mode,currency,balance,credit_limit) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`, [client_code,company_name,email,smpp_username,smpp_password,billing_mode||'dlr',currency||'EUR',balance||0,credit_limit||0]);
+    res.json({ success: true, data: r.rows[0] });
+  } catch (e) { 
+    res.status(500).json({ error: e.message }); 
+  }
+});
+
+app.put('/api/clients/:id', auth, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const keys = Object.keys(req.body).filter(k => req.body[k] !== undefined);
+    if (keys.length === 0) return res.json({ success: true });
+    const sets = keys.map((k, i) => `${k}=$${i+1}`).join(',');
+    const vals = keys.map(k => req.body[k]);
+    await pool.query(`UPDATE clients SET ${sets}, updated_at=NOW() WHERE id=$${keys.length+1}`, [...vals, id]);
+    res.json({ success: true });
+  } catch (e) { 
+    res.status(500).json({ error: e.message }); 
+  }
+});
+
+app.delete('/api/clients/:id', auth, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM clients WHERE id=$1', [req.params.id]);
+    res.json({ success: true });
+  } catch (e) { 
+    res.status(500).json({ error: e.message }); 
+  }
+});
+
+// ===================== SUPPLIERS API =====================
+app.get('/api/suppliers', auth, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT * FROM suppliers ORDER BY created_at DESC');
+    res.json({ success: true, data: r.rows });
+  } catch (e) { 
+    res.status(500).json({ error: e.message }); 
+  }
+});
+
+app.put('/api/suppliers/:id', auth, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const keys = Object.keys(req.body).filter(k => req.body[k] !== undefined);
+    if (keys.length === 0) return res.json({ success: true });
+    const sets = keys.map((k, i) => `${k}=$${i+1}`).join(',');
+    const vals = keys.map(k => req.body[k]);
+    await pool.query(`UPDATE suppliers SET ${sets}, updated_at=NOW() WHERE id=$${keys.length+1}`, [...vals, id]);
+    res.json({ success: true });
+  } catch (e) { 
+    res.status(500).json({ error: e.message }); 
+  }
+});
+
+// ===================== BIND STATUS =====================
+app.get('/api/bind/status', auth, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT id,supplier_code,company_name,connection_type,bind_status,status FROM suppliers');
+    res.json({ success: true, data: r.rows });
+  } catch (e) { 
+    res.status(500).json({ error: e.message }); 
+  }
+});
+
+// ===================== RATES =====================
+app.get('/api/rates', auth, async (req, res) => {
+  try {
+    const { entity_type, entity_id } = req.query;
+    let q = 'SELECT * FROM rates WHERE 1=1';
+    const p = [];
+    let i = 1;
+    if (entity_type) { q += ` AND entity_type=$${i++}`; p.push(entity_type); }
+    if (entity_id) { q += ` AND entity_id=$${i++}`; p.push(entity_id); }
+    q += ' ORDER BY country, mcc, mnc';
+    const r = await pool.query(q, p);
+    res.json({ success: true, data: r.rows });
+  } catch (e) { 
+    res.status(500).json({ error: e.message }); 
+  }
+});
+
+app.post('/api/rates', auth, async (req, res) => {
+  try {
+    const { entity_type, entity_id, mcc, mnc, country, operator, rate } = req.body;
+    await pool.query("UPDATE rates SET is_active=false, effective_to=CURRENT_DATE WHERE entity_type=$1 AND entity_id=$2 AND mcc=$3 AND mnc=$4 AND is_active=true", [entity_type, entity_id, mcc, mnc]);
+    const r = await pool.query(`INSERT INTO rates (entity_type,entity_id,mcc,mnc,country,operator,rate,effective_from,version) VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8, CURRENT_DATE), (SELECT COALESCE(MAX(version),0)+1 FROM rates WHERE entity_type=$1 AND entity_id=$2 AND mcc=$3 AND mnc=$4)) RETURNING *`, [entity_type,entity_id,mcc,mnc,country,operator||'All',rate,req.body.effective_from]);
+    res.json({ success: true, data: r.rows[0] });
+  } catch (e) { 
+    res.status(500).json({ error: e.message }); 
+  }
+});
+
+// ===================== DASHBOARD STATS =====================
+app.get('/api/dashboard/stats', auth, async (req, res) => {
+  try {
+    const r = await pool.query(`SELECT 
+      (SELECT COUNT(*) FROM clients) as total_clients,
+      (SELECT COUNT(*) FROM clients WHERE status='active') as active_clients,
+      (SELECT COUNT(*) FROM suppliers) as total_suppliers,
+      (SELECT COUNT(*) FROM suppliers WHERE status='active') as active_suppliers,
+      (SELECT COUNT(*) FROM sms_logs WHERE submit_time::date=CURRENT_DATE) as today_sms,
+      (SELECT COUNT(*) FROM sms_logs WHERE submit_time::date=CURRENT_DATE AND status='delivered') as delivered_today
+    `);
+    res.json({ success: true, data: r.rows[0] });
+  } catch (e) { 
+    res.status(500).json({ error: e.message }); 
+  }
+});
+
+// ===================== SMS SEND =====================
+app.post('/api/sms/send', auth, async (req, res) => {
+  try {
+    const { client_id, destination, sender_id, message } = req.body;
+    const client = await pool.query('SELECT * FROM clients WHERE id=$1 AND status=$2', [client_id, 'active']);
+    if (!client.rows.length) return res.status(400).json({ error: 'Client not found' });
+    const c = client.rows[0];
+    const msgId = 'MSG' + Date.now() + Math.random().toString(36).substr(2, 6);
+    await pool.query(`INSERT INTO sms_logs (message_id,client_id,client_code,sender_id,destination,message,status,submit_time) VALUES ($1,$2,$3,$4,$5,$6,'submitted',NOW())`, [msgId, client_id, c.client_code, sender_id, destination, message]);
+    res.json({ success: true, message_id: msgId, status: 'submitted' });
+  } catch (e) { 
+    res.status(500).json({ error: e.message }); 
+  }
+});
+
+// ===================== SMS LOGS =====================
+app.post('/api/sms/logs', auth, async (req, res) => {
+  try {
+    const { client_id, status, limit = 100, offset = 0 } = req.body;
+    let query = 'SELECT * FROM sms_logs WHERE 1=1';
+    const params = [];
+    let paramCount = 1;
+    if (client_id) {
+      params.push(client_id);
+      query += ` AND client_id = $${paramCount++}`;
+    }
+    if (status) {
+      params.push(status);
+      query += ` AND status = $${paramCount++}`;
+    }
+    params.push(limit, offset);
+    query += ` ORDER BY submit_time DESC LIMIT $${paramCount++} OFFSET $${paramCount++}`;
+    const r = await pool.query(query, params);
+    res.json({ success: true, data: r.rows });
+  } catch (e) { 
+    res.status(500).json({ error: e.message }); 
+  }
+});
+
+// ===================== EXTERNAL API v1 =====================
+app.post('/api/v1/sms/send', async (req, res) => {
+  try {
+    const { username, password, to, from, text } = req.body;
+    if (!username || !password) return res.status(401).json({ success: false, error: 'Authentication required' });
+    const client = await pool.query('SELECT * FROM clients WHERE smpp_username=$1 AND status=$2', [username, 'active']);
+    if (!client.rows.length) return res.status(401).json({ success: false, error: 'Invalid credentials' });
+    const c = client.rows[0];
+    if (c.smpp_password !== password) return res.status(401).json({ success: false, error: 'Invalid password' });
+    const msgId = 'MSG' + Date.now() + Math.random().toString(36).substr(2, 6);
+    await pool.query(`INSERT INTO sms_logs (message_id,client_id,client_code,sender_id,destination,message,status,submit_time) VALUES ($1,$2,$3,$4,$5,$6,'submitted',NOW())`, [msgId, c.id, c.client_code, from, to, text]);
+    res.json({ success: true, message_id: msgId, status: 'submitted' });
+  } catch (e) { 
+    res.status(500).json({ success: false, error: e.message }); 
+  }
+});
+
+app.get('/api/v1/account/balance', async (req, res) => {
+  try {
+    const { username, password } = req.query;
+    if (!username || !password) return res.status(401).json({ success: false, error: 'Authentication required' });
+    const client = await pool.query('SELECT * FROM clients WHERE smpp_username=$1 AND smpp_password=$2 AND status=$3', [username, password, 'active']);
+    if (!client.rows.length) return res.status(401).json({ success: false, error: 'Invalid credentials' });
+    const c = client.rows[0];
+    res.json({ success: true, data: { balance: parseFloat(c.balance), credit_limit: parseFloat(c.credit_limit), available: parseFloat(c.balance) + parseFloat(c.credit_limit), currency: c.currency } });
+  } catch (e) { 
+    res.status(500).json({ success: false, error: e.message }); 
+  }
+});
+
+// ===================== SERVE STATIC FILES =====================
+// Serve static files from dist directory
+app.use(express.static(path.join(__dirname, 'dist')));
+
+// Catch-all route to serve index.html for client-side routing
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api')) {
+    return res.status(404).json({ error: 'API endpoint not found' });
+  }
+  res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+});
+
+// Start server
+app.listen(PORT, '0.0.0.0', () => {
+  console.log('\x1b[32m%s\x1b[0m', '✅ NET2APP Hub running successfully!');
+  console.log('\x1b[36m%s\x1b[0m', `📡 Port: ${PORT}`);
+  console.log('\x1b[36m%s\x1b[0m', `🗄️  Database: ${pool.options.database}`);
+  console.log('\x1b[36m%s\x1b[0m', `🌐 Web UI: http://146.59.47.22:${PORT}`);
+  console.log('\x1b[36m%s\x1b[0m', `🔗 API: http://146.59.47.22:${PORT}/api/health`);
+  console.log('\x1b[33m%s\x1b[0m', '\n🔐 Login Credentials:');
+  console.log('\x1b[33m%s\x1b[0m', `   Username: admin`);
+  console.log('\x1b[33m%s\x1b[0m', `   Password: Ariya@2024Admin`);
+  console.log('\x1b[32m%s\x1b[0m', '\n✨ Ready to accept connections!\n');
+});
+
+// ===================== SMPP SERVER =====================
+try {
+  const smppServer = new SmppServer();
+  smppServer.start();
+} catch (err) {
+}
+
+// ===================== SMS INBOX (MO) API =====================
+// Receive incoming SMS (from external)
+app.post('/api/sms/inbox/receive', async (req, res) => {
+  try {
+    const { from_number, to_number, message, client_id, smsc_reference } = req.body;
+    
+    const result = await pool.query(
+      `INSERT INTO sms_inbox (message_id, from_number, to_number, message, client_id, smsc_reference, received_at, status)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW(), 'received')
+       RETURNING *`,
+      ['MO_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4), 
+       from_number, to_number, message, client_id, smsc_reference]
+    );
+    
+    res.json({ success: true, data: result.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Get SMS Inbox (MO messages)
+app.get('/api/sms/inbox', auth, async (req, res) => {
+  try {
+    const { client_id, status, limit = 100, offset = 0 } = req.query;
+    let query = 'SELECT * FROM sms_inbox WHERE 1=1';
+    const params = [];
+    let paramCount = 1;
+    
+    if (client_id) {
+      params.push(client_id);
+      query += ` AND client_id = $${paramCount++}`;
+    }
+    if (status) {
+      params.push(status);
+      query += ` AND status = $${paramCount++}`;
+    }
+    
+    params.push(limit, offset);
+    query += ` ORDER BY received_at DESC LIMIT $${paramCount++} OFFSET $${paramCount++}`;
+    
+    const result = await pool.query(query, params);
+    res.json({ success: true, data: result.rows, total: result.rowCount });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Get single SMS Inbox message
+app.get('/api/sms/inbox/:id', auth, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM sms_inbox WHERE id = $1', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Message not found' });
+    res.json({ success: true, data: result.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Mark SMS as processed
+app.put('/api/sms/inbox/:id/process', auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'UPDATE sms_inbox SET processed = true, status = $1 WHERE id = $2 RETURNING *',
+      ['processed', req.params.id]
+    );
+    res.json({ success: true, data: result.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Delete SMS from inbox
+app.delete('/api/sms/inbox/:id', auth, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM sms_inbox WHERE id = $1', [req.params.id]);
+    res.json({ success: true, message: 'Message deleted' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===================== VOICE OTP API =====================
+// Send Voice OTP
+app.post('/api/voice-otp/send', auth, async (req, res) => {
+  try {
+    const { destination, language = 'en', otp_code, client_id } = req.body;
+    const finalOtp = otp_code || Math.floor(100000 + Math.random() * 900000).toString();
+    
+    const result = await pool.query(
+      `INSERT INTO voice_otp_logs (call_id, destination, otp_code, language, client_id, status, created_at)
+       VALUES ($1, $2, $3, $4, $5, 'initiated', NOW())
+       RETURNING *`,
+      ['VOICE_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4), 
+       destination, finalOtp, language, client_id]
+    );
+    
+    res.json({ 
+      success: true, 
+      data: result.rows[0],
+      message: `OTP ${finalOtp} sent to ${destination}`
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Get Voice OTP logs
+app.get('/api/voice-otp/logs', auth, async (req, res) => {
+  try {
+    const { limit = 100, offset = 0 } = req.query;
+    const result = await pool.query(
+      'SELECT * FROM voice_otp_logs ORDER BY created_at DESC LIMIT $1 OFFSET $2',
+      [limit, offset]
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Verify OTP code
+app.post('/api/voice-otp/verify', auth, async (req, res) => {
+  try {
+    const { call_id, otp_code } = req.body;
+    
+    const result = await pool.query(
+      'SELECT * FROM voice_otp_logs WHERE call_id = $1 AND otp_code = $2',
+      [call_id, otp_code]
+    );
+    
+    if (result.rows.length > 0) {
+      await pool.query(
+        'UPDATE voice_otp_logs SET status = $1, completed_at = NOW() WHERE call_id = $2',
+        ['verified', call_id]
+      );
+      res.json({ success: true, message: 'OTP verified successfully' });
+    } else {
+      res.status(400).json({ success: false, error: 'Invalid OTP' });
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===================== TENANT MONITOR API =====================
+// Get all tenants
+app.get('/api/tenants', auth, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM tenants ORDER BY id');
+    res.json({ success: true, data: result.rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Get tenant by ID
+app.get('/api/tenants/:id', auth, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM tenants WHERE id = $1', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+    res.json({ success: true, data: result.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Create tenant
+app.post('/api/tenants', auth, async (req, res) => {
+  try {
+    const { name, code, status, features, limits } = req.body;
+    const result = await pool.query(
+      `INSERT INTO tenants (name, code, status, features, limits, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       RETURNING *`,
+      [name, code, status || 'active', features || '{}', limits || '{}']
+    );
+    res.json({ success: true, data: result.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Update tenant
+app.put('/api/tenants/:id', auth, async (req, res) => {
+  try {
+    const { name, status, features, limits } = req.body;
+    const result = await pool.query(
+      `UPDATE tenants SET name = COALESCE($1, name), status = COALESCE($2, status),
+       features = COALESCE($3, features), limits = COALESCE($4, limits), updated_at = NOW()
+       WHERE id = $5 RETURNING *`,
+      [name, status, features, limits, req.params.id]
+    );
+    res.json({ success: true, data: result.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Get tenant usage stats
+app.get('/api/tenants/:id/stats', auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT t.*, 
+       (SELECT COUNT(*) FROM clients WHERE clients.tenant_id = t.id) as total_clients,
+       (SELECT COUNT(*) FROM sms_logs WHERE sms_logs.submit_time::date = CURRENT_DATE) as today_sms
+       FROM tenants t WHERE t.id = $1`,
+      [req.params.id]
+    );
+    res.json({ success: true, data: result.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===================== USER MANAGEMENT API (Extended) =====================
+// Get all users with details
+app.get('/api/users', auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, username, email, role, permissions, name, is_active, last_login, created_at 
+       FROM users ORDER BY id`
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Get user by ID
+app.get('/api/users/:id', auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, username, email, role, permissions, name, is_active, last_login, created_at 
+       FROM users WHERE id = $1`,
+      [req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    res.json({ success: true, data: result.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Create user
+app.post('/api/users', auth, async (req, res) => {
+  try {
+    const { username, password, email, role, permissions, name } = req.body;
+    const hashedPassword = await bcrypt.hash(password, 10);
+    
+    const result = await pool.query(
+      `INSERT INTO users (username, password_hash, email, role, permissions, name, is_active, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, true, NOW())
+       RETURNING id, username, email, role, name, is_active`,
+      [username, hashedPassword, email, role || 'agent', permissions || '{}', name]
+    );
+    res.json({ success: true, data: result.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Update user
+app.put('/api/users/:id', auth, async (req, res) => {
+  try {
+    const { email, role, permissions, name, is_active } = req.body;
+    const result = await pool.query(
+      `UPDATE users SET email = COALESCE($1, email), role = COALESCE($2, role),
+       permissions = COALESCE($3, permissions), name = COALESCE($4, name),
+       is_active = COALESCE($5, is_active), updated_at = NOW()
+       WHERE id = $6 RETURNING id, username, email, role, name, is_active`,
+      [email, role, permissions, name, is_active, req.params.id]
+    );
+    res.json({ success: true, data: result.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Delete user
+app.delete('/api/users/:id', auth, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM users WHERE id = $1', [req.params.id]);
+    res.json({ success: true, message: 'User deleted' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Reset user password
+app.post('/api/users/:id/reset-password', auth, async (req, res) => {
+  try {
+    const { new_password } = req.body;
+    const hashedPassword = await bcrypt.hash(new_password, 10);
+    
+    await pool.query(
+      'UPDATE users SET password_hash = $1, last_password_change = NOW() WHERE id = $2',
+      [hashedPassword, req.params.id]
+    );
+    res.json({ success: true, message: 'Password reset successfully' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});

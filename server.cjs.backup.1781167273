@@ -1,0 +1,123 @@
+const express = require('express');
+const cors = require('cors');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcrypt');
+const { Pool } = require('pg');
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+app.use(cors());
+app.use(express.json());
+
+const pool = new Pool({
+    host: process.env.DB_HOST || 'localhost',
+    port: process.env.DB_PORT || 5432,
+    database: process.env.DB_NAME || 'net2app_hub',
+    user: process.env.DB_USER || 'net2app_user',
+    password: process.env.DB_PASS || 'Ariya@2024Net2App',
+});
+
+const auth = async (req, res, next) => {
+    try {
+        const token = req.headers.authorization?.split(' ')[1];
+        if (!token) return res.status(401).json({ error: 'No token provided' });
+        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'net2app-hub-secret-key-2024');
+        req.user = decoded;
+        next();
+    } catch (error) {
+        return res.status(401).json({ error: 'Invalid token' });
+    }
+};
+
+// Login
+app.post('/api/auth/login', async (req, res) => {
+    try {
+        const { username, password } = req.body;
+        const result = await pool.query('SELECT * FROM users WHERE username = $1 OR email = $1', [username]);
+        if (result.rows.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
+        const user = result.rows[0];
+        const validPassword = await bcrypt.compare(password, user.password_hash);
+        if (!validPassword) return res.status(401).json({ error: 'Invalid credentials' });
+        const token = jwt.sign(
+            { id: user.id, username: user.username, role: user.role },
+            process.env.JWT_SECRET || 'net2app-hub-secret-key-2024',
+            { expiresIn: '24h' }
+        );
+        res.json({ success: true, token, user: { id: user.id, username: user.username, email: user.email, role: user.role, is_active: user.is_active } });
+    } catch (error) {
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Get all clients
+app.get('/api/clients', auth, async (req, res) => {
+    try {
+        const { client_code } = req.query;
+        let query = 'SELECT * FROM clients';
+        let params = [];
+        if (client_code) {
+            query += ' WHERE client_code = $1';
+            params.push(client_code);
+        }
+        query += ' ORDER BY id';
+        const result = await pool.query(query, params);
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Create client
+app.post('/api/clients', auth, async (req, res) => {
+    try {
+        const { client_code, company_name, contact_person, email, phone, address, country, smpp_username, smpp_password, status, routing_plan_id, max_tps, currency, credit_limit, balance } = req.body;
+        const result = await pool.query(
+            `INSERT INTO clients (client_code, company_name, contact_person, email, phone, address, country, smpp_username, smpp_password, status, routing_plan_id, max_tps, currency, credit_limit, balance, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW(), NOW()) RETURNING *`,
+            [client_code, company_name, contact_person, email, phone, address, country, smpp_username, smpp_password, status || 'active', routing_plan_id, max_tps || 100, currency || 'USD', credit_limit || 0, balance || 0]
+        );
+        res.json({ success: true, data: result.rows[0] });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Update client
+app.put('/api/clients/:id', auth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { client_code, company_name, contact_person, email, phone, address, country, smpp_username, smpp_password, status, routing_plan_id, max_tps, currency, credit_limit, balance } = req.body;
+        const result = await pool.query(
+            `UPDATE clients SET client_code = COALESCE($1, client_code), company_name = COALESCE($2, company_name), contact_person = COALESCE($3, contact_person), email = COALESCE($4, email), phone = COALESCE($5, phone), address = COALESCE($6, address), country = COALESCE($7, country), smpp_username = COALESCE($8, smpp_username), smpp_password = COALESCE($9, smpp_password), status = COALESCE($10, status), routing_plan_id = COALESCE($11, routing_plan_id), max_tps = COALESCE($12, max_tps), currency = COALESCE($13, currency), credit_limit = COALESCE($14, credit_limit), balance = COALESCE($15, balance), updated_at = NOW() WHERE id = $16 RETURNING *`,
+            [client_code, company_name, contact_person, email, phone, address, country, smpp_username, smpp_password, status, routing_plan_id, max_tps, currency, credit_limit, balance, id]
+        );
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Client not found' });
+        res.json({ success: true, data: result.rows[0] });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// DELETE client endpoint
+app.delete('/api/clients/:id', auth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const checkResult = await pool.query('SELECT id, client_code FROM clients WHERE id = $1', [id]);
+        if (checkResult.rows.length === 0) return res.status(404).json({ error: 'Client not found' });
+        const deleteResult = await pool.query('DELETE FROM clients WHERE id = $1 RETURNING client_code', [id]);
+        res.json({ success: true, message: 'Client deleted successfully', client_code: deleteResult.rows[0].client_code });
+    } catch (error) {
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Health check
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on port ${PORT}`);
+});
+
+module.exports = app;

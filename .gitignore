@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+*.log
+.DS_Store
+*.sqlite
+*.backup
+*.tar.gz
+server.log
