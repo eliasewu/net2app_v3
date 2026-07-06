@@ -441,10 +441,11 @@ app.get('/api/rates/:id', auth, async (req, res) => {
 
 app.post('/api/rates', auth, async (req, res) => {
     try {
-        const { entity_id, mcc, prefix, rate, currency, rate_type, is_active } = req.body;
+        const { entity_type, entity_id, mcc, mnc, country, operator, rate, currency, effective_from, is_active } = req.body;
         const result = await pool.query(
-            `INSERT INTO rates (entity_id, mcc, prefix, rate, currency, rate_type, is_active, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW()) RETURNING *`,
-            [entity_id, mcc, prefix, rate, currency, rate_type, is_active !== false]
+            `INSERT INTO rates (entity_type, entity_id, mcc, mnc, country, operator, rate, currency, effective_from, is_active, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW()) RETURNING *`,
+            [entity_type || 'client', entity_id || '0', mcc || '', mnc || '*', country || '', operator || 'All', rate || 0, currency || 'EUR', effective_from || new Date().toISOString().split('T')[0], is_active !== false]
         );
         res.json({ success: true, data: result.rows[0] });
     } catch (error) {
@@ -455,10 +456,17 @@ app.post('/api/rates', auth, async (req, res) => {
 app.put('/api/rates/:id', auth, async (req, res) => {
     try {
         const { id } = req.params;
-        const { rate, currency, is_active } = req.body;
+        const fields = req.body;
+        const allowed = ['entity_type','entity_id','mcc','mnc','country','operator','rate','currency','effective_from','effective_to','is_active'];
+        const setParts = []; const values = []; let idx = 1;
+        for (const key of allowed) {
+            if (fields[key] !== undefined) { setParts.push(`${key} = $${idx++}`); values.push(fields[key]); }
+        }
+        if (setParts.length === 0) return res.status(400).json({ error: 'No fields to update' });
+        values.push(id);
         const result = await pool.query(
-            `UPDATE rates SET rate = COALESCE($1, rate), currency = COALESCE($2, currency), is_active = COALESCE($3, is_active), updated_at = NOW() WHERE id = $4 RETURNING *`,
-            [rate, currency, is_active, id]
+            `UPDATE rates SET ${setParts.join(', ')} WHERE id = $${values.length} RETURNING *`,
+            values
         );
         if (result.rows.length === 0) return res.status(404).json({ error: 'Rate not found' });
         res.json({ success: true, data: result.rows[0] });

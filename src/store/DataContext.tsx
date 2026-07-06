@@ -17,7 +17,7 @@ interface DataContextType {
   addTrunk:(t:Omit<Trunk,'id'|'created_at'>)=>void; updateTrunk:(id:string,t:Partial<Trunk>)=>void; deleteTrunk:(id:string)=>void;
   addRoute:(r:Omit<Route,'id'|'created_at'>)=>void; updateRoute:(id:string,r:Partial<Route>)=>void; deleteRoute:(id:string)=>void;
   addRoutePlan:(p:Omit<RoutePlan,'id'|'created_at'>)=>void; updateRoutePlan:(id:string,p:Partial<RoutePlan>)=>void; deleteRoutePlan:(id:string)=>void;
-  addRate:(r:Omit<Rate,'id'>)=>void; updateRate:(id:string,r:Partial<Rate>)=>void; deleteRate:(id:string)=>void;
+  addRate:(r:Omit<Rate,'id'>)=>Promise<void>; updateRate:(id:string,r:Partial<Rate>)=>Promise<void>; deleteRate:(id:string)=>Promise<void>;
   addMCCMNC:(m:Omit<MCCMNC,'id'>)=>void; updateMCCMNC:(id:string,m:Partial<MCCMNC>)=>void; deleteMCCMNC:(id:string)=>void;
   addInvoice:(i:Omit<Invoice,'id'|'created_at'>)=>void; updateInvoice:(id:string,i:Partial<Invoice>)=>void;
   addPayment:(p:Omit<Payment,'id'|'created_at'>)=>void;
@@ -165,9 +165,21 @@ export const DataProvider:React.FC<{children:ReactNode}> = ({children}) => {
   const deleteRoutePlan=useCallback((id:string)=>{setRoutePlans(prev=>{const n=prev.filter(x=>x.id!==id);return n;});},[]);
 
   // Rates
-  const addRate=useCallback((r:Omit<Rate,'id'>)=>{setRates(p=>{const n=[...p,{...r,id:gid()}];return n;});},[]);
-  const updateRate=useCallback((id:string,r:Partial<Rate>)=>{setRates(p=>{const n=p.map(x=>x.id===id?{...x,...r}:x);return n;});},[]);
-  const deleteRate=useCallback((id:string)=>{setRates(p=>{const n=p.filter(x=>x.id!==id);return n;});},[]);
+  const addRate=useCallback(async (r:Omit<Rate,'id'>) => {
+    const res: any = await api.post('/rates', r);
+    if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to create rate');
+    setRates(p=>{const n=[...p,res.data.data];return n;});
+  },[]);
+  const updateRate=useCallback(async (id:string,r:Partial<Rate>) => {
+    const res: any = await api.put(`/rates/${id}`, r);
+    if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to update rate');
+    setRates(p=>{const n=p.map(x=>x.id===id?res.data.data:x);return n;});
+  },[]);
+  const deleteRate=useCallback(async (id:string) => {
+    const res: any = await api.delete(`/rates/${id}`);
+    if (!res.success) throw new Error(res.error || 'Failed to delete rate');
+    setRates(p=>{const n=p.filter(x=>x.id!==id);return n;});
+  },[]);
 
   // MCCMNC
   const addMCCMNC=useCallback((m:Omit<MCCMNC,'id'>)=>{setMCCMNC(p=>{const n=[...p,{...m,id:gid()}];return n;});},[]);
