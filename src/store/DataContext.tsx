@@ -1,6 +1,7 @@
-import React, { createContext, useContext, useState, useCallback, ReactNode } from 'react';
+import React, { createContext, useContext, useState, useCallback, useEffect, ReactNode } from 'react';
 import { Client, Supplier, Trunk, Route, RoutePlan, Rate, MCCMNC, Invoice, Payment, SMSLog, EmailTemplate, OTTDevice, APIConnector, User, DashboardStats, Notification, Campaign, Translation, VoiceOTPConfig } from '../types';
 import { mockUsers, hourlyTrafficData, dailyRevenueData, topDestinations } from './mockData';
+import { clientsApi, suppliersApi, routingApi } from '../services/api';
 
 // Database persistence — localStorage keys (PostgreSQL via API in production)
 const DB = {
@@ -22,8 +23,8 @@ interface DataContextType {
   emailTemplates: EmailTemplate[]; notifications: Notification[]; campaigns: Campaign[];
   translations: Translation[]; voiceOTPConfigs: VoiceOTPConfig[];
   dashboardStats: DashboardStats; hourlyTraffic: typeof hourlyTrafficData; dailyRevenue: typeof dailyRevenueData; topDest: typeof topDestinations;
-  addClient:(c:Omit<Client,'id'|'created_at'|'updated_at'>)=>void; updateClient:(id:string,c:Partial<Client>)=>void; deleteClient:(id:string)=>void;
-  addSupplier:(s:Omit<Supplier,'id'|'created_at'|'updated_at'>)=>void; updateSupplier:(id:string,s:Partial<Supplier>)=>void; deleteSupplier:(id:string)=>void;
+  addClient:(c:Omit<Client,'id'|'created_at'|'updated_at'>)=>Promise<void>; updateClient:(id:string,c:Partial<Client>)=>Promise<void>; deleteClient:(id:string)=>Promise<void>;
+  addSupplier:(s:Omit<Supplier,'id'|'created_at'|'updated_at'>)=>Promise<void>; updateSupplier:(id:string,s:Partial<Supplier>)=>Promise<void>; deleteSupplier:(id:string)=>Promise<void>;
   addSMSLog:(log:Omit<SMSLog,'id'|'created_at'|'submit_time'>)=>void;
   addTrunk:(t:Omit<Trunk,'id'|'created_at'>)=>void; updateTrunk:(id:string,t:Partial<Trunk>)=>void; deleteTrunk:(id:string)=>void;
   addRoute:(r:Omit<Route,'id'|'created_at'>)=>void; updateRoute:(id:string,r:Partial<Route>)=>void; deleteRoute:(id:string)=>void;
@@ -66,15 +67,83 @@ export const DataProvider:React.FC<{children:ReactNode}> = ({children}) => {
   const [smtpConfig, setSMTPConfig] = useState<any>(()=>load(DB.smtp_config,{host:'smtp.gmail.com',port:587,encryption:'tls'}));
   const [emailTemplates, setEmailTemplates] = useState<EmailTemplate[]>(()=>load(DB.email_templates,[]));
 
-  // Client CRUD — persist to DB
-  const addClient=useCallback((c:Omit<Client,'id'|'created_at'|'updated_at'>)=>{setClients(p=>{const n=[...p,{...c,id:gid(),created_at:nw(),updated_at:nw()}];save(DB.clients,n);return n;});},[]);
-  const updateClient=useCallback((id:string,c:Partial<Client>)=>{setClients(p=>{const n=p.map(x=>x.id===id?{...x,...c,updated_at:nw()}:x);save(DB.clients,n);return n;});},[]);
-  const deleteClient=useCallback((id:string)=>{setClients(p=>{const n=p.filter(x=>x.id!==id);save(DB.clients,n);return n;});},[]);
+  // ========== Fetch real data from PostgreSQL API on mount ==========
+  useEffect(() => {
+    const fetchAll = async () => {
+      try {
+        const [clientsRes, suppliersRes, trunksRes, routesRes, plansRes] = await Promise.all([
+          clientsApi.getAll(),
+          suppliersApi.getAll(),
+          routingApi.getTrunks(),
+          routingApi.getRoutes(),
+          routingApi.getRoutePlans(),
+        ]);
+        const cd: any = clientsRes.data;
+        const sd: any = suppliersRes.data;
+        const td: any = trunksRes.data;
+        const rd: any = routesRes.data;
+        const pd: any = plansRes.data;
+        if (clientsRes.success && cd?.data) {
+          setClients(cd.data); save(DB.clients, cd.data);
+        }
+        if (suppliersRes.success && sd?.data) {
+          setSuppliers(sd.data); save(DB.suppliers, sd.data);
+        }
+        if (trunksRes.success && td?.data) {
+          setTrunks(td.data); save(DB.trunks, td.data);
+        }
+        if (routesRes.success && rd?.data) {
+          setRoutes(rd.data); save(DB.routes, rd.data);
+        }
+        if (plansRes.success && pd?.data) {
+          setRoutePlans(pd.data); save(DB.route_plans, pd.data);
+        }
+      } catch (e) {
+        console.warn('[DataContext] API fetch failed, using localStorage cache:', e);
+      }
+    };
+    fetchAll();
+  }, []);
 
-  // Supplier CRUD
-  const addSupplier=useCallback((s:Omit<Supplier,'id'|'created_at'|'updated_at'>)=>{setSuppliers(p=>{const n=[...p,{...s,id:gid(),created_at:nw(),updated_at:nw()}];save(DB.suppliers,n);return n;});},[]);
-  const updateSupplier=useCallback((id:string,s:Partial<Supplier>)=>{setSuppliers(p=>{const n=p.map(x=>x.id===id?{...x,...s,updated_at:nw()}:x);save(DB.suppliers,n);return n;});},[]);
-  const deleteSupplier=useCallback((id:string)=>{setSuppliers(p=>{const n=p.filter(x=>x.id!==id);save(DB.suppliers,n);return n;});},[]);
+  // Client CRUD — call API + update local cache
+  const addClient=useCallback(async (c:Omit<Client,'id'|'created_at'|'updated_at'>) => {
+    const res = await clientsApi.create(c);
+    if (res.success && res.data?.data) {
+      setClients(p => { const n = [...p, res.data.data]; save(DB.clients, n); return n; });
+    }
+  },[]);
+  const updateClient=useCallback(async (id:string,c:Partial<Client>) => {
+    const res = await clientsApi.update(id, c);
+    if (res.success && res.data?.data) {
+      setClients(p => { const n = p.map(x => x.id === id ? res.data.data : x); save(DB.clients, n); return n; });
+    }
+  },[]);
+  const deleteClient=useCallback(async (id:string) => {
+    const res = await clientsApi.delete(id);
+    if (res.success) {
+      setClients(p => { const n = p.filter(x => x.id !== id); save(DB.clients, n); return n; });
+    }
+  },[]);
+
+  // Supplier CRUD — call API + update local cache
+  const addSupplier=useCallback(async (s:Omit<Supplier,'id'|'created_at'|'updated_at'>) => {
+    const res = await suppliersApi.create(s);
+    if (res.success && res.data?.data) {
+      setSuppliers(p => { const n = [...p, res.data.data]; save(DB.suppliers, n); return n; });
+    }
+  },[]);
+  const updateSupplier=useCallback(async (id:string,s:Partial<Supplier>) => {
+    const res = await suppliersApi.update(id, s);
+    if (res.success && res.data?.data) {
+      setSuppliers(p => { const n = p.map(x => x.id === id ? res.data.data : x); save(DB.suppliers, n); return n; });
+    }
+  },[]);
+  const deleteSupplier=useCallback(async (id:string) => {
+    const res = await suppliersApi.delete(id);
+    if (res.success) {
+      setSuppliers(p => { const n = p.filter(x => x.id !== id); save(DB.suppliers, n); return n; });
+    }
+  },[]);
 
   // SMS Logs
   const addSMSLog=useCallback((log:Omit<SMSLog,'id'|'created_at'|'submit_time'>)=>{const nl:SMSLog={...log,id:gid(),submit_time:nw(),created_at:nw(),supplier_id:log.supplier_id??null,supplier_code:log.supplier_code??null,dlr_status:log.dlr_status??null,dlr_timestamp:log.dlr_timestamp??null,delivery_time:log.delivery_time??null,error_code:log.error_code??null,error_message:log.error_message??null,route_name:log.route_name??null,trunk_name:log.trunk_name??null};setSMSLogs(p=>{const n=[nl,...p];save(DB.sms_logs,n);return n;});},[]);
