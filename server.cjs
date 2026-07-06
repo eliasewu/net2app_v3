@@ -499,6 +499,56 @@ app.post('/api/sms/logs', auth, async (req, res) => {
     }
 });
 
+// ==================== INVOICES ====================
+app.get('/api/invoices', auth, async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM invoices ORDER BY id DESC LIMIT 500');
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ==================== PAYMENTS ====================
+app.get('/api/payments', auth, async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM payments ORDER BY id DESC LIMIT 500');
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ==================== CAMPAIGNS ====================
+app.get('/api/campaigns', auth, async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM campaigns ORDER BY id DESC LIMIT 500');
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ==================== TRANSLATIONS ====================
+app.get('/api/translations', auth, async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM translations ORDER BY id DESC LIMIT 500');
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ==================== MCCMNC ====================
+app.get('/api/mccmnc', auth, async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM mccmnc ORDER BY id LIMIT 500');
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // ==================== BIND STATUS ====================
 app.get('/api/bind/status', auth, async (req, res) => {
     try {

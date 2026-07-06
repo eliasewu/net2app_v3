@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Plus, Search, Edit, Trash2, Play, Type, RefreshCw } from 'lucide-react';
 import { useData } from '../store/DataContext';
 import { Card } from '../components/UI/Card';
@@ -61,8 +61,28 @@ function applyTrans(input:string, entry:TransEntry): string {
 }
 
 export const TranslationsPage: React.FC = () => {
-  const { clients, suppliers } = useData();
+  const { clients, suppliers, translations: apiTranslations } = useData();
   const [entries, setEntries] = useState<TransEntry[]>(() => { try { const s=localStorage.getItem('translations_db');if(s)return JSON.parse(s);}catch{}localStorage.setItem('translations_db',JSON.stringify(defaultTrans));return defaultTrans; });
+  const seededRef = useRef(false);
+  // Sync from API when data arrives — map DB columns to local TransEntry format (once)
+  useEffect(() => {
+    if (seededRef.current || apiTranslations.length === 0) return;
+    seededRef.current = true;
+    const mapped: TransEntry[] = apiTranslations.map((t: any) => ({
+      id: String(t.id),
+      name: t.name || `Rule #${t.id}`,
+      type: (t.subtype === 'content_random_body' ? 'random_body' : t.subtype === 'sender_id_masking' ? 'random_sid' : t.subtype === 'dynamic_content' ? 'content' : t.translation_type === 'sender_id' ? 'sid' : t.translation_type === 'content' ? 'content' : t.translation_type === 'origination' ? 'number' : 'content') as TranslationType,
+      priority: t.priority || 1,
+      apply_to: (t.apply_to === 'client' || t.apply_to === 'supplier' ? t.apply_to : 'both') as 'client' | 'supplier' | 'both',
+      entity_id: t.apply_entity_id || String(t.client_id || t.supplier_id || ''),
+      source_pattern: t.source_pattern || '',
+      replace_pattern: t.target_value || '',
+      is_active: t.is_active !== false,
+      description: t.description || '',
+      created_at: t.created_at || '',
+    }));
+    setEntries(mapped);
+  }, [apiTranslations]);
   const [search, setSearch] = useState(''); const [typeFilter, setTypeFilter] = useState<string>('all');
   const [currentPage, setCurrentPage] = useState(1); const [showModal, setShowModal] = useState(false);
   const [editing, setEditing] = useState<TransEntry|null>(null);

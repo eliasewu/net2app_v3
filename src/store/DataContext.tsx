@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useState, useCallback, useEffect, ReactNode } from 'react';
 import { Client, Supplier, Trunk, Route, RoutePlan, Rate, MCCMNC, Invoice, Payment, SMSLog, EmailTemplate, OTTDevice, APIConnector, User, DashboardStats, Notification, Campaign, Translation, VoiceOTPConfig } from '../types';
 import { mockUsers, hourlyTrafficData, dailyRevenueData, topDestinations } from './mockData';
-import { clientsApi, suppliersApi, routingApi, smsApi } from '../services/api';
+import { api, clientsApi, suppliersApi, routingApi, smsApi } from '../services/api';
 
 // Database persistence — localStorage keys (PostgreSQL via API in production)
 const DB = {
@@ -71,13 +71,19 @@ export const DataProvider:React.FC<{children:ReactNode}> = ({children}) => {
   useEffect(() => {
     const fetchAll = async () => {
       try {
-        const [clientsRes, suppliersRes, trunksRes, routesRes, plansRes, smsRes] = await Promise.all([
+        const [clientsRes, suppliersRes, trunksRes, routesRes, plansRes, smsRes, ratesRes, mccmncRes, invoicesRes, paymentsRes, campaignsRes, translationsRes] = await Promise.all([
           clientsApi.getAll(),
           suppliersApi.getAll(),
           routingApi.getTrunks(),
           routingApi.getRoutes(),
           routingApi.getRoutePlans(),
           smsApi.getLogs({}).catch(() => ({ success: false, data: null })),
+          api.get('/rates').catch(() => ({ success: false, data: null })),
+          api.get('/mccmnc').catch(() => ({ success: false, data: null })),
+          api.get('/invoices').catch(() => ({ success: false, data: null })),
+          api.get('/payments').catch(() => ({ success: false, data: null })),
+          api.get('/campaigns').catch(() => ({ success: false, data: null })),
+          api.get('/translations').catch(() => ({ success: false, data: null })),
         ]);
         const cd: any = clientsRes.data;
         const sd: any = suppliersRes.data;
@@ -103,6 +109,18 @@ export const DataProvider:React.FC<{children:ReactNode}> = ({children}) => {
         if (smsRes.success && (md as any)?.data) {
           setSMSLogs((md as any).data); save(DB.sms_logs, (md as any).data);
         }
+        const rd2: any = ratesRes.data;
+        if (ratesRes.success && rd2?.data) { setRates(rd2.data); save(DB.rates, rd2.data); }
+        const mmd: any = mccmncRes.data;
+        if (mccmncRes.success && mmd?.data) { setMCCMNC(mmd.data); save(DB.mccmnc, mmd.data); }
+        const invd: any = invoicesRes.data;
+        if (invoicesRes.success && invd?.data) { setInvoices(invd.data); save(DB.invoices, invd.data); }
+        const payd: any = paymentsRes.data;
+        if (paymentsRes.success && payd?.data) { setPayments(payd.data); save(DB.payments, payd.data); }
+        const campd: any = campaignsRes.data;
+        if (campaignsRes.success && campd?.data) { setCampaigns(campd.data); save(DB.campaigns, campd.data); }
+        const trad: any = translationsRes.data;
+        if (translationsRes.success && trad?.data) { setTranslations(trad.data); save(DB.translations, trad.data); }
       } catch (e) {
         console.warn('[DataContext] API fetch failed, using localStorage cache:', e);
       }

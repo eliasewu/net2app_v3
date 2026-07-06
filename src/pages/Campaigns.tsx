@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Plus, Search, Upload, Play, Pause, X, Send, Users, CheckCircle, AlertTriangle } from 'lucide-react';
 import { useData } from '../store/DataContext';
 import { Card } from '../components/UI/Card';
@@ -33,8 +33,41 @@ interface Campaign {
 }
 
 export const CampaignsPage: React.FC = () => {
-  const { clients, routePlans, rates } = useData();
+  const { clients, routePlans, rates, campaigns: apiCampaigns } = useData();
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
+  // Seed from API data on mount (maps DB campaigns to local Campaign shape)
+  useEffect(() => {
+    if (apiCampaigns.length === 0) return;
+    setCampaigns(prev => {
+      const existingIds = new Set(prev.map(c => c.id));
+      const newOnes = apiCampaigns
+        .filter((c: any) => !existingIds.has(String(c.id)))
+        .map((c: any): Campaign => ({
+          id: String(c.id),
+          campaign_name: c.campaign_name || '',
+          client_id: String(c.client_id || ''),
+          sender_id: c.sender_id || '',
+          message_template: c.message_template || '',
+          route_plan_id: '',
+          recipients_file: null,
+          recipients_count: c.recipients_count || 0,
+          sent_count: c.sent_count || 0,
+          delivered_count: c.delivered_count || 0,
+          failed_count: c.failed_count || 0,
+          status: (c.status as Campaign['status']) || 'draft',
+          send_type: c.scheduled_at ? 'scheduled' : 'immediate',
+          scheduled_at: c.scheduled_at || null,
+          started_at: c.started_at || null,
+          completed_at: c.completed_at || null,
+          currency: 'EUR',
+          client_rate: 0.025,
+          supplier_rate: 0.015,
+          profit: 0.01,
+          created_at: c.created_at || '',
+        }));
+      return [...prev, ...newOnes];
+    });
+  }, [apiCampaigns]);
   const [search, setSearch] = useState('');
   const [showCreate, setShowCreate] = useState(false);
   const [showUpload, setShowUpload] = useState(false);
