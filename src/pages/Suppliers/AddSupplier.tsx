@@ -100,10 +100,16 @@ export const AddSupplier: React.FC = () => {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!validate()) return;
-    setLoading(true); await new Promise(r => setTimeout(r, 1000));
-    if (isEditing && existingSupplier) updateSupplier(existingSupplier.id, formData);
-    else addSupplier(formData as any);
-    setLoading(false); navigate('/suppliers');
+    setLoading(true);
+    try {
+      if (isEditing && existingSupplier) await updateSupplier(existingSupplier.id, formData);
+      else await addSupplier(formData as any);
+      navigate('/suppliers');
+    } catch (err: any) {
+      setErrors(prev => ({ ...prev, submit: err?.message || 'Failed to save supplier' }));
+    } finally {
+      setLoading(false);
+    }
   };
 
   const updateField = (field: string, value: any) => {
@@ -276,6 +282,7 @@ export const AddSupplier: React.FC = () => {
           <Card title="Test Connection"><div className="flex items-center gap-4"><Button type="button" variant="secondary" icon={<TestTube size={18} />} onClick={handleTest}>Test SMPP</Button>{testResult && <Badge variant={testResult.success ? 'success' : 'danger'}>{testResult.message}</Badge>}</div></Card>
         )}
 
+        {errors.submit && <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-600">{errors.submit}</div>}
         <div className="flex justify-end gap-4">
           <Button variant="secondary" type="button" onClick={() => navigate(-1)}>Cancel</Button>
           <Button type="submit" icon={<Save size={18} />} loading={loading}>{isEditing ? 'Update Supplier' : 'Create Supplier'}</Button>

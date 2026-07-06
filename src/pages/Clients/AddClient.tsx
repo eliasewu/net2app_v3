@@ -73,14 +73,18 @@ export const AddClient: React.FC = () => {
     e.preventDefault();
     if (!validate()) return;
     setLoading(true);
-    await new Promise(resolve => setTimeout(resolve, 500));
-    if (existingClient) {
-      updateClient(existingClient.id, formData as Partial<Client>);
-    } else {
-      addClient(formData as Omit<Client, 'id' | 'created_at' | 'updated_at'>);
+    try {
+      if (existingClient) {
+        await updateClient(existingClient.id, formData as Partial<Client>);
+      } else {
+        await addClient(formData as Omit<Client, 'id' | 'created_at' | 'updated_at'>);
+      }
+      navigate('/clients');
+    } catch (err: any) {
+      setErrors(prev => ({ ...prev, submit: err?.message || 'Failed to save client' }));
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
-    navigate('/clients');
   };
 
   const updateField = (field: string, value: any) => {
@@ -330,6 +334,7 @@ export const AddClient: React.FC = () => {
           </div>
         </Card>
 
+        {errors.submit && <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-600">{errors.submit}</div>}
         {/* Actions */}
         <div className="flex justify-end gap-4">
           <Button variant="secondary" type="button" onClick={() => navigate(-1)}>

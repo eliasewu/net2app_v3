@@ -105,44 +105,38 @@ export const DataProvider:React.FC<{children:ReactNode}> = ({children}) => {
     fetchAll();
   }, []);
 
-  // Client CRUD — call API + update local cache
+  // Client CRUD — call API + throw on failure for form error handling
   const addClient=useCallback(async (c:Omit<Client,'id'|'created_at'|'updated_at'>) => {
     const res = await clientsApi.create(c);
-    if (res.success && res.data?.data) {
-      setClients(p => { const n = [...p, res.data.data]; save(DB.clients, n); return n; });
-    }
+    if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to create client');
+    setClients(p => { const n = [...p, res.data.data]; save(DB.clients, n); return n; });
   },[]);
   const updateClient=useCallback(async (id:string,c:Partial<Client>) => {
     const res = await clientsApi.update(id, c);
-    if (res.success && res.data?.data) {
-      setClients(p => { const n = p.map(x => x.id === id ? res.data.data : x); save(DB.clients, n); return n; });
-    }
+    if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to update client');
+    setClients(p => { const n = p.map(x => x.id === id ? res.data.data : x); save(DB.clients, n); return n; });
   },[]);
   const deleteClient=useCallback(async (id:string) => {
     const res = await clientsApi.delete(id);
-    if (res.success) {
-      setClients(p => { const n = p.filter(x => x.id !== id); save(DB.clients, n); return n; });
-    }
+    if (!res.success) throw new Error(res.error || 'Failed to delete client');
+    setClients(p => { const n = p.filter(x => x.id !== id); save(DB.clients, n); return n; });
   },[]);
 
-  // Supplier CRUD — call API + update local cache
+  // Supplier CRUD — call API + throw on failure for form error handling
   const addSupplier=useCallback(async (s:Omit<Supplier,'id'|'created_at'|'updated_at'>) => {
     const res = await suppliersApi.create(s);
-    if (res.success && res.data?.data) {
-      setSuppliers(p => { const n = [...p, res.data.data]; save(DB.suppliers, n); return n; });
-    }
+    if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to create supplier');
+    setSuppliers(p => { const n = [...p, res.data.data]; save(DB.suppliers, n); return n; });
   },[]);
   const updateSupplier=useCallback(async (id:string,s:Partial<Supplier>) => {
     const res = await suppliersApi.update(id, s);
-    if (res.success && res.data?.data) {
-      setSuppliers(p => { const n = p.map(x => x.id === id ? res.data.data : x); save(DB.suppliers, n); return n; });
-    }
+    if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to update supplier');
+    setSuppliers(p => { const n = p.map(x => x.id === id ? res.data.data : x); save(DB.suppliers, n); return n; });
   },[]);
   const deleteSupplier=useCallback(async (id:string) => {
     const res = await suppliersApi.delete(id);
-    if (res.success) {
-      setSuppliers(p => { const n = p.filter(x => x.id !== id); save(DB.suppliers, n); return n; });
-    }
+    if (!res.success) throw new Error(res.error || 'Failed to delete supplier');
+    setSuppliers(p => { const n = p.filter(x => x.id !== id); save(DB.suppliers, n); return n; });
   },[]);
 
   // SMS Logs
