@@ -51,6 +51,64 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
+// ==================== USERS ====================
+app.get('/api/users', auth, async (req, res) => {
+    try {
+        const result = await pool.query('SELECT id, username, email, role, permissions, name, is_active, last_login, created_at FROM users ORDER BY id');
+        res.json({ success: true, data: result.rows });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/users', auth, async (req, res) => {
+    try {
+        const { username, password, email, role, permissions, name } = req.body;
+        if (!username || !password) return res.status(400).json({ error: 'username and password required' });
+        const hash = await bcrypt.hash(password, 10);
+        const result = await pool.query(
+            `INSERT INTO users (username, password_hash, email, role, permissions, name, is_active, created_at, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,true,NOW(),NOW()) RETURNING id, username, email, role, permissions, name, is_active, last_login, created_at`,
+            [username, hash, email || '', role || 'client', permissions || [], name || '']
+        );
+        res.json({ success: true, data: result.rows[0] });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/api/users/:id', auth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const fields = req.body;
+        if (fields.password) {
+            fields.password_hash = await bcrypt.hash(fields.password, 10);
+            delete fields.password;
+        }
+        delete fields.current_password;
+        const setParts = []; const values = []; let idx = 1;
+        for (const [key, value] of Object.entries(fields)) {
+            if (value !== undefined && key !== 'id') {
+                setParts.push(`${key} = $${idx++}`);
+                values.push(value);
+            }
+        }
+        if (setParts.length === 0) return res.status(400).json({ error: 'No fields to update' });
+        setParts.push(`updated_at = NOW()`);
+        values.push(id);
+        const result = await pool.query(
+            `UPDATE users SET ${setParts.join(', ')} WHERE id = $${values.length} RETURNING id, username, email, role, permissions, name, is_active, last_login, created_at`,
+            values
+        );
+        if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+        res.json({ success: true, data: result.rows[0] });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/users/:id', auth, async (req, res) => {
+    try {
+        const result = await pool.query('DELETE FROM users WHERE id = $1 RETURNING id, username', [req.params.id]);
+        if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+        res.json({ success: true, message: 'User deleted', username: result.rows[0].username });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ==================== CLIENTS ====================
 app.get('/api/clients', auth, async (req, res) => {
     try {
@@ -236,6 +294,52 @@ app.delete('/api/suppliers/:id', auth, async (req, res) => {
     } catch (error) {
         res.status(500).json({ error: 'Internal server error' });
     }
+});
+
+// ==================== API CONNECTORS ====================
+app.get('/api/api-connectors', auth, async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM api_connectors ORDER BY id');
+        res.json({ success: true, data: result.rows });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/api-connectors', auth, async (req, res) => {
+    try {
+        const b = req.body || {};
+        const result = await pool.query(
+            `INSERT INTO api_connectors (name, type, base_url, api_key, api_secret, region, description, is_active, created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW()) RETURNING *`,
+            [b.name || '', b.type || 'http', b.base_url || '', b.api_key || '', b.api_secret || '', b.region || '', b.description || '', b.is_active !== false]
+        );
+        res.json({ success: true, data: result.rows[0] });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/api/api-connectors/:id', auth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const fields = req.body;
+        const allowed = ['name','type','base_url','api_key','api_secret','region','description','is_active'];
+        const setParts = []; const values = []; let idx = 1;
+        for (const key of allowed) {
+            if (fields[key] !== undefined) { setParts.push(`${key} = $${idx++}`); values.push(fields[key]); }
+        }
+        if (setParts.length === 0) return res.status(400).json({ error: 'No fields to update' });
+        values.push(id);
+        const result = await pool.query(`UPDATE api_connectors SET ${setParts.join(', ')} WHERE id = $${values.length} RETURNING *`, values);
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+        res.json({ success: true, data: result.rows[0] });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/api-connectors/:id', auth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const result = await pool.query('DELETE FROM api_connectors WHERE id = $1 RETURNING id', [id]);
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+        res.json({ success: true, message: 'API connector deleted' });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ==================== TRUNKS ====================

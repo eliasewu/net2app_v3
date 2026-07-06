@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useCallback, useEffect, ReactNode } from 'react';
 import { Client, Supplier, Trunk, Route, RoutePlan, Rate, MCCMNC, Invoice, Payment, SMSLog, EmailTemplate, OTTDevice, APIConnector, User, DashboardStats, Notification, Campaign, Translation, VoiceOTPConfig } from '../types';
-import { mockUsers, hourlyTrafficData, dailyRevenueData, topDestinations } from './mockData';
+import { hourlyTrafficData, dailyRevenueData, topDestinations } from './mockData';
 import { api, clientsApi, suppliersApi, routingApi, smsApi } from '../services/api';
 
 
@@ -22,6 +22,7 @@ interface DataContextType {
   addInvoice:(i:Omit<Invoice,'id'|'created_at'>)=>void; updateInvoice:(id:string,i:Partial<Invoice>)=>void;
   addPayment:(p:Omit<Payment,'id'|'created_at'>)=>void;
   addOTTDevice:(d:Omit<OTTDevice,'id'|'created_at'>)=>void; updateOTTDevice:(id:string,d:Partial<OTTDevice>)=>void; deleteOTTDevice:(id:string)=>void;
+  addApiConnector:(c:Omit<APIConnector,'id'|'created_at'>)=>Promise<void>; updateApiConnector:(id:string,c:Partial<APIConnector>)=>Promise<void>; deleteApiConnector:(id:string)=>Promise<void>;
   markNotificationRead:(id:string)=>void;
   addCampaign:(c:Omit<Campaign,'id'|'created_at'>)=>void; updateCampaign:(id:string,c:Partial<Campaign>)=>void; deleteCampaign:(id:string)=>void;
   addTranslation:(t:Omit<Translation,'id'|'created_at'>)=>void; updateTranslation:(id:string,t:Partial<Translation>)=>void; deleteTranslation:(id:string)=>void;
@@ -54,12 +55,14 @@ export const DataProvider:React.FC<{children:ReactNode}> = ({children}) => {
   const [platformSettings, setPlatformSettings] = useState<Record<string,string>>({platform_name:'NET2APP Hub',currency:'EUR',default_tax_rate:'19.00'});
   const [smtpConfig, setSMTPConfig] = useState<any>({host:'smtp.gmail.com',port:587,encryption:'tls'});
   const [emailTemplates, setEmailTemplates] = useState<EmailTemplate[]>([]);
+  const [users, setUsers] = useState<User[]>([]);
+  const [apiConnectors, setApiConnectors] = useState<APIConnector[]>([]);
 
   // ========== Fetch real data from PostgreSQL API on mount ==========
   useEffect(() => {
     const fetchAll = async () => {
       try {
-        const [clientsRes, suppliersRes, trunksRes, routesRes, plansRes, smsRes, ratesRes, mccmncRes, invoicesRes, paymentsRes, campaignsRes, translationsRes] = await Promise.all([
+        const [clientsRes, suppliersRes, trunksRes, routesRes, plansRes, smsRes, ratesRes, mccmncRes, invoicesRes, paymentsRes, campaignsRes, translationsRes, usersRes, connectorsRes] = await Promise.all([
           clientsApi.getAll(),
           suppliersApi.getAll(),
           routingApi.getTrunks(),
@@ -72,6 +75,8 @@ export const DataProvider:React.FC<{children:ReactNode}> = ({children}) => {
           api.get('/payments').catch(() => ({ success: false, data: null })),
           api.get('/campaigns').catch(() => ({ success: false, data: null })),
           api.get('/translations').catch(() => ({ success: false, data: null })),
+          api.get('/users').catch(() => ({ success: false, data: null })),
+          api.get('/api-connectors').catch(() => ({ success: false, data: null })),
         ]);
         const cd: any = clientsRes.data;
         const sd: any = suppliersRes.data;
@@ -109,6 +114,10 @@ export const DataProvider:React.FC<{children:ReactNode}> = ({children}) => {
         if (campaignsRes.success && campd?.data) { setCampaigns(campd.data); }
         const trad: any = translationsRes.data;
         if (translationsRes.success && trad?.data) { setTranslations(trad.data); }
+        const ud: any = usersRes.data;
+        if (usersRes.success && ud?.data) { setUsers(ud.data); }
+        const acd: any = connectorsRes.data;
+        if (connectorsRes.success && acd?.data) { setApiConnectors(acd.data); }
       } catch (e) {
         console.warn('[DataContext] API fetch failed:', e);
       }
@@ -255,6 +264,22 @@ export const DataProvider:React.FC<{children:ReactNode}> = ({children}) => {
   const addOTTDevice=useCallback((d:Omit<OTTDevice,'id'|'created_at'>)=>{setOTTDevices(p=>{const n=[...p,{...d,id:gid(),created_at:nw()}];return n;});},[]);
   const updateOTTDevice=useCallback((id:string,d:Partial<OTTDevice>)=>{setOTTDevices(p=>{const n=p.map(x=>x.id===id?{...x,...d}:x);return n;});},[]);
   const deleteOTTDevice=useCallback((id:string)=>{setOTTDevices(p=>{const n=p.filter(x=>x.id!==id);return n;});},[]);
+  // API Connectors
+  const addApiConnector=useCallback(async (c:Omit<APIConnector,'id'|'created_at'>) => {
+    const res: any = await api.post('/api-connectors', c);
+    if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to create API connector');
+    setApiConnectors(p=>{const n=[...p,res.data.data];return n;});
+  },[]);
+  const updateApiConnector=useCallback(async (id:string,c:Partial<APIConnector>) => {
+    const res: any = await api.put(`/api-connectors/${id}`, c);
+    if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to update API connector');
+    setApiConnectors(p=>{const n=p.map(x=>x.id===id?res.data.data:x);return n;});
+  },[]);
+  const deleteApiConnector=useCallback(async (id:string) => {
+    const res: any = await api.delete(`/api-connectors/${id}`);
+    if (!res.success) throw new Error(res.error || 'Failed to delete API connector');
+    setApiConnectors(p=>{const n=p.filter(x=>x.id!==id);return n;});
+  },[]);
   const markNotificationRead=useCallback((id:string)=>{setNotifications(p=>{const n=p.map(x=>x.id===id?{...x,is_read:true}:x);return n;});},[]);
   const addCampaign=useCallback(async (c:Omit<Campaign,'id'|'created_at'>) => {
     const res: any = await api.post('/campaigns', c);
@@ -311,7 +336,7 @@ export const DataProvider:React.FC<{children:ReactNode}> = ({children}) => {
     active_binds:suppliers.filter(s=>s.bind_status==='bound').length,total_binds:suppliers.length,
   };
 
-  return (<DataContext.Provider value={{clients,suppliers,trunks,routes,routePlans,rates,mccmnc,invoices,payments,smsLogs,ottDevices,apiConnectors:[],users:mockUsers as User[],emailTemplates,notifications,campaigns,translations,voiceOTPConfigs,dashboardStats,hourlyTraffic:hourlyTrafficData,dailyRevenue:dailyRevenueData,topDest:topDestinations,addClient,updateClient,deleteClient,addSupplier,updateSupplier,deleteSupplier,addSMSLog,addTrunk,updateTrunk,deleteTrunk,addRoute,updateRoute,deleteRoute,addRoutePlan,updateRoutePlan,deleteRoutePlan,addRate,updateRate,deleteRate,addMCCMNC,updateMCCMNC,deleteMCCMNC,addInvoice,updateInvoice,addPayment,addOTTDevice,updateOTTDevice,deleteOTTDevice,markNotificationRead,addCampaign,updateCampaign,deleteCampaign,addTranslation,updateTranslation,deleteTranslation,getClientById,getSupplierById,getTrunkById,updateEmailTemplate,platformSettings,updatePlatformSetting,smtpConfig,updateSMTPConfig}}>{children}</DataContext.Provider>);
+  return (<DataContext.Provider value={{clients,suppliers,trunks,routes,routePlans,rates,mccmnc,invoices,payments,smsLogs,ottDevices,apiConnectors,users,emailTemplates,notifications,campaigns,translations,voiceOTPConfigs,dashboardStats,hourlyTraffic:hourlyTrafficData,dailyRevenue:dailyRevenueData,topDest:topDestinations,addClient,updateClient,deleteClient,addSupplier,updateSupplier,deleteSupplier,addSMSLog,addTrunk,updateTrunk,deleteTrunk,addRoute,updateRoute,deleteRoute,addRoutePlan,updateRoutePlan,deleteRoutePlan,addRate,updateRate,deleteRate,addMCCMNC,updateMCCMNC,deleteMCCMNC,addInvoice,updateInvoice,addPayment,addOTTDevice,updateOTTDevice,deleteOTTDevice,addApiConnector,updateApiConnector,deleteApiConnector,markNotificationRead,addCampaign,updateCampaign,deleteCampaign,addTranslation,updateTranslation,deleteTranslation,getClientById,getSupplierById,getTrunkById,updateEmailTemplate,platformSettings,updatePlatformSetting,smtpConfig,updateSMTPConfig}}>{children}</DataContext.Provider>);
 };
 
 export const useData = () => { const c=useContext(DataContext); if(!c) throw new Error('useData required'); return c; };
