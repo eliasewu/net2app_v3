@@ -14,8 +14,8 @@ app.use(express.json());
 const pool = new Pool({
     host: process.env.DB_HOST || 'localhost',
     port: process.env.DB_PORT || 5432,
-    database: process.env.DB_NAME || 'net2app_hub',
-    user: process.env.DB_USER || 'net2app_user',
+    database: process.env.DB_NAME || 'sms_platform',
+    user: process.env.DB_USER || 'sms_user',
     password: process.env.DB_PASS || 'Ariya@2024Net2App',
 });
 
@@ -483,9 +483,9 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Serve static files
+// Serve static files — SPA fallback (middleware avoids path-to-regexp wildcard issue)
 app.use(express.static('dist'));
-app.get('*', (req, res) => {
+app.use((req, res) => {
     if (!req.path.startsWith('/api')) {
         res.sendFile(path.join(__dirname, 'dist', 'index.html'));
     }
