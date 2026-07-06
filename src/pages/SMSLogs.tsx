@@ -11,7 +11,7 @@ import { Modal } from '../components/UI/Modal';
 interface ExtendedLog {
   id: string; message_id: string; destination: string; sender_id: string; message: string;
   status: string; client_code?: string; supplier_code?: string; country?: string; operator?: string;
-  route_name?: string; trunk_name?: string; client_rate?: number; supplier_rate?: number;
+  mcc?: string; mnc?: string; route_name?: string; trunk_name?: string; client_rate?: number; supplier_rate?: number;
   profit?: number; currency?: string; dlr_status?: string; submit_time: string; delivery_time?: string;
   source: string; error_code?: string; error_message?: string; language?: string; provider?: string;
 }
@@ -37,7 +37,7 @@ export const SMSLogs: React.FC = () => {
     return [];
   })();
 
-  const smsLogEntries: ExtendedLog[] = smsLogs.map(l=>({id:l.id,message_id:l.message_id,destination:l.destination,sender_id:l.sender_id,message:l.message,status:l.status,client_code:l.client_code||undefined,supplier_code:l.supplier_code||undefined,country:l.country,operator:l.operator,route_name:l.route_name||undefined,trunk_name:l.trunk_name||undefined,client_rate:l.client_rate,supplier_rate:l.supplier_rate,profit:l.profit,currency:l.currency,dlr_status:l.dlr_status||undefined,submit_time:l.submit_time||'',delivery_time:l.delivery_time||undefined,source:'smpp',error_code:l.error_code||undefined,error_message:l.error_message||undefined}));
+  const smsLogEntries: ExtendedLog[] = smsLogs.map(l=>({id:l.id,message_id:l.message_id,destination:l.destination,sender_id:l.sender_id,message:l.message,status:l.status,client_code:l.client_code||undefined,supplier_code:l.supplier_code||undefined,country:l.country,operator:l.operator,mcc:l.mcc,mnc:l.mnc,route_name:l.route_name||undefined,trunk_name:l.trunk_name||undefined,client_rate:l.client_rate,supplier_rate:l.supplier_rate,profit:l.profit,currency:l.currency,dlr_status:l.dlr_status||undefined,submit_time:l.submit_time||'',delivery_time:l.delivery_time||undefined,source:'smpp',error_code:l.error_code||undefined,error_message:l.error_message||undefined}));
 
   // Merge all logs
   const allLogs: ExtendedLog[] = [...smsLogEntries, ...voiceLogs, ...ottLogs, ...testCalls].sort((a,b) => new Date(b.submit_time||'').getTime() - new Date(a.submit_time||'').getTime());
@@ -45,9 +45,21 @@ export const SMSLogs: React.FC = () => {
   const getClientName = (code?: string) => { const c = clients.find(x=>x.client_code===code); return c?.company_name||code||'-'; };
   const getSupplierName = (code?: string) => { const s = suppliers.find(x=>x.supplier_code===code); return s?.company_name||code||'-'; };
 
+  // Build lookup maps for performance
+  const clientMap = React.useMemo(() => {
+    const m = new Map<string, string>();
+    clients.forEach(c => m.set(c.client_code, c.company_name || ''));
+    return m;
+  }, [clients]);
+  const supplierMap = React.useMemo(() => {
+    const m = new Map<string, string>();
+    suppliers.forEach(s => m.set(s.supplier_code, s.company_name || ''));
+    return m;
+  }, [suppliers]);
+
   const itemsPerPage = 25;
   const filtered = allLogs.filter(log => {
-    const ms = (log.destination||'').includes(search) || (log.message_id||'').toLowerCase().includes(search.toLowerCase()) || (log.sender_id||'').toLowerCase().includes(search.toLowerCase());
+    const ms = (log.destination||'').includes(search) || (log.message_id||'').toLowerCase().includes(search.toLowerCase()) || (log.sender_id||'').toLowerCase().includes(search.toLowerCase()) || (log.operator||'').toLowerCase().includes(search.toLowerCase()) || (log.trunk_name||'').toLowerCase().includes(search.toLowerCase()) || (log.route_name||'').toLowerCase().includes(search.toLowerCase()) || (clientMap.get(log.client_code||'')||'').toLowerCase().includes(search.toLowerCase()) || (supplierMap.get(log.supplier_code||'')||'').toLowerCase().includes(search.toLowerCase());
     const st = statusFilter==='all' || log.status===statusFilter;
     const cl = clientFilter==='all' || log.client_code===clientFilter;
     const sc = sourceFilter==='all' || log.source===sourceFilter;
@@ -78,9 +90,10 @@ export const SMSLogs: React.FC = () => {
   const columns = [
     { key:'source', header:'Type', render:(log:ExtendedLog) => getSourceB(log.source) },
     { key:'message_id', header:'ID', render:(log:ExtendedLog) => <span className="font-mono text-[10px] bg-gray-100 px-1.5 py-0.5 rounded">{(log.message_id||'').slice(-12)}</span> },
-    { key:'client', header:'Client', render:(log:ExtendedLog) => <Badge variant="info" size="sm">{log.client_code||'-'}</Badge> },
-    { key:'supplier', header:'Supplier', render:(log:ExtendedLog) => <span className="text-xs text-gray-500">{log.supplier_code||'-'}</span> },
-    { key:'destination', header:'Destination', render:(log:ExtendedLog) => <div><p className="font-mono text-xs">{log.destination||'-'}</p><p className="text-[10px] text-gray-500">{log.country||log.language||''}</p></div> },
+    { key:'client', header:'Client', render:(log:ExtendedLog) => <div><p className="text-xs font-medium">{getClientName(log.client_code)}</p><p className="text-[10px] text-gray-400">{log.client_code || '-'}</p></div> },
+    { key:'supplier', header:'Supplier', render:(log:ExtendedLog) => <span className="text-xs text-gray-500">{getSupplierName(log.supplier_code) || log.supplier_code || '-'}</span> },
+    { key:'destination', header:'Destination', render:(log:ExtendedLog) => <div><p className="font-mono text-xs">{log.destination||'-'}</p>{(log.mcc||log.mnc) && <p className="text-[10px] text-gray-400">{log.mcc}{log.mnc ? '/' + log.mnc : ''}</p>}</div> },
+    { key:'operator', header:'Operator', render:(log:ExtendedLog) => <span className="text-xs text-gray-500">{log.operator || (log.country && log.language) || '—'}</span> },
     { key:'rates', header:'Rates', align:'right' as const, render:(log:ExtendedLog) => log.client_rate ? <div className="text-[10px]"><p className="text-gray-600">€{log.client_rate.toFixed(4)}</p><p className="text-green-600">+€{(log.profit||0).toFixed(4)}</p></div> : <span className="text-xs text-gray-400">-</span> },
     { key:'status', header:'Status', render:(log:ExtendedLog) => getStatusB(log.status) },
     { key:'dlr', header:'DLR', render:(log:ExtendedLog) => <Badge variant={log.dlr_status==='DELIVRD'?'success':'default'} size="sm">{log.dlr_status||'-'}</Badge> },

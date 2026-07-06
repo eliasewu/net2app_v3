@@ -1,0 +1,214 @@
+// NET2APP Hub — Production SMPP ESME Server (Node.js)
+// Accepts SMPP client connections on port 2775
+// Authenticates clients against PostgreSQL, routes SMS through the full routing engine
+
+const smpp = require('smpp');
+const { Pool } = require('pg');
+const http = require('http');
+require('dotenv').config();
+
+const pool = new Pool({
+  host: process.env.DB_HOST || 'localhost',
+  database: process.env.DB_NAME || 'sms_platform',
+  user: process.env.DB_USER || 'sms_user',
+  password: process.env.DB_PASS || 'Ariya@2024Net2App',
+});
+
+const bcrypt = require('bcryptjs');
+
+// Internal API config
+const API_BASE = process.env.API_BASE || 'http://localhost:3000';
+const INTERNAL_TOKEN = process.env.BACKEND_INTERNAL_TOKEN || '';
+
+// Helper: make internal HTTP call to the routing engine
+function internalPost(path, body) {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify(body);
+    const url = new URL(path, API_BASE);
+    const options = {
+      hostname: url.hostname,
+      port: url.port,
+      path: url.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Internal-Token': INTERNAL_TOKEN,
+        'Content-Length': Buffer.byteLength(data)
+      },
+      timeout: 10000
+    };
+
+    const req = http.request(options, (res) => {
+      let body = '';
+      res.on('data', chunk => body += chunk);
+      res.on('end', () => {
+        try { resolve(JSON.parse(body)); }
+        catch { resolve({ error: 'Invalid JSON response', raw: body }); }
+      });
+    });
+    req.on('error', (err) => reject(err));
+    req.on('timeout', () => { req.destroy(); reject(new Error('Request timeout')); });
+    req.write(data);
+    req.end();
+  });
+}
+
+class SmppServer {
+  constructor() {
+    this.sessions = new Map();
+    this.boundCount = 0;
+    this.totalSubmitted = 0;
+  }
+
+  start() {
+    const server = smpp.createServer({ port: 2775, host: '0.0.0.0' });
+
+    server.on('session', (session) => {
+      const remoteAddr = session.socket.remoteAddress;
+      console.log(`[SMPP] 🔗 New connection from: ${remoteAddr}`);
+
+      let authenticatedSystemId = null;
+
+      session.on('bind_transceiver', (pdu) => {
+        const systemId = pdu.system_id;
+        console.log(`[SMPP] Bind TRX: ${systemId} from ${remoteAddr}`);
+
+        // Query DB and authenticate
+        pool.query(
+          `SELECT id, client_code, smpp_password, smpp_ip, max_tps, status
+           FROM clients WHERE smpp_username = $1 AND status = 'active'`,
+          [systemId]
+        ).then(async (result) => {
+          if (result.rows.length === 0) {
+            console.log(`[SMPP] ❌ Bind denied: ${systemId} not found`);
+            session.send(pdu.response(), { command_status: 0x0000000D });
+            return;
+          }
+          const client = result.rows[0];
+
+          // IP whitelist check
+          if (client.smpp_ip && client.smpp_ip !== '0.0.0.0' && remoteAddr !== client.smpp_ip) {
+            console.log(`[SMPP] ❌ Bind denied: ${systemId} IP mismatch`);
+            session.send(pdu.response(), { command_status: 0x0000000D });
+            return;
+          }
+
+          // Password check
+          let passwordMatch = false;
+          const pwd = pdu.password ? (typeof pdu.password === 'string' ? pdu.password : pdu.password.toString()) : '';
+          if (client.smpp_password && client.smpp_password.startsWith('$2')) {
+            passwordMatch = await bcrypt.compare(pwd, client.smpp_password);
+          } else {
+            passwordMatch = client.smpp_password === pwd;
+          }
+
+          if (!passwordMatch) {
+            console.log(`[SMPP] ❌ Bind denied: ${systemId} invalid password`);
+            session.send(pdu.response(), { command_status: 0x0000000D });
+            return;
+          }
+
+          authenticatedSystemId = systemId;
+          this.sessions.set(systemId, { session, clientId: client.id, clientCode: client.client_code, maxTps: client.max_tps || 100 });
+          this.boundCount++;
+
+          session.send(pdu.response(), { command_status: 0, system_id: systemId, sc_interface_version: 0x34 });
+          console.log(`[SMPP] ✅ ${systemId} (${client.client_code}) bound | Total: ${this.boundCount}`);
+        }).catch((err) => {
+          console.error(`[SMPP] ❌ Bind DB error:`, err.message);
+          try { session.send(pdu.response(), { command_status: 0x0000000D }); } catch {}
+        });
+      });
+
+      session.on('submit_sm', (pdu) => {
+        const sourceAddr = (pdu.source_addr?.toString() || '').trim();
+        const destAddr = (pdu.destination_addr?.toString() || '').trim();
+        const message = typeof pdu.short_message === 'object' ? 
+          (pdu.short_message.message || pdu.short_message.toString()) : 
+          (pdu.short_message?.toString() || '');
+
+        console.log(`[SMPP] 📨 submit_sm: ${sourceAddr} → ${destAddr}`);
+
+        const sessionData = this.sessions.get(authenticatedSystemId);
+        if (!sessionData) {
+          session.send(pdu.response(), { command_status: 0x0000000E });
+          return;
+        }
+
+        // Route through production SMS engine
+        internalPost('/api/internal/sms/received', {
+          client_id: sessionData.clientId,
+          client_code: sessionData.clientCode,
+          source_addr: sourceAddr,
+          destination: destAddr,
+          message: message,
+          smpp_message_id: null
+        }).then((response) => {
+          if (response.success) {
+            this.totalSubmitted++;
+            const msgId = (response.data?.message_id || `SMPP_${Date.now()}`).substring(0, 64);
+            session.send(pdu.response(), { command_status: 0, message_id: msgId });
+            console.log(`[SMPP] ✅ SMS accepted: ${msgId} (total: ${this.totalSubmitted})`);
+          } else {
+            console.log(`[SMPP] ❌ SMS rejected: ${response.error}`);
+            session.send(pdu.response(), { command_status: 0x00000045 });
+          }
+        }).catch((err) => {
+          console.error(`[SMPP] ❌ submit_sm error:`, err.message);
+          // Fallback: direct DB insert
+          const msgId = `SMPP_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+          pool.query(
+            `INSERT INTO sms_logs (message_id, client_id, client_code, sender_id, destination, message, status, source, submit_time, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, 'submitted', 'smpp', NOW(), NOW())`,
+            [msgId, sessionData.clientId, sessionData.clientCode, sourceAddr, destAddr, message]
+          ).then(() => {
+            this.totalSubmitted++;
+            session.send(pdu.response(), { command_status: 0, message_id: msgId });
+          }).catch(() => {
+            session.send(pdu.response(), { command_status: 0x00000045 });
+          });
+        });
+      });
+
+      // enquire_link + unbind are auto-handled by smpp library, no callback needed
+      session.on('enquire_link', () => {});
+      
+      session.on('unbind', () => {
+        console.log(`[SMPP] 👋 Unbind: ${authenticatedSystemId || remoteAddr}`);
+        if (authenticatedSystemId) {
+          this.sessions.delete(authenticatedSystemId);
+          this.boundCount = Math.max(0, this.boundCount - 1);
+        }
+      });
+
+      session.on('close', () => {
+        if (authenticatedSystemId) {
+          this.sessions.delete(authenticatedSystemId);
+          this.boundCount = Math.max(0, this.boundCount - 1);
+        }
+      });
+
+      session.on('error', (err) => {
+        console.error(`[SMPP] Session error (${authenticatedSystemId || remoteAddr}):`, err.message);
+      });
+    });
+
+    server.listen(2775, '0.0.0.0', () => {
+      console.log(`========================================`);
+      console.log(`[SMPP] ✅ ESME Server listening on 0.0.0.0:2775`);
+      console.log(`[SMPP] Internal API: ${API_BASE}`);
+      console.log(`[SMPP] Token configured: ${INTERNAL_TOKEN ? 'YES' : 'NO (warning)'}`);
+      console.log(`[SMPP] Ready to accept client SMPP connections`);
+      console.log(`========================================`);
+    });
+
+    server.on('error', (err) => {
+      console.error(`[SMPP] ❌ Fatal:`, err.message);
+    });
+  }
+}
+
+const smppServer = new SmppServer();
+smppServer.start();
+
+module.exports = SmppServer;

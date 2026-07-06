@@ -15,7 +15,7 @@ function load<T>(key: string, fallback: T): T { try { const s=localStorage.getIt
 function save(key: string, v: any) { localStorage.setItem(key, JSON.stringify(v)); }
 
 const ONE_CLIENT: Client = { id:'1',client_code:'CLT001',company_name:'TechCorp Global',contact_person:'John Smith',email:'john@techcorp.com',phone:'+1234567890',address:'123 Tech Street, Silicon Valley',country:'USA',smpp_username:'techcorp_smpp',smpp_password:'secure123',smpp_ip:'0.0.0.0',smpp_port:2775,system_type:'SMPP',max_tps:100,billing_mode:'dlr',currency:'EUR',balance:5000,credit_limit:10000,api_enabled:true,webhook_url:'',force_dlr:true,routing_plan_id:'1',rate_plan_id:'1',status:'active',created_at:'2024-01-15T10:00:00Z',updated_at:'2024-01-15T10:00:00Z'};
-const ONE_SUPPLIER: Supplier = { id:'1',supplier_code:'SUP001',company_name:'GlobalSMS Gateway',contact_person:'Alex Turner',email:'alex@globalsms.com',phone:'+1111222233',connection_type:'smpp',smpp_host:'smpp.globalsms.com',smpp_port:2775,smpp_username:'net2app_client',smpp_password:'gateway123',system_id:'NET2APP',api_url:'',api_key:'',api_method:'POST',balance:50000,credit_limit:100000,currency:'EUR',bind_status:'bound',status:'active',consecutive_failures:0,created_at:'2024-01-01T00:00:00Z',updated_at:'2024-03-20T12:00:00Z'};
+const ONE_SUPPLIER: Supplier = { id:'1',supplier_code:'SUP001',company_name:'GlobalSMS Gateway',contact_person:'Alex Turner',email:'alex@globalsms.com',phone:'+1111222233',connection_type:'smpp',smpp_host:'smpp.globalsms.com',smpp_port:2775,smpp_username:'net2app_client',smpp_password:'gateway123',system_id:'NET2APP',smpp_version:'auto',smpp_system_type:'',smpp_bind_type:'trx',smpp_addr_ton:0,smpp_addr_npi:0,smpp_addr_range:'',is_inbound:false,api_url:'',api_key:'',api_method:'POST',api_connector_id:null,voice_otp_config_id:null,whatsapp_device_ids:null,telegram_device_ids:null,balance:50000,credit_limit:100000,currency:'EUR',force_dlr:false,bind_status:'bound',status:'active',consecutive_failures:0,created_at:'2024-01-01T00:00:00Z',updated_at:'2024-03-20T12:00:00Z'};
 
 interface DataContextType {
   clients: Client[]; suppliers: Supplier[]; trunks: Trunk[]; routes: Route[]; routePlans: RoutePlan[];
@@ -121,7 +121,7 @@ export const DataProvider:React.FC<{children:ReactNode}> = ({children}) => {
 
   // Settings
   const updatePlatformSetting=useCallback((key:string,value:string)=>{setPlatformSettings(p=>{const n={...p,[key]:value};save(DB.platform_settings,n);return n;});},[]);
-  const updateSMTPConfig=useCallback((data:any)=>{setSMTPConfig(prev=>{const n={...prev,...data};save(DB.smtp_config,n);return n;});},[]);
+  const updateSMTPConfig=useCallback((data:any)=>{setSMTPConfig((prev:any)=>{const n={...prev,...data};save(DB.smtp_config,n);return n;});},[]);
   const updateEmailTemplate=useCallback((id:string,data:Partial<EmailTemplate>)=>{setEmailTemplates(p=>{const n=p.map(t=>t.id===id?{...t,...data}:t);save(DB.email_templates,n);return n;});},[]);
 
   const getClientById=(id:string)=>clients.find(c=>c.id===id);

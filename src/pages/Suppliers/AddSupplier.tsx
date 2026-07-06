@@ -43,9 +43,17 @@ export const AddSupplier: React.FC = () => {
     smpp_username: existingSupplier?.smpp_username || '',
     smpp_password: existingSupplier?.smpp_password || '',
     system_id: existingSupplier?.system_id || '',
+    smpp_version: existingSupplier?.smpp_version || 'auto',
+    smpp_system_type: existingSupplier?.smpp_system_type || '',
+    smpp_bind_type: existingSupplier?.smpp_bind_type || 'trx',
+    smpp_addr_ton: existingSupplier?.smpp_addr_ton ?? 0,
+    smpp_addr_npi: existingSupplier?.smpp_addr_npi ?? 0,
+    smpp_addr_range: existingSupplier?.smpp_addr_range || '',
+    is_inbound: existingSupplier?.is_inbound || false,
     api_url: existingSupplier?.api_url || '',
     api_key: existingSupplier?.api_key || '',
     api_method: (existingSupplier?.api_method || 'POST') as 'GET' | 'POST',
+    force_dlr: existingSupplier?.force_dlr || false,
     balance: existingSupplier?.balance || 0,
     credit_limit: existingSupplier?.credit_limit || 0,
     currency: (existingSupplier?.currency || 'EUR') as Currency,
@@ -208,15 +216,37 @@ export const AddSupplier: React.FC = () => {
 
         {/* SMPP settings */}
         {formData.connection_type === 'smpp' && (
+          <>
           <Card title="SMPP Connection Settings">
             <div className="grid grid-cols-2 gap-6">
-              <Input label="SMPP Host" value={formData.smpp_host} onChange={e => updateField('smpp_host', e.target.value)} error={errors.smpp_host} required />
-              <Input label="SMPP Port" type="number" value={formData.smpp_port} onChange={e => updateField('smpp_port', parseInt(e.target.value))} />
+              <Input label="SMPP Host" value={formData.smpp_host} onChange={e => updateField('smpp_host', e.target.value)} error={errors.smpp_host} placeholder={formData.is_inbound ? 'Auto (inbound mode)' : 'smpp.provider.com'} disabled={formData.is_inbound} required={!formData.is_inbound} />
+              <Input label="SMPP Port" type="number" value={formData.smpp_port} onChange={e => updateField('smpp_port', parseInt(e.target.value))} disabled={formData.is_inbound} />
               <Input label="Username" value={formData.smpp_username} onChange={e => updateField('smpp_username', e.target.value)} error={errors.smpp_username} required />
               <div className="flex gap-2"><div className="flex-1"><Input label="Password" value={formData.smpp_password} onChange={e => updateField('smpp_password', e.target.value)} /></div><button type="button" onClick={generatePassword} className="mt-7 p-2.5 bg-gray-100 rounded-lg hover:bg-gray-200"><RefreshCw size={18} className="text-gray-600" /></button></div>
               <Input label="System ID" value={formData.system_id} onChange={e => updateField('system_id', e.target.value)} />
+              <div className="col-span-2 flex items-center gap-3 p-4 bg-yellow-50 rounded-lg border border-yellow-200">
+                <label className="flex items-center gap-3 cursor-pointer">
+                  <div className="relative">
+                    <input type="checkbox" checked={formData.is_inbound} onChange={e => updateField('is_inbound', e.target.checked)} className="sr-only peer" />
+                    <div className="w-10 h-5 bg-gray-300 rounded-full peer-checked:bg-yellow-500 transition-colors" />
+                    <div className="absolute left-0.5 top-0.5 w-4 h-4 bg-white rounded-full shadow peer-checked:translate-x-5 transition-transform" />
+                  </div>
+                  <div><p className="text-sm font-medium text-gray-800">Inbound Supplier Mode</p><p className="text-xs text-gray-500">Supplier connects TO us (no public IP needed). For GSM gateways behind NAT.</p></div>
+                </label>
+              </div>
             </div>
           </Card>
+          <Card title="SMPP Advanced Configuration">
+            <div className="grid grid-cols-2 gap-6">
+              <Select label="SMPP Version" value={formData.smpp_version} onChange={e => updateField('smpp_version', e.target.value)} options={[{value:'auto',label:'Auto-Detect'},{value:'3.4',label:'v3.4'},{value:'5.0',label:'v5.0'}]} />
+              <Input label="System Type" value={formData.smpp_system_type} onChange={e => updateField('smpp_system_type', e.target.value)} placeholder="(empty)" />
+              <Select label="Bind Type" value={formData.smpp_bind_type} onChange={e => updateField('smpp_bind_type', e.target.value)} options={[{value:'trx',label:'TRX (Transceiver)'},{value:'tx',label:'TX (Transmitter)'},{value:'rx',label:'RX (Receiver)'}]} />
+              <Input label="Address TON" type="number" value={formData.smpp_addr_ton} onChange={e => updateField('smpp_addr_ton', parseInt(e.target.value)||0)} />
+              <Input label="Address NPI" type="number" value={formData.smpp_addr_npi} onChange={e => updateField('smpp_addr_npi', parseInt(e.target.value)||0)} />
+              <Input label="Address Range" value={formData.smpp_addr_range} onChange={e => updateField('smpp_addr_range', e.target.value)} placeholder="system_id" />
+            </div>
+          </Card>
+          </>
         )}
 
         {/* Non-SMPP: Show available endpoints from other pages */}

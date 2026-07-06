@@ -76,15 +76,31 @@ export interface Supplier {
   smpp_password: string;
   system_id: string;
   
+  // SMPP Advanced
+  smpp_version: string;
+  smpp_system_type: string;
+  smpp_bind_type: string;
+  smpp_addr_ton: number;
+  smpp_addr_npi: number;
+  smpp_addr_range: string;
+  is_inbound: boolean;
+  
   // HTTP API
   api_url: string;
   api_key: string;
   api_method: 'GET' | 'POST';
   
+  // Connector/Device links
+  api_connector_id: string | null;
+  voice_otp_config_id: string | null;
+  whatsapp_device_ids: string | null;
+  telegram_device_ids: string | null;
+  
   // Billing
   balance: number;
   credit_limit: number;
   currency: Currency;
+  force_dlr: boolean;
   
   // Status
   bind_status: BindStatus;

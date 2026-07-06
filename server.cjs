@@ -130,10 +130,67 @@ app.get('/api/suppliers/:id', auth, async (req, res) => {
 
 app.post('/api/suppliers', auth, async (req, res) => {
     try {
-        const { supplier_code, company_name, connection_type, status } = req.body;
+        const b = req.body || {};
+        if (!b.supplier_code) return res.status(400).json({ error: 'supplier_code is required' });
+        if (!b.company_name) return res.status(400).json({ error: 'company_name is required' });
         const result = await pool.query(
-            `INSERT INTO suppliers (supplier_code, company_name, connection_type, status, created_at, updated_at) VALUES ($1, $2, $3, $4, NOW(), NOW()) RETURNING *`,
-            [supplier_code, company_name, connection_type, status || 'active']
+            `INSERT INTO suppliers (
+                supplier_code, company_name, contact_person, email, phone,
+                connection_type, smpp_host, smpp_port, smpp_username, smpp_password,
+                system_id, smpp_version, smpp_system_type, smpp_bind_type,
+                smpp_addr_ton, smpp_addr_npi, smpp_addr_range,
+                is_inbound, api_url, api_key, api_method,
+                api_connector_id, voice_otp_config_id,
+                whatsapp_device_ids, telegram_device_ids,
+                balance, credit_limit, currency,
+                bind_status, consecutive_failures, force_dlr, status,
+                created_at, updated_at
+            ) VALUES (
+                $1,$2,$3,$4,$5,
+                $6,$7,$8,$9,$10,
+                $11,$12,$13,$14,
+                $15,$16,$17,
+                $18,$19,$20,$21,
+                $22,$23,
+                $24,$25,
+                $26,$27,$28,
+                $29,$30,$31,$32,
+                NOW(), NOW()
+            ) RETURNING *`,
+            [
+                b.supplier_code,
+                b.company_name,
+                b.contact_person || '',
+                b.email || '',
+                b.phone || '',
+                b.connection_type || 'smpp',
+                b.smpp_host || '',
+                b.smpp_port || 2775,
+                b.smpp_username || '',
+                b.smpp_password || '',
+                b.system_id || '',
+                b.smpp_version || 'auto',
+                b.smpp_system_type || '',
+                b.smpp_bind_type || 'trx',
+                b.smpp_addr_ton ?? 0,
+                b.smpp_addr_npi ?? 0,
+                b.smpp_addr_range || '',
+                b.is_inbound || false,
+                b.api_url || '',
+                b.api_key || '',
+                b.api_method || 'POST',
+                b.api_connector_id || null,
+                b.voice_otp_config_id || null,
+                b.whatsapp_device_ids || null,
+                b.telegram_device_ids || null,
+                b.balance || 0,
+                b.credit_limit || 0,
+                b.currency || 'EUR',
+                b.bind_status || 'unbound',
+                b.consecutive_failures || 0,
+                b.force_dlr !== undefined ? b.force_dlr : false,
+                b.status || 'active'
+            ]
         );
         res.json({ success: true, data: result.rows[0] });
     } catch (error) {
@@ -144,10 +201,24 @@ app.post('/api/suppliers', auth, async (req, res) => {
 app.put('/api/suppliers/:id', auth, async (req, res) => {
     try {
         const { id } = req.params;
-        const { supplier_code, company_name, connection_type, status } = req.body;
+        const fields = req.body;
+        // Build dynamic SET clause for any field passed
+        const allowed = ['supplier_code','company_name','contact_person','email','phone','connection_type','smpp_host','smpp_port','smpp_username','smpp_password','system_id','smpp_version','smpp_system_type','smpp_bind_type','smpp_addr_ton','smpp_addr_npi','smpp_addr_range','is_inbound','api_url','api_key','api_method','api_connector_id','voice_otp_config_id','whatsapp_device_ids','telegram_device_ids','balance','credit_limit','currency','bind_status','consecutive_failures','force_dlr','status'];
+        const setParts = [];
+        const values = [];
+        let idx = 1;
+        for (const key of allowed) {
+            if (fields[key] !== undefined) {
+                setParts.push(`${key} = $${idx++}`);
+                values.push(fields[key]);
+            }
+        }
+        if (setParts.length === 0) return res.status(400).json({ error: 'No fields to update' });
+        setParts.push(`updated_at = NOW()`);
+        values.push(id);
         const result = await pool.query(
-            `UPDATE suppliers SET supplier_code = COALESCE($1, supplier_code), company_name = COALESCE($2, company_name), connection_type = COALESCE($3, connection_type), status = COALESCE($4, status), updated_at = NOW() WHERE id = $5 RETURNING *`,
-            [supplier_code, company_name, connection_type, status, id]
+            `UPDATE suppliers SET ${setParts.join(', ')} WHERE id = $${values.length} RETURNING *`,
+            values
         );
         if (result.rows.length === 0) return res.status(404).json({ error: 'Supplier not found' });
         res.json({ success: true, data: result.rows[0] });
