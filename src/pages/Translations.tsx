@@ -17,15 +17,6 @@ interface TransEntry {
   is_active: boolean; description: string; created_at: string;
 }
 
-const defaultTrans: TransEntry[] = [
-  { id:'1', name:'Bangla +880 Prefix', type:'number', priority:1, apply_to:'client', entity_id:'1', source_pattern:'^0(?=[1-9])', replace_pattern:'+880$&', is_active:true, description:'Add +880 prefix to Bangladesh numbers', created_at:'2024-01-15' },
-  { id:'2', name:'TechCorp SID Mask', type:'sid', priority:1, apply_to:'client', entity_id:'1', source_pattern:'TECHCORP', replace_pattern:'TC-MSG', is_active:true, description:'Mask sender ID', created_at:'2024-01-20' },
-  { id:'3', name:'OTP Extract', type:'content', priority:2, apply_to:'client', entity_id:'2', source_pattern:'\\b(\\d{4,8})\\b', replace_pattern:'{{OTP}}', is_active:true, description:'Extract OTP codes', created_at:'2024-02-01' },
-  { id:'4', name:'Dynamic Body', type:'dynamic_body', priority:3, apply_to:'client', entity_id:'3', source_pattern:'Your (.+) code is (\\d{4,8})', replace_pattern:'Your ${1} code is {{OTP}}', is_active:true, description:'Dynamic body with preserved context', created_at:'2024-02-10' },
-  { id:'5', name:'Random Body', type:'random_body', priority:4, apply_to:'client', entity_id:'1', source_pattern:'\\d{4,8}', replace_pattern:'Your code: {{OTP}}|Verification: {{OTP}}|Enter {{OTP}} to continue', is_active:true, description:'Random template for OTP messages', created_at:'2024-02-15' },
-  { id:'6', name:'Random SID', type:'random_sid', priority:5, apply_to:'supplier', entity_id:'2', source_pattern:'^[A-Z]{4,10}$', replace_pattern:'SENDER1|SENDER2|SENDER3|SENDER4', is_active:true, description:'Random sender ID rotation', created_at:'2024-03-01' },
-];
-
 const TYPE_LABELS: Record<TranslationType, {label:string;desc:string;color:'info'|'success'|'warning'|'purple'|'default'|'danger'}> = {
   number: {label:'Number',desc:'Prefix, E.164, formatting',color:'warning'},
   sid: {label:'Sender ID',desc:'Mask, alpha↔numeric',color:'info'},
@@ -62,7 +53,7 @@ function applyTrans(input:string, entry:TransEntry): string {
 
 export const TranslationsPage: React.FC = () => {
   const { clients, suppliers, translations: apiTranslations } = useData();
-  const [entries, setEntries] = useState<TransEntry[]>(() => { try { const s=localStorage.getItem('translations_db');if(s)return JSON.parse(s);}catch{}localStorage.setItem('translations_db',JSON.stringify(defaultTrans));return defaultTrans; });
+  const [entries, setEntries] = useState<TransEntry[]>([]);
   const seededRef = useRef(false);
   // Sync from API when data arrives — map DB columns to local TransEntry format (once)
   useEffect(() => {
@@ -107,11 +98,11 @@ export const TranslationsPage: React.FC = () => {
   };
   const save = () => {
     const data = { ...form, created_at: new Date().toISOString().split('T')[0] };
-    if (editing) { setEntries(p => { const n = p.map(x => x.id===editing.id ? {...x, ...form} : x); localStorage.setItem('translations_db',JSON.stringify(n)); return n; }); }
-    else { setEntries(p => { const n = [...p, {...data, id:Date.now().toString()}]; localStorage.setItem('translations_db',JSON.stringify(n)); return n; }); }
+    if (editing) { setEntries(p => { const n = p.map(x => x.id===editing.id ? {...x, ...form} : x); return n; }); }
+    else { setEntries(p => { const n = [...p, {...data, id:Date.now().toString()}]; return n; }); }
     setShowModal(false);
   };
-  const del = (id:string) => { setEntries(p => { const n = p.filter(x => x.id!==id); localStorage.setItem('translations_db',JSON.stringify(n)); return n; }); };
+  const del = (id:string) => { setEntries(p => { const n = p.filter(x => x.id!==id); return n; }); };
   const testTrans = () => {
     if (!editing && !form.source_pattern) { alert('Save or select a translation first'); return; }
     const entry = editing || {...form, id:'', created_at:''};

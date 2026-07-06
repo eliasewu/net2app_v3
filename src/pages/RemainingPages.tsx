@@ -200,10 +200,10 @@ export const RolesPage: React.FC = () => {
 export const PlatformSettings: React.FC = () => {
   const { platformSettings, updatePlatformSetting, smtpConfig, updateSMTPConfig } = useData();
   const [smtp, setSMTP] = useState(smtpConfig||{host:'',port:587,encryption:'tls',username:'',password:'',from_email:'',from_name:''});
-  const [bank, setBank] = useState(()=>{try{const s=localStorage.getItem('bank_info');if(s)return JSON.parse(s);}catch{}return {bank_name:'',bank_account:'',bank_iban:'',bank_bic:'',bank_swift:'',bank_address:'',beneficiary_name:''};});
+  const [bank, setBank] = useState({bank_name:'',bank_account:'',bank_iban:'',bank_bic:'',bank_swift:'',bank_address:'',beneficiary_name:''});
   const [saving, setSaving] = useState(false);
   const update=(k:string,v:any)=>updatePlatformSetting(k,v);
-  const handleSave = async () => { setSaving(true); await new Promise(r=>setTimeout(r,500)); updateSMTPConfig(smtp); localStorage.setItem('bank_info',JSON.stringify(bank)); setSaving(false); alert('All settings saved to database!'); };
+  const handleSave = async () => { setSaving(true); await new Promise(r=>setTimeout(r,500)); updateSMTPConfig(smtp); setSaving(false); alert('Settings saved!'); };
   return (<div className="space-y-6"><div className="flex items-center justify-between"><div><h1 className="text-2xl font-bold text-gray-800">Platform Settings</h1><p className="text-gray-500 mt-1">Platform, Company, SMTP & Bank details for invoices</p></div><Button onClick={handleSave} loading={saving}>Save All Settings</Button></div>
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
       <Card title="Platform & Company Information"><div className="space-y-3">

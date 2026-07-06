@@ -3,18 +3,6 @@ import { Client, Supplier, Trunk, Route, RoutePlan, Rate, MCCMNC, Invoice, Payme
 import { mockUsers, hourlyTrafficData, dailyRevenueData, topDestinations } from './mockData';
 import { api, clientsApi, suppliersApi, routingApi, smsApi } from '../services/api';
 
-// Database persistence — localStorage keys (PostgreSQL via API in production)
-const DB = {
-  clients: 'clients_db', suppliers: 'suppliers_db', sms_logs: 'sms_logs_db',
-  trunks: 'trunks_db', routes: 'routes_db', route_plans: 'route_plans_db',
-  rates: 'rates_db', mccmnc: 'mccmnc_db', invoices: 'invoices_db', payments: 'payments_db',
-  campaigns: 'campaigns_db', translations: 'translations_db', notifications: 'notifications_db',
-  ott_devices: 'ott_devices_db', platform_settings: 'platform_settings_db', smtp_config: 'smtp_config_db',
-  voice_otp_configs: 'voice_otp_configs_db', email_templates: 'email_templates_db',
-};
-function load<T>(key: string, fallback: T): T { try { const s=localStorage.getItem(key); if(s) return JSON.parse(s); } catch{} localStorage.setItem(key, JSON.stringify(fallback)); return fallback; }
-function save(key: string, v: any) { localStorage.setItem(key, JSON.stringify(v)); }
-
 
 interface DataContextType {
   clients: Client[]; suppliers: Supplier[]; trunks: Trunk[]; routes: Route[]; routePlans: RoutePlan[];
@@ -48,24 +36,24 @@ const gid=()=>'rec_'+Date.now()+'_'+Math.random().toString(36).substr(2,9);
 const nw=()=>new Date().toISOString();
 
 export const DataProvider:React.FC<{children:ReactNode}> = ({children}) => {
-  const [clients, setClients] = useState<Client[]>(()=>load(DB.clients,[]));
-  const [suppliers, setSuppliers] = useState<Supplier[]>(()=>load(DB.suppliers,[]));
-  const [trunks, setTrunks] = useState<Trunk[]>(()=>load(DB.trunks,[]));
-  const [routes, setRoutes] = useState<Route[]>(()=>load(DB.routes,[]));
-  const [routePlans, setRoutePlans] = useState<RoutePlan[]>(()=>load(DB.route_plans,[]));
-  const [rates, setRates] = useState<Rate[]>(()=>load(DB.rates,[]));
-  const [mccmnc, setMCCMNC] = useState<MCCMNC[]>(()=>load(DB.mccmnc,[]));
-  const [invoices, setInvoices] = useState<Invoice[]>(()=>load(DB.invoices,[]));
-  const [payments, setPayments] = useState<Payment[]>(()=>load(DB.payments,[]));
-  const [smsLogs, setSMSLogs] = useState<SMSLog[]>(()=>load(DB.sms_logs,[]));
-  const [ottDevices, setOTTDevices] = useState<OTTDevice[]>(()=>load(DB.ott_devices,[]));
-  const [notifications, setNotifications] = useState<Notification[]>(()=>load(DB.notifications,[]));
-  const [campaigns, setCampaigns] = useState<Campaign[]>(()=>load(DB.campaigns,[]));
-  const [translations, setTranslations] = useState<Translation[]>(()=>load(DB.translations,[]));
-  const [voiceOTPConfigs] = useState<VoiceOTPConfig[]>(()=>load(DB.voice_otp_configs,[]));
-  const [platformSettings, setPlatformSettings] = useState<Record<string,string>>(()=>load(DB.platform_settings,{platform_name:'NET2APP Hub',currency:'EUR',default_tax_rate:'19.00'}));
-  const [smtpConfig, setSMTPConfig] = useState<any>(()=>load(DB.smtp_config,{host:'smtp.gmail.com',port:587,encryption:'tls'}));
-  const [emailTemplates, setEmailTemplates] = useState<EmailTemplate[]>(()=>load(DB.email_templates,[]));
+  const [clients, setClients] = useState<Client[]>([]);
+  const [suppliers, setSuppliers] = useState<Supplier[]>([]);
+  const [trunks, setTrunks] = useState<Trunk[]>([]);
+  const [routes, setRoutes] = useState<Route[]>([]);
+  const [routePlans, setRoutePlans] = useState<RoutePlan[]>([]);
+  const [rates, setRates] = useState<Rate[]>([]);
+  const [mccmnc, setMCCMNC] = useState<MCCMNC[]>([]);
+  const [invoices, setInvoices] = useState<Invoice[]>([]);
+  const [payments, setPayments] = useState<Payment[]>([]);
+  const [smsLogs, setSMSLogs] = useState<SMSLog[]>([]);
+  const [ottDevices, setOTTDevices] = useState<OTTDevice[]>([]);
+  const [notifications, setNotifications] = useState<Notification[]>([]);
+  const [campaigns, setCampaigns] = useState<Campaign[]>([]);
+  const [translations, setTranslations] = useState<Translation[]>([]);
+  const [voiceOTPConfigs] = useState<VoiceOTPConfig[]>([]);
+  const [platformSettings, setPlatformSettings] = useState<Record<string,string>>({platform_name:'NET2APP Hub',currency:'EUR',default_tax_rate:'19.00'});
+  const [smtpConfig, setSMTPConfig] = useState<any>({host:'smtp.gmail.com',port:587,encryption:'tls'});
+  const [emailTemplates, setEmailTemplates] = useState<EmailTemplate[]>([]);
 
   // ========== Fetch real data from PostgreSQL API on mount ==========
   useEffect(() => {
@@ -92,37 +80,37 @@ export const DataProvider:React.FC<{children:ReactNode}> = ({children}) => {
         const pd: any = plansRes.data;
         const md: any = smsRes.data;
         if (clientsRes.success && cd?.data) {
-          setClients(cd.data); save(DB.clients, cd.data);
+          setClients(cd.data);
         }
         if (suppliersRes.success && sd?.data) {
-          setSuppliers(sd.data); save(DB.suppliers, sd.data);
+          setSuppliers(sd.data);
         }
         if (trunksRes.success && td?.data) {
-          setTrunks(td.data); save(DB.trunks, td.data);
+          setTrunks(td.data);
         }
         if (routesRes.success && rd?.data) {
-          setRoutes(rd.data); save(DB.routes, rd.data);
+          setRoutes(rd.data);
         }
         if (plansRes.success && pd?.data) {
-          setRoutePlans(pd.data); save(DB.route_plans, pd.data);
+          setRoutePlans(pd.data);
         }
         if (smsRes.success && (md as any)?.data) {
-          setSMSLogs((md as any).data); save(DB.sms_logs, (md as any).data);
+          setSMSLogs((md as any).data);
         }
         const rd2: any = ratesRes.data;
-        if (ratesRes.success && rd2?.data) { setRates(rd2.data); save(DB.rates, rd2.data); }
+        if (ratesRes.success && rd2?.data) { setRates(rd2.data); }
         const mmd: any = mccmncRes.data;
-        if (mccmncRes.success && mmd?.data) { setMCCMNC(mmd.data); save(DB.mccmnc, mmd.data); }
+        if (mccmncRes.success && mmd?.data) { setMCCMNC(mmd.data); }
         const invd: any = invoicesRes.data;
-        if (invoicesRes.success && invd?.data) { setInvoices(invd.data); save(DB.invoices, invd.data); }
+        if (invoicesRes.success && invd?.data) { setInvoices(invd.data); }
         const payd: any = paymentsRes.data;
-        if (paymentsRes.success && payd?.data) { setPayments(payd.data); save(DB.payments, payd.data); }
+        if (paymentsRes.success && payd?.data) { setPayments(payd.data); }
         const campd: any = campaignsRes.data;
-        if (campaignsRes.success && campd?.data) { setCampaigns(campd.data); save(DB.campaigns, campd.data); }
+        if (campaignsRes.success && campd?.data) { setCampaigns(campd.data); }
         const trad: any = translationsRes.data;
-        if (translationsRes.success && trad?.data) { setTranslations(trad.data); save(DB.translations, trad.data); }
+        if (translationsRes.success && trad?.data) { setTranslations(trad.data); }
       } catch (e) {
-        console.warn('[DataContext] API fetch failed, using localStorage cache:', e);
+        console.warn('[DataContext] API fetch failed:', e);
       }
     };
     fetchAll();
@@ -132,117 +120,117 @@ export const DataProvider:React.FC<{children:ReactNode}> = ({children}) => {
   const addClient=useCallback(async (c:Omit<Client,'id'|'created_at'|'updated_at'>) => {
     const res = await clientsApi.create(c);
     if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to create client');
-    setClients(p => { const n = [...p, res.data.data]; save(DB.clients, n); return n; });
+    setClients(p => { const n = [...p, res.data.data];return n; });
   },[]);
   const updateClient=useCallback(async (id:string,c:Partial<Client>) => {
     const res = await clientsApi.update(id, c);
     if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to update client');
-    setClients(p => { const n = p.map(x => x.id === id ? res.data.data : x); save(DB.clients, n); return n; });
+    setClients(p => { const n = p.map(x => x.id === id ? res.data.data : x);return n; });
   },[]);
   const deleteClient=useCallback(async (id:string) => {
     const res = await clientsApi.delete(id);
     if (!res.success) throw new Error(res.error || 'Failed to delete client');
-    setClients(p => { const n = p.filter(x => x.id !== id); save(DB.clients, n); return n; });
+    setClients(p => { const n = p.filter(x => x.id !== id);return n; });
   },[]);
 
   // Supplier CRUD — call API + throw on failure for form error handling
   const addSupplier=useCallback(async (s:Omit<Supplier,'id'|'created_at'|'updated_at'>) => {
     const res = await suppliersApi.create(s);
     if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to create supplier');
-    setSuppliers(p => { const n = [...p, res.data.data]; save(DB.suppliers, n); return n; });
+    setSuppliers(p => { const n = [...p, res.data.data];return n; });
   },[]);
   const updateSupplier=useCallback(async (id:string,s:Partial<Supplier>) => {
     const res = await suppliersApi.update(id, s);
     if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to update supplier');
-    setSuppliers(p => { const n = p.map(x => x.id === id ? res.data.data : x); save(DB.suppliers, n); return n; });
+    setSuppliers(p => { const n = p.map(x => x.id === id ? res.data.data : x);return n; });
   },[]);
   const deleteSupplier=useCallback(async (id:string) => {
     const res = await suppliersApi.delete(id);
     if (!res.success) throw new Error(res.error || 'Failed to delete supplier');
-    setSuppliers(p => { const n = p.filter(x => x.id !== id); save(DB.suppliers, n); return n; });
+    setSuppliers(p => { const n = p.filter(x => x.id !== id);return n; });
   },[]);
 
   // SMS Logs
-  const addSMSLog=useCallback((log:Omit<SMSLog,'id'|'created_at'|'submit_time'>)=>{const nl:SMSLog={...log,id:gid(),submit_time:nw(),created_at:nw(),supplier_id:log.supplier_id??null,supplier_code:log.supplier_code??null,dlr_status:log.dlr_status??null,dlr_timestamp:log.dlr_timestamp??null,delivery_time:log.delivery_time??null,error_code:log.error_code??null,error_message:log.error_message??null,route_name:log.route_name??null,trunk_name:log.trunk_name??null};setSMSLogs(p=>{const n=[nl,...p];save(DB.sms_logs,n);return n;});},[]);
+  const addSMSLog=useCallback((log:Omit<SMSLog,'id'|'created_at'|'submit_time'>)=>{const nl:SMSLog={...log,id:gid(),submit_time:nw(),created_at:nw(),supplier_id:log.supplier_id??null,supplier_code:log.supplier_code??null,dlr_status:log.dlr_status??null,dlr_timestamp:log.dlr_timestamp??null,delivery_time:log.delivery_time??null,error_code:log.error_code??null,error_message:log.error_message??null,route_name:log.route_name??null,trunk_name:log.trunk_name??null};setSMSLogs(p=>{const n=[nl,...p];return n;});},[]);
 
   // Trunks, Routes, Plans
-  const addTrunk=useCallback((t:Omit<Trunk,'id'|'created_at'>)=>{setTrunks(p=>{const n=[...p,{...t,id:gid(),created_at:nw()}];save(DB.trunks,n);return n;});},[]);
-  const updateTrunk=useCallback((id:string,t:Partial<Trunk>)=>{setTrunks(p=>{const n=p.map(x=>x.id===id?{...x,...t}:x);save(DB.trunks,n);return n;});},[]);
-  const deleteTrunk=useCallback((id:string)=>{setTrunks(p=>{const n=p.filter(x=>x.id!==id);save(DB.trunks,n);return n;});},[]);
-  const addRoute=useCallback((r:Omit<Route,'id'|'created_at'>)=>{setRoutes(p=>{const n=[...p,{...r,id:gid(),created_at:nw()}];save(DB.routes,n);return n;});},[]);
-  const updateRoute=useCallback((id:string,r:Partial<Route>)=>{setRoutes(p=>{const n=p.map(x=>x.id===id?{...x,...r}:x);save(DB.routes,n);return n;});},[]);
-  const deleteRoute=useCallback((id:string)=>{setRoutes(p=>{const n=p.filter(x=>x.id!==id);save(DB.routes,n);return n;});},[]);
-  const addRoutePlan=useCallback((p:Omit<RoutePlan,'id'|'created_at'>)=>{setRoutePlans(prev=>{const n=[...prev,{...p,id:gid(),created_at:nw()}];save(DB.route_plans,n);return n;});},[]);
-  const updateRoutePlan=useCallback((id:string,p:Partial<RoutePlan>)=>{setRoutePlans(prev=>{const n=prev.map(x=>x.id===id?{...x,...p}:x);save(DB.route_plans,n);return n;});},[]);
-  const deleteRoutePlan=useCallback((id:string)=>{setRoutePlans(prev=>{const n=prev.filter(x=>x.id!==id);save(DB.route_plans,n);return n;});},[]);
+  const addTrunk=useCallback((t:Omit<Trunk,'id'|'created_at'>)=>{setTrunks(p=>{const n=[...p,{...t,id:gid(),created_at:nw()}];return n;});},[]);
+  const updateTrunk=useCallback((id:string,t:Partial<Trunk>)=>{setTrunks(p=>{const n=p.map(x=>x.id===id?{...x,...t}:x);return n;});},[]);
+  const deleteTrunk=useCallback((id:string)=>{setTrunks(p=>{const n=p.filter(x=>x.id!==id);return n;});},[]);
+  const addRoute=useCallback((r:Omit<Route,'id'|'created_at'>)=>{setRoutes(p=>{const n=[...p,{...r,id:gid(),created_at:nw()}];return n;});},[]);
+  const updateRoute=useCallback((id:string,r:Partial<Route>)=>{setRoutes(p=>{const n=p.map(x=>x.id===id?{...x,...r}:x);return n;});},[]);
+  const deleteRoute=useCallback((id:string)=>{setRoutes(p=>{const n=p.filter(x=>x.id!==id);return n;});},[]);
+  const addRoutePlan=useCallback((p:Omit<RoutePlan,'id'|'created_at'>)=>{setRoutePlans(prev=>{const n=[...prev,{...p,id:gid(),created_at:nw()}];return n;});},[]);
+  const updateRoutePlan=useCallback((id:string,p:Partial<RoutePlan>)=>{setRoutePlans(prev=>{const n=prev.map(x=>x.id===id?{...x,...p}:x);return n;});},[]);
+  const deleteRoutePlan=useCallback((id:string)=>{setRoutePlans(prev=>{const n=prev.filter(x=>x.id!==id);return n;});},[]);
 
   // Rates
-  const addRate=useCallback((r:Omit<Rate,'id'>)=>{setRates(p=>{const n=[...p,{...r,id:gid()}];save(DB.rates,n);return n;});},[]);
-  const updateRate=useCallback((id:string,r:Partial<Rate>)=>{setRates(p=>{const n=p.map(x=>x.id===id?{...x,...r}:x);save(DB.rates,n);return n;});},[]);
-  const deleteRate=useCallback((id:string)=>{setRates(p=>{const n=p.filter(x=>x.id!==id);save(DB.rates,n);return n;});},[]);
+  const addRate=useCallback((r:Omit<Rate,'id'>)=>{setRates(p=>{const n=[...p,{...r,id:gid()}];return n;});},[]);
+  const updateRate=useCallback((id:string,r:Partial<Rate>)=>{setRates(p=>{const n=p.map(x=>x.id===id?{...x,...r}:x);return n;});},[]);
+  const deleteRate=useCallback((id:string)=>{setRates(p=>{const n=p.filter(x=>x.id!==id);return n;});},[]);
 
   // MCCMNC
-  const addMCCMNC=useCallback((m:Omit<MCCMNC,'id'>)=>{setMCCMNC(p=>{const n=[...p,{...m,id:gid()}];save(DB.mccmnc,n);return n;});},[]);
-  const updateMCCMNC=useCallback((id:string,m:Partial<MCCMNC>)=>{setMCCMNC(p=>{const n=p.map(x=>x.id===id?{...x,...m}:x);save(DB.mccmnc,n);return n;});},[]);
-  const deleteMCCMNC=useCallback((id:string)=>{setMCCMNC(p=>{const n=p.filter(x=>x.id!==id);save(DB.mccmnc,n);return n;});},[]);
+  const addMCCMNC=useCallback((m:Omit<MCCMNC,'id'>)=>{setMCCMNC(p=>{const n=[...p,{...m,id:gid()}];return n;});},[]);
+  const updateMCCMNC=useCallback((id:string,m:Partial<MCCMNC>)=>{setMCCMNC(p=>{const n=p.map(x=>x.id===id?{...x,...m}:x);return n;});},[]);
+  const deleteMCCMNC=useCallback((id:string)=>{setMCCMNC(p=>{const n=p.filter(x=>x.id!==id);return n;});},[]);
 
   // Invoices, Payments
   const addInvoice=useCallback(async (i:Omit<Invoice,'id'|'created_at'>) => {
     const res: any = await api.post('/invoices', i);
     if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to create invoice');
-    setInvoices(p=>{const n=[...p,res.data.data];save(DB.invoices,n);return n;});
+    setInvoices(p=>{const n=[...p,res.data.data];return n;});
   },[]);
   const updateInvoice=useCallback(async (id:string,i:Partial<Invoice>) => {
     const res: any = await api.put(`/invoices/${id}`, i);
     if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to update invoice');
-    setInvoices(p=>{const n=p.map(x=>x.id===id?res.data.data:x);save(DB.invoices,n);return n;});
+    setInvoices(p=>{const n=p.map(x=>x.id===id?res.data.data:x);return n;});
   },[]);
   const addPayment=useCallback(async (p:Omit<Payment,'id'|'created_at'>) => {
     const res: any = await api.post('/payments', p);
     if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to create payment');
-    setPayments(prev=>{const n=[...prev,res.data.data];save(DB.payments,n);return n;});
+    setPayments(prev=>{const n=[...prev,res.data.data];return n;});
   },[]);
 
   // OTT, Notifications, Campaigns, Translations
-  const addOTTDevice=useCallback((d:Omit<OTTDevice,'id'|'created_at'>)=>{setOTTDevices(p=>{const n=[...p,{...d,id:gid(),created_at:nw()}];save(DB.ott_devices,n);return n;});},[]);
-  const updateOTTDevice=useCallback((id:string,d:Partial<OTTDevice>)=>{setOTTDevices(p=>{const n=p.map(x=>x.id===id?{...x,...d}:x);save(DB.ott_devices,n);return n;});},[]);
-  const deleteOTTDevice=useCallback((id:string)=>{setOTTDevices(p=>{const n=p.filter(x=>x.id!==id);save(DB.ott_devices,n);return n;});},[]);
-  const markNotificationRead=useCallback((id:string)=>{setNotifications(p=>{const n=p.map(x=>x.id===id?{...x,is_read:true}:x);save(DB.notifications,n);return n;});},[]);
+  const addOTTDevice=useCallback((d:Omit<OTTDevice,'id'|'created_at'>)=>{setOTTDevices(p=>{const n=[...p,{...d,id:gid(),created_at:nw()}];return n;});},[]);
+  const updateOTTDevice=useCallback((id:string,d:Partial<OTTDevice>)=>{setOTTDevices(p=>{const n=p.map(x=>x.id===id?{...x,...d}:x);return n;});},[]);
+  const deleteOTTDevice=useCallback((id:string)=>{setOTTDevices(p=>{const n=p.filter(x=>x.id!==id);return n;});},[]);
+  const markNotificationRead=useCallback((id:string)=>{setNotifications(p=>{const n=p.map(x=>x.id===id?{...x,is_read:true}:x);return n;});},[]);
   const addCampaign=useCallback(async (c:Omit<Campaign,'id'|'created_at'>) => {
     const res: any = await api.post('/campaigns', c);
     if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to create campaign');
-    setCampaigns(p=>{const n=[...p,res.data.data];save(DB.campaigns,n);return n;});
+    setCampaigns(p=>{const n=[...p,res.data.data];return n;});
   },[]);
   const updateCampaign=useCallback(async (id:string,c:Partial<Campaign>) => {
     const res: any = await api.put(`/campaigns/${id}`, c);
     if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to update campaign');
-    setCampaigns(p=>{const n=p.map(x=>x.id===id?res.data.data:x);save(DB.campaigns,n);return n;});
+    setCampaigns(p=>{const n=p.map(x=>x.id===id?res.data.data:x);return n;});
   },[]);
   const deleteCampaign=useCallback(async (id:string) => {
     const res: any = await api.delete(`/campaigns/${id}`);
     if (!res.success) throw new Error(res.error || 'Failed to delete campaign');
-    setCampaigns(p=>{const n=p.filter(x=>x.id!==id);save(DB.campaigns,n);return n;});
+    setCampaigns(p=>{const n=p.filter(x=>x.id!==id);return n;});
   },[]);
   const addTranslation=useCallback(async (t:Omit<Translation,'id'|'created_at'>) => {
     const res: any = await api.post('/translations', t);
     if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to create translation');
-    setTranslations(p=>{const n=[...p,res.data.data];save(DB.translations,n);return n;});
+    setTranslations(p=>{const n=[...p,res.data.data];return n;});
   },[]);
   const updateTranslation=useCallback(async (id:string,t:Partial<Translation>) => {
     const res: any = await api.put(`/translations/${id}`, t);
     if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to update translation');
-    setTranslations(p=>{const n=p.map(x=>x.id===id?res.data.data:x);save(DB.translations,n);return n;});
+    setTranslations(p=>{const n=p.map(x=>x.id===id?res.data.data:x);return n;});
   },[]);
   const deleteTranslation=useCallback(async (id:string) => {
     const res: any = await api.delete(`/translations/${id}`);
     if (!res.success) throw new Error(res.error || 'Failed to delete translation');
-    setTranslations(p=>{const n=p.filter(x=>x.id!==id);save(DB.translations,n);return n;});
+    setTranslations(p=>{const n=p.filter(x=>x.id!==id);return n;});
   },[]);
 
   // Settings
-  const updatePlatformSetting=useCallback((key:string,value:string)=>{setPlatformSettings(p=>{const n={...p,[key]:value};save(DB.platform_settings,n);return n;});},[]);
-  const updateSMTPConfig=useCallback((data:any)=>{setSMTPConfig((prev:any)=>{const n={...prev,...data};save(DB.smtp_config,n);return n;});},[]);
-  const updateEmailTemplate=useCallback((id:string,data:Partial<EmailTemplate>)=>{setEmailTemplates(p=>{const n=p.map(t=>t.id===id?{...t,...data}:t);save(DB.email_templates,n);return n;});},[]);
+  const updatePlatformSetting=useCallback((key:string,value:string)=>{setPlatformSettings(p=>{const n={...p,[key]:value};return n;});},[]);
+  const updateSMTPConfig=useCallback((data:any)=>{setSMTPConfig((prev:any)=>{const n={...prev,...data};return n;});},[]);
+  const updateEmailTemplate=useCallback((id:string,data:Partial<EmailTemplate>)=>{setEmailTemplates(p=>{const n=p.map(t=>t.id===id?{...t,...data}:t);return n;});},[]);
 
   const getClientById=(id:string)=>clients.find(c=>c.id===id);
   const getSupplierById=(id:string)=>suppliers.find(s=>s.id===id);
