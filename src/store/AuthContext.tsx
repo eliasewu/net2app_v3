@@ -40,16 +40,11 @@ const INITIAL_USERS: UserRecord[] = [
   { id:'5', username:'globalsms_user', password:'globalsms123', email:'user@globalsms.com', role:'supplier', supplier_id:'1', permissions:['view_own_cdr','view_own_usage','view_own_payments','view_bind_status'], name:'GlobalSMS Supplier', is_active:true, created_by:'admin' },
 ];
 
-function loadUsers(): UserRecord[] { try { const s=localStorage.getItem('pg_users_db');if(s){const p=JSON.parse(s);if(Array.isArray(p)&&p.length>0)return p;}}catch{} localStorage.setItem('pg_users_db',JSON.stringify(INITIAL_USERS));return INITIAL_USERS; }
-function loadPasswords(): Record<string,string> { try { const s=localStorage.getItem('pg_passwords_db');if(s){const p=JSON.parse(s);if(Object.keys(p).length>0)return p;}}catch{} const pwd:Record<string,string>={};INITIAL_USERS.forEach(u=>{pwd[u.username]=u.password;});localStorage.setItem('pg_passwords_db',JSON.stringify(pwd));return pwd; }
-function saveUsers(u: UserRecord[]) { localStorage.setItem('pg_users_db',JSON.stringify(u)); }
-function savePasswords(p: Record<string,string>) { localStorage.setItem('pg_passwords_db',JSON.stringify(p)); }
-
 export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [user, setUser] = useState<User | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [usersDb, setUsersDb] = useState<UserRecord[]>(loadUsers);
-  const [passwordsDb, setPasswordsDb] = useState<Record<string,string>>(loadPasswords);
+  const [usersDb, setUsersDb] = useState<UserRecord[]>(INITIAL_USERS);
+  const [passwordsDb, setPasswordsDb] = useState<Record<string,string>>(() => { const pwd:Record<string,string>={};INITIAL_USERS.forEach(u=>{pwd[u.username]=u.password;});return pwd; });
 
   // Restore session from stored JWT token on mount
   useEffect(() => {
@@ -106,9 +101,9 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     if(!user)return;
     // Admins cannot create super_admin accounts
     if(user.role==='admin'&&nu.role==='super_admin'){alert('Only Super Admin can create Super Admin accounts');return;}
-    const id=String(Date.now());const r:UserRecord={...nu,id,is_active:true,password:pw,created_by:user.username};
-    const up=[...usersDb,r];setUsersDb(up);saveUsers(up);
-    setPasswordsDb(prev=>{const n={...prev,[nu.username]:pw};savePasswords(n);return n;});
+    const id=String(Date.now());    const r:UserRecord={...nu,id,is_active:true,password:pw,created_by:user.username};
+    const up=[...usersDb,r];setUsersDb(up);
+    setPasswordsDb(prev=>{const n={...prev,[nu.username]:pw};return n;});
   };
 
   const updateUser=(id:string,data:Partial<User>)=>{
@@ -119,28 +114,28 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     if(user&&user.role==='admin'&&data.role==='super_admin'){alert('Only Super Admin can grant super_admin role');return;}
     // Admin cannot change their own role
     if(user&&user.role==='admin'&&id===user.id&&data.role&&data.role!=='admin'){alert('You cannot change your own role');return;}
-    const up=usersDb.map(u=>u.id===id?{...u,...data}:u);setUsersDb(up);saveUsers(up);
+    const up=usersDb.map(u=>u.id===id?{...u,...data}:u);setUsersDb(up);
     if(user&&user.id===id){const f=up.find(u=>u.id===id);if(f){const{password,...s}=f;setUser(s);}}
   };
 
   const deleteUser=(id:string)=>{
     const target=usersDb.find(u=>u.id===id);
     if(user&&user.role==='admin'&&target?.role==='super_admin'){alert('Admin cannot delete Super Admin users');return;}
-    const up=usersDb.filter(u=>u.id!==id);setUsersDb(up);saveUsers(up);
-    if(target){setPasswordsDb(prev=>{const n={...prev};delete n[target.username];savePasswords(n);return n;});}
+    const up=usersDb.filter(u=>u.id!==id);setUsersDb(up);
+    if(target){setPasswordsDb(prev=>{const n={...prev};delete n[target.username];return n;});}
   };
 
   const toggleUserBlock=(id:string)=>{
     const target=usersDb.find(u=>u.id===id);
     if(user&&user.role==='admin'&&target?.role==='super_admin'){alert('Admin cannot block Super Admin users');return;}
-    const up=usersDb.map(u=>u.id===id?{...u,is_active:!u.is_active}:u);setUsersDb(up);saveUsers(up);
+    const up=usersDb.map(u=>u.id===id?{...u,is_active:!u.is_active}:u);setUsersDb(up);
   };
 
   const resetPassword=(id:string,np:string)=>{
     const target=usersDb.find(u=>u.id===id);
     if(user&&user.role==='admin'&&target?.role==='super_admin'){alert('Admin cannot reset Super Admin password');return;}
     const f=usersDb.find(u=>u.id===id);
-    if(f){setPasswordsDb(prev=>{const n={...prev,[f.username]:np};savePasswords(n);return n;});}
+    if(f){setPasswordsDb(prev=>{const n={...prev,[f.username]:np};return n;});}
   };
 
   // Super admin can change own password (requires current password)
@@ -148,7 +143,7 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     if(!user)return false;
     const currentPwd=passwordsDb[user.username];
     if(currentPwd!==currentPassword)return false;
-    setPasswordsDb(prev=>{const n={...prev,[user.username]:newPassword};savePasswords(n);return n;});
+    setPasswordsDb(prev=>{const n={...prev,[user.username]:newPassword};return n;});
     return true;
   };
 

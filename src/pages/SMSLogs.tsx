@@ -22,20 +22,14 @@ export const SMSLogs: React.FC = () => {
   const [clientFilter, setClientFilter] = useState<string>('all'); const [sourceFilter, setSourceFilter] = useState<string>('all');
   const [currentPage, setCurrentPage] = useState(1); const [detailModal, setDetailModal] = useState<ExtendedLog | null>(null);
 
-  // Load voice OTP logs + OTT logs and merge with SMS logs
-  const voiceLogs: ExtendedLog[] = (() => {
-    try { return JSON.parse(localStorage.getItem('voice_logs_db')||'[]').map((l:any) => ({...l, message_id:l.call_id, sender_id:'VoiceOTP', source:'voice_otp', message:l.otp_code||'', status:l.status, submit_time:l.created_at, client_code:'CLT001', supplier_code:'SUP005'})); } catch {}
-    return [];
-  })();
+  // Voice OTP logs come from the API (merged with SMS logs server-side)
+  const voiceLogs: ExtendedLog[] = [];
 
-  // OTT device logs from localStorage  
+  // OTT device logs
   const ottLogs: ExtendedLog[] = [];
   
-  // Test call logs from voice OTP test
-  const testCalls: ExtendedLog[] = (() => {
-    try { const s = localStorage.getItem('voice_logs_db'); if (s) { return JSON.parse(s).map((l:any)=>({...l, message_id:l.call_id, sender_id:'TestCall', source:'voice_otp_test', message:l.otp_code||'', status:l.status, submit_time:l.created_at, client_code:'TEST', supplier_code:'SUP005'})); } } catch {}
-    return [];
-  })();
+  // Test call logs
+  const testCalls: ExtendedLog[] = [];
 
   const smsLogEntries: ExtendedLog[] = smsLogs.map(l=>({id:l.id,message_id:l.message_id,destination:l.destination,sender_id:l.sender_id,message:l.message,status:l.status,client_code:l.client_code||undefined,supplier_code:l.supplier_code||undefined,country:l.country,operator:l.operator,mcc:l.mcc,mnc:l.mnc,route_name:l.route_name||undefined,trunk_name:l.trunk_name||undefined,client_rate:l.client_rate,supplier_rate:l.supplier_rate,profit:l.profit,currency:l.currency,dlr_status:l.dlr_status||undefined,submit_time:l.submit_time||'',delivery_time:l.delivery_time||undefined,source:'smpp',error_code:l.error_code||undefined,error_message:l.error_message||undefined}));
 

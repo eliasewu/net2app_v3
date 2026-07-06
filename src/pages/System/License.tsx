@@ -177,11 +177,8 @@ async function detectServerInfo(): Promise<{ ip: string; mac: string }> {
 }
 
 // Load/Save
-function load<T>(key: string, fallback: T): T { try { const s=localStorage.getItem(key); if(s) return JSON.parse(s); } catch{} return fallback; }
-function save<T>(key: string, v: T) { localStorage.setItem(key, JSON.stringify(v)); }
-
-// Default license — Trial 1000 SMS
-const defaultLicense: LicenseInfo = {
+  const [license, setLicense] = useState<LicenseInfo>(defaultLicense);
+  const [tenants, setTenants] = useState<Tenant[]>(defaultTenants);
   key: 'N2A-TRI-2026-UZ1P-IQGQ-7Z7F',
   type: 'trial',
   status: 'active',
@@ -213,8 +210,8 @@ const defaultTenants: Tenant[] = [
 export const License: React.FC = () => {
   const { user, verifySuperAdmin } = useAuth();
   const isSuperUser = user?.role === 'super_admin';
-  const [license, setLicense] = useState<LicenseInfo>(() => load('license_active', defaultLicense));
-  const [tenants, setTenants] = useState<Tenant[]>(() => load('license_tenants', defaultTenants));
+  const [license, setLicense] = useState<LicenseInfo>(defaultLicense);
+  const [tenants, setTenants] = useState<Tenant[]>(defaultTenants);
   const [serverIP, setServerIP] = useState('');
   const [serverMAC, setServerMAC] = useState('');
   const [detecting, setDetecting] = useState(false);
@@ -247,7 +244,7 @@ export const License: React.FC = () => {
       // Auto-update license with detected IP/MAC if not set
       if (!license.system_ip || license.system_ip === '192.168.1.100') {
         const updated = { ...license, system_ip: ip, system_mac: mac };
-        setLicense(updated); save('license_active', updated);
+        setLicense(updated);
       }
     }).catch(() => {});
   }, []);
@@ -313,7 +310,7 @@ export const License: React.FC = () => {
       activated_at: new Date().toISOString(),
       usage: { sms_this_month: 0, sms_total: 0, days_used: 0 },
     };
-    setLicense(updated); save('license_active', updated); setShowActivate(false);
+    setLicense(updated); setShowActivate(false);
     alert(`✅ License activated!\nPackage: ${pkg.name}\nSMS/Month: ${pkg.sms_monthly.toLocaleString()}\nMax TPS: ${pkg.max_tps}`);
   };
 
@@ -327,7 +324,7 @@ export const License: React.FC = () => {
       extended_at: new Date().toISOString(),
       extension_sms: (license.extension_sms || 0) + extendSMS,
     };
-    setLicense(extended); save('license_active', extended); setShowExtendModal(false);
+    setLicense(extended); setShowExtendModal(false);
     alert(`✅ Volume extended by ${extendSMS.toLocaleString()} SMS\nNew total: ${extended.limits.max_sms_monthly.toLocaleString()} SMS/Month`);
   };
 
@@ -354,12 +351,12 @@ export const License: React.FC = () => {
   };
   const saveTenant = () => {
     requireSuperAuth(() => {
-      if (editingTenant) { setTenants(p => { const n = p.map(t => t.id === editingTenant.id ? { ...t, ...tenantForm } : t); save('license_tenants', n); return n; }); }
-      else { setTenants(p => { const n = [...p, { ...tenantForm, id: Date.now().toString(), status: 'active' as const, usage: { sms_this_month: 0, current_tps: 0, sms_today: 0 }, license_expiry: license.expiry_date, created_at: new Date().toISOString().split('T')[0] }]; save('license_tenants', n); return n; }); }
+      if (editingTenant) { setTenants(p => { const n = p.map(t => t.id === editingTenant.id ? { ...t, ...tenantForm } : t); return n; }); }
+      else { setTenants(p => { const n = [...p, { ...tenantForm, id: Date.now().toString(), status: 'active' as const, usage: { sms_this_month: 0, current_tps: 0, sms_today: 0 }, license_expiry: license.expiry_date, created_at: new Date().toISOString().split('T')[0] }]; return n; }); }
       setShowTenantModal(false);
     });
   };
-  const deleteTenant = (id: string) => { requireSuperAuth(() => { setTenants(p => { const n = p.filter(t => t.id !== id); save('license_tenants', n); return n; }); }); };
+  const deleteTenant = (id: string) => { requireSuperAuth(() => { setTenants(p => { const n = p.filter(t => t.id !== id); return n; }); }); };
 
   const pkg = PACKAGES[license.type];
   const daysRemaining = Math.max(0, (pkg?.days || 30) - license.usage.days_used);

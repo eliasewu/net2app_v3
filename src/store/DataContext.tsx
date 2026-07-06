@@ -14,11 +14,11 @@ interface DataContextType {
   addClient:(c:Omit<Client,'id'|'created_at'|'updated_at'>)=>Promise<void>; updateClient:(id:string,c:Partial<Client>)=>Promise<void>; deleteClient:(id:string)=>Promise<void>;
   addSupplier:(s:Omit<Supplier,'id'|'created_at'|'updated_at'>)=>Promise<void>; updateSupplier:(id:string,s:Partial<Supplier>)=>Promise<void>; deleteSupplier:(id:string)=>Promise<void>;
   addSMSLog:(log:Omit<SMSLog,'id'|'created_at'|'submit_time'>)=>void;
-  addTrunk:(t:Omit<Trunk,'id'|'created_at'>)=>void; updateTrunk:(id:string,t:Partial<Trunk>)=>void; deleteTrunk:(id:string)=>void;
-  addRoute:(r:Omit<Route,'id'|'created_at'>)=>void; updateRoute:(id:string,r:Partial<Route>)=>void; deleteRoute:(id:string)=>void;
-  addRoutePlan:(p:Omit<RoutePlan,'id'|'created_at'>)=>void; updateRoutePlan:(id:string,p:Partial<RoutePlan>)=>void; deleteRoutePlan:(id:string)=>void;
+  addTrunk:(t:Omit<Trunk,'id'|'created_at'>)=>Promise<void>; updateTrunk:(id:string,t:Partial<Trunk>)=>Promise<void>; deleteTrunk:(id:string)=>Promise<void>;
+  addRoute:(r:Omit<Route,'id'|'created_at'>)=>Promise<void>; updateRoute:(id:string,r:Partial<Route>)=>Promise<void>; deleteRoute:(id:string)=>Promise<void>;
+  addRoutePlan:(p:Omit<RoutePlan,'id'|'created_at'>)=>Promise<void>; updateRoutePlan:(id:string,p:Partial<RoutePlan>)=>Promise<void>; deleteRoutePlan:(id:string)=>Promise<void>;
   addRate:(r:Omit<Rate,'id'>)=>Promise<void>; updateRate:(id:string,r:Partial<Rate>)=>Promise<void>; deleteRate:(id:string)=>Promise<void>;
-  addMCCMNC:(m:Omit<MCCMNC,'id'>)=>void; updateMCCMNC:(id:string,m:Partial<MCCMNC>)=>void; deleteMCCMNC:(id:string)=>void;
+  addMCCMNC:(m:Omit<MCCMNC,'id'>)=>Promise<void>; updateMCCMNC:(id:string,m:Partial<MCCMNC>)=>Promise<void>; deleteMCCMNC:(id:string)=>Promise<void>;
   addInvoice:(i:Omit<Invoice,'id'|'created_at'>)=>void; updateInvoice:(id:string,i:Partial<Invoice>)=>void;
   addPayment:(p:Omit<Payment,'id'|'created_at'>)=>void;
   addOTTDevice:(d:Omit<OTTDevice,'id'|'created_at'>)=>void; updateOTTDevice:(id:string,d:Partial<OTTDevice>)=>void; deleteOTTDevice:(id:string)=>void;
@@ -153,16 +153,52 @@ export const DataProvider:React.FC<{children:ReactNode}> = ({children}) => {
   // SMS Logs
   const addSMSLog=useCallback((log:Omit<SMSLog,'id'|'created_at'|'submit_time'>)=>{const nl:SMSLog={...log,id:gid(),submit_time:nw(),created_at:nw(),supplier_id:log.supplier_id??null,supplier_code:log.supplier_code??null,dlr_status:log.dlr_status??null,dlr_timestamp:log.dlr_timestamp??null,delivery_time:log.delivery_time??null,error_code:log.error_code??null,error_message:log.error_message??null,route_name:log.route_name??null,trunk_name:log.trunk_name??null};setSMSLogs(p=>{const n=[nl,...p];return n;});},[]);
 
-  // Trunks, Routes, Plans
-  const addTrunk=useCallback((t:Omit<Trunk,'id'|'created_at'>)=>{setTrunks(p=>{const n=[...p,{...t,id:gid(),created_at:nw()}];return n;});},[]);
-  const updateTrunk=useCallback((id:string,t:Partial<Trunk>)=>{setTrunks(p=>{const n=p.map(x=>x.id===id?{...x,...t}:x);return n;});},[]);
-  const deleteTrunk=useCallback((id:string)=>{setTrunks(p=>{const n=p.filter(x=>x.id!==id);return n;});},[]);
-  const addRoute=useCallback((r:Omit<Route,'id'|'created_at'>)=>{setRoutes(p=>{const n=[...p,{...r,id:gid(),created_at:nw()}];return n;});},[]);
-  const updateRoute=useCallback((id:string,r:Partial<Route>)=>{setRoutes(p=>{const n=p.map(x=>x.id===id?{...x,...r}:x);return n;});},[]);
-  const deleteRoute=useCallback((id:string)=>{setRoutes(p=>{const n=p.filter(x=>x.id!==id);return n;});},[]);
-  const addRoutePlan=useCallback((p:Omit<RoutePlan,'id'|'created_at'>)=>{setRoutePlans(prev=>{const n=[...prev,{...p,id:gid(),created_at:nw()}];return n;});},[]);
-  const updateRoutePlan=useCallback((id:string,p:Partial<RoutePlan>)=>{setRoutePlans(prev=>{const n=prev.map(x=>x.id===id?{...x,...p}:x);return n;});},[]);
-  const deleteRoutePlan=useCallback((id:string)=>{setRoutePlans(prev=>{const n=prev.filter(x=>x.id!==id);return n;});},[]);
+  // Trunks, Routes, Plans — API-wired
+  const addTrunk=useCallback(async (t:Omit<Trunk,'id'|'created_at'>) => {
+    const res: any = await api.post('/trunks', t);
+    if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to create trunk');
+    setTrunks(p=>{const n=[...p,res.data.data];return n;});
+  },[]);
+  const updateTrunk=useCallback(async (id:string,t:Partial<Trunk>) => {
+    const res: any = await api.put(`/trunks/${id}`, t);
+    if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to update trunk');
+    setTrunks(p=>{const n=p.map(x=>x.id===id?res.data.data:x);return n;});
+  },[]);
+  const deleteTrunk=useCallback(async (id:string) => {
+    const res: any = await api.delete(`/trunks/${id}`);
+    if (!res.success) throw new Error(res.error || 'Failed to delete trunk');
+    setTrunks(p=>{const n=p.filter(x=>x.id!==id);return n;});
+  },[]);
+  const addRoute=useCallback(async (r:Omit<Route,'id'|'created_at'>) => {
+    const res: any = await api.post('/routes', r);
+    if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to create route');
+    setRoutes(p=>{const n=[...p,res.data.data];return n;});
+  },[]);
+  const updateRoute=useCallback(async (id:string,r:Partial<Route>) => {
+    const res: any = await api.put(`/routes/${id}`, r);
+    if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to update route');
+    setRoutes(p=>{const n=p.map(x=>x.id===id?res.data.data:x);return n;});
+  },[]);
+  const deleteRoute=useCallback(async (id:string) => {
+    const res: any = await api.delete(`/routes/${id}`);
+    if (!res.success) throw new Error(res.error || 'Failed to delete route');
+    setRoutes(p=>{const n=p.filter(x=>x.id!==id);return n;});
+  },[]);
+  const addRoutePlan=useCallback(async (p:Omit<RoutePlan,'id'|'created_at'>) => {
+    const res: any = await api.post('/route-plans', p);
+    if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to create route plan');
+    setRoutePlans(prev=>{const n=[...prev,res.data.data];return n;});
+  },[]);
+  const updateRoutePlan=useCallback(async (id:string,p:Partial<RoutePlan>) => {
+    const res: any = await api.put(`/route-plans/${id}`, p);
+    if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to update route plan');
+    setRoutePlans(prev=>{const n=prev.map(x=>x.id===id?res.data.data:x);return n;});
+  },[]);
+  const deleteRoutePlan=useCallback(async (id:string) => {
+    const res: any = await api.delete(`/route-plans/${id}`);
+    if (!res.success) throw new Error(res.error || 'Failed to delete route plan');
+    setRoutePlans(prev=>{const n=prev.filter(x=>x.id!==id);return n;});
+  },[]);
 
   // Rates
   const addRate=useCallback(async (r:Omit<Rate,'id'>) => {
@@ -181,10 +217,22 @@ export const DataProvider:React.FC<{children:ReactNode}> = ({children}) => {
     setRates(p=>{const n=p.filter(x=>x.id!==id);return n;});
   },[]);
 
-  // MCCMNC
-  const addMCCMNC=useCallback((m:Omit<MCCMNC,'id'>)=>{setMCCMNC(p=>{const n=[...p,{...m,id:gid()}];return n;});},[]);
-  const updateMCCMNC=useCallback((id:string,m:Partial<MCCMNC>)=>{setMCCMNC(p=>{const n=p.map(x=>x.id===id?{...x,...m}:x);return n;});},[]);
-  const deleteMCCMNC=useCallback((id:string)=>{setMCCMNC(p=>{const n=p.filter(x=>x.id!==id);return n;});},[]);
+  // MCCMNC — API-wired
+  const addMCCMNC=useCallback(async (m:Omit<MCCMNC,'id'>) => {
+    const res: any = await api.post('/mccmnc', m);
+    if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to create MCCMNC');
+    setMCCMNC(p=>{const n=[...p,res.data.data];return n;});
+  },[]);
+  const updateMCCMNC=useCallback(async (id:string,m:Partial<MCCMNC>) => {
+    const res: any = await api.put(`/mccmnc/${id}`, m);
+    if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to update MCCMNC');
+    setMCCMNC(p=>{const n=p.map(x=>x.id===id?res.data.data:x);return n;});
+  },[]);
+  const deleteMCCMNC=useCallback(async (id:string) => {
+    const res: any = await api.delete(`/mccmnc/${id}`);
+    if (!res.success) throw new Error(res.error || 'Failed to delete MCCMNC');
+    setMCCMNC(p=>{const n=p.filter(x=>x.id!==id);return n;});
+  },[]);
 
   // Invoices, Payments
   const addInvoice=useCallback(async (i:Omit<Invoice,'id'|'created_at'>) => {

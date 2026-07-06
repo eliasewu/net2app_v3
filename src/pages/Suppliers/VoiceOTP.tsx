@@ -28,13 +28,8 @@ interface VoiceSIPConfig {
   created_at: string;
 }
 
-function load<T>(k: string, f: T): T {
-  try { const s = localStorage.getItem(k); if (s) return JSON.parse(s); } catch {}
-  localStorage.setItem(k, JSON.stringify(f)); return f;
-}
-function save<T>(k: string, v: T) { localStorage.setItem(k, JSON.stringify(v)); }
-
-const defaultSIPs: VoiceSIPConfig[] = [
+export const VoiceOTP: React.FC = () => {
+  const [sipConfigs, setSipConfigs] = useState<VoiceSIPConfig[]>(defaultSIPs);
   { id:'1', name:'TechCorp SIP', client_id:'1', client_code:'CLT001', client_name:'TechCorp Global', sip_host:'sip.techcorp.com', sip_port:5060, sip_user:'techcorp', sip_pass:'pass123', caller_id:'+18001234567', provider:'asterisk', version:'20', allowed_languages:['ar-SA','en-US'], max_retries:3, retry_delay:30, timeout:150, is_active:true, created_at:'2024-01-15' },
   { id:'2', name:'MegaBank Voice', client_id:'2', client_code:'CLT002', client_name:'MegaBank Ltd', sip_host:'sip.megabank.com', sip_port:5060, sip_user:'megabank', sip_pass:'bank456', caller_id:'+18007654321', provider:'vos3000', version:'2', allowed_languages:['en-US','ar-SA'], max_retries:4, retry_delay:25, timeout:120, is_active:true, created_at:'2024-02-01' },
 ];
@@ -60,7 +55,7 @@ const ALL_LANGS = [
 ];
 
 export const VoiceOTP: React.FC = () => {
-  const [sipConfigs, setSipConfigs] = useState<VoiceSIPConfig[]>(() => load('voice_sips_db', defaultSIPs));
+  const [sipConfigs, setSipConfigs] = useState<VoiceSIPConfig[]>(defaultSIPs);
   const [search, setSearch] = useState('');
   const [showModal, setShowModal] = useState(false);
   const [editing, setEditing] = useState<VoiceSIPConfig | null>(null);
@@ -94,20 +89,20 @@ export const VoiceOTP: React.FC = () => {
   const handleSave = () => {
     const data = { ...form };
     if (editing) {
-      setSipConfigs(p => { const n = p.map(s => s.id === editing.id ? { ...s, ...data } : s); save('voice_sips_db', n); return n; });
+      setSipConfigs(p => { const n = p.map(s => s.id === editing.id ? { ...s, ...data } : s); return n; });
     } else {
       const nc: VoiceSIPConfig = { ...data, id: 'sip_' + Date.now(), created_at: new Date().toISOString().split('T')[0] };
-      setSipConfigs(p => { const n = [...p, nc]; save('voice_sips_db', n); return n; });
+      setSipConfigs(p => { const n = [...p, nc]; return n; });
     }
     setShowModal(false);
   };
 
   const handleDelete = (id: string) => {
-    setSipConfigs(p => { const n = p.filter(s => s.id !== id); save('voice_sips_db', n); return n; });
+    setSipConfigs(p => { const n = p.filter(s => s.id !== id); return n; });
   };
 
   const handleToggle = (id: string) => {
-    setSipConfigs(p => { const n = p.map(s => s.id === id ? { ...s, is_active: !s.is_active } : s); save('voice_sips_db', n); return n; });
+    setSipConfigs(p => { const n = p.map(s => s.id === id ? { ...s, is_active: !s.is_active } : s); return n; });
   };
 
   const toggleLang = (code: string) => {

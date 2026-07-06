@@ -8,14 +8,8 @@ import { Input, Select, Textarea } from '../../components/UI/Input';
 import { Table, Pagination } from '../../components/UI/Table';
 import { defaultConnectors, Connector } from '../../data/connectors';
 
-function load<T>(k: string, f: T): T {
-  try { const s = localStorage.getItem(k); if (s) return JSON.parse(s); } catch {}
-  localStorage.setItem(k, JSON.stringify(f)); return f;
-}
-function save<T>(k: string, v: T) { localStorage.setItem(k, JSON.stringify(v)); }
-
-const REGIONS = [
-  { key: 'all', label: 'All', flag: '📊' },
+export const APIConnectors: React.FC = () => {
+  const [connectors, setConnectors] = useState<Connector[]>(defaultConnectors);
   { key: 'Global', label: 'Global', flag: '🌍' },
   { key: 'Bangladesh', label: 'Bangladesh', flag: '🇧🇩' },
   { key: 'India', label: 'India', flag: '🇮🇳' },
@@ -28,7 +22,7 @@ const REGIONS = [
 ];
 
 export const APIConnectors: React.FC = () => {
-  const [connectors, setConnectors] = useState<Connector[]>(() => load('api_connectors_db', defaultConnectors));
+  const [connectors, setConnectors] = useState<Connector[]>(defaultConnectors);
   const [search, setSearch] = useState('');
   const [regionFilter, setRegionFilter] = useState('all');
   const [currentPage, setCurrentPage] = useState(1);
@@ -62,15 +56,15 @@ export const APIConnectors: React.FC = () => {
   };
   const handleSave = () => {
     if (editing) {
-      setConnectors(p => { const n = p.map(c => c.id === editing.id ? { ...c, ...form } : c); save('api_connectors_db', n); return n; });
+      setConnectors(p => { const n = p.map(c => c.id === editing.id ? { ...c, ...form } : c); return n; });
     } else {
       const nc: Connector = { ...form, id: 'cust_' + Date.now(), type: 'http', status: 'untested' };
-      setConnectors(p => { const n = [...p, nc]; save('api_connectors_db', n); return n; });
+      setConnectors(p => { const n = [...p, nc]; return n; });
     }
     setShowModal(false);
   };
-  const handleDelete = (id: string) => { setConnectors(p => { const n = p.filter(c => c.id !== id); save('api_connectors_db', n); return n; }); };
-  const handleToggle = (id: string) => { setConnectors(p => { const n = p.map(c => c.id === id ? { ...c, is_active: !c.is_active } : c); save('api_connectors_db', n); return n; }); };
+  const handleDelete = (id: string) => { setConnectors(p => { const n = p.filter(c => c.id !== id); return n; }); };
+  const handleToggle = (id: string) => { setConnectors(p => { const n = p.map(c => c.id === id ? { ...c, is_active: !c.is_active } : c); return n; }); };
   const handleTest = async (id: string) => {
     setConnectors(p => p.map(c => c.id === id ? { ...c, status: 'testing' } : c));
     await new Promise(r => setTimeout(r, 2000 + Math.random() * 2000));
@@ -78,7 +72,6 @@ export const APIConnectors: React.FC = () => {
   };
   const handleRestoreDefaults = () => {
     if (window.confirm('Reset all API connectors to defaults? Custom ones will be lost.')) {
-      localStorage.setItem('api_connectors_db', JSON.stringify(defaultConnectors));
       setConnectors([...defaultConnectors]);
     }
   };

@@ -261,10 +261,11 @@ app.get('/api/trunks/:id', auth, async (req, res) => {
 
 app.post('/api/trunks', auth, async (req, res) => {
     try {
-        const { trunk_name, supplier_id, trunk_type, status } = req.body;
+        const { trunk_name, supplier_id, trunk_type, priority, percentage, is_active, mccmnc_allowed, mccmnc_denied } = req.body;
         const result = await pool.query(
-            `INSERT INTO trunks (trunk_name, supplier_id, trunk_type, status, created_at, updated_at) VALUES ($1, $2, $3, $4, NOW(), NOW()) RETURNING *`,
-            [trunk_name, supplier_id, trunk_type, status || 'active']
+            `INSERT INTO trunks (trunk_name, supplier_id, trunk_type, priority, percentage, is_active, mccmnc_allowed, mccmnc_denied, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) RETURNING *`,
+            [trunk_name, supplier_id, trunk_type || 'sim_otp', priority || 0, percentage || 100, is_active !== false, mccmnc_allowed || null, mccmnc_denied || null]
         );
         res.json({ success: true, data: result.rows[0] });
     } catch (error) {
@@ -275,10 +276,17 @@ app.post('/api/trunks', auth, async (req, res) => {
 app.put('/api/trunks/:id', auth, async (req, res) => {
     try {
         const { id } = req.params;
-        const { trunk_name, supplier_id, trunk_type, status } = req.body;
+        const fields = req.body;
+        const allowed = ['trunk_name','supplier_id','trunk_type','priority','percentage','is_active','mccmnc_allowed','mccmnc_denied'];
+        const setParts = []; const values = []; let idx = 1;
+        for (const key of allowed) {
+            if (fields[key] !== undefined) { setParts.push(`${key} = $${idx++}`); values.push(fields[key]); }
+        }
+        if (setParts.length === 0) return res.status(400).json({ error: 'No fields to update' });
+        values.push(id);
         const result = await pool.query(
-            `UPDATE trunks SET trunk_name = COALESCE($1, trunk_name), supplier_id = COALESCE($2, supplier_id), trunk_type = COALESCE($3, trunk_type), status = COALESCE($4, status), updated_at = NOW() WHERE id = $5 RETURNING *`,
-            [trunk_name, supplier_id, trunk_type, status, id]
+            `UPDATE trunks SET ${setParts.join(', ')} WHERE id = $${values.length} RETURNING *`,
+            values
         );
         if (result.rows.length === 0) return res.status(404).json({ error: 'Trunk not found' });
         res.json({ success: true, data: result.rows[0] });
@@ -321,10 +329,11 @@ app.get('/api/routes/:id', auth, async (req, res) => {
 
 app.post('/api/routes', auth, async (req, res) => {
     try {
-        const { route_name, trunk_ids, status } = req.body;
+        const { route_name, trunk_ids, route_method, is_active, preferred_channel, mccmnc_allowed, mccmnc_denied } = req.body;
         const result = await pool.query(
-            `INSERT INTO routes (route_name, trunk_ids, status, created_at, updated_at) VALUES ($1, $2, $3, NOW(), NOW()) RETURNING *`,
-            [route_name, trunk_ids, status || 'active']
+            `INSERT INTO routes (route_name, trunk_ids, route_method, is_active, preferred_channel, mccmnc_allowed, mccmnc_denied, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) RETURNING *`,
+            [route_name, trunk_ids || null, route_method || 'priority', is_active !== false, preferred_channel || null, mccmnc_allowed || null, mccmnc_denied || null]
         );
         res.json({ success: true, data: result.rows[0] });
     } catch (error) {
@@ -335,10 +344,17 @@ app.post('/api/routes', auth, async (req, res) => {
 app.put('/api/routes/:id', auth, async (req, res) => {
     try {
         const { id } = req.params;
-        const { route_name, trunk_ids, status } = req.body;
+        const fields = req.body;
+        const allowed = ['route_name','trunk_ids','route_method','is_active','preferred_channel','mccmnc_allowed','mccmnc_denied'];
+        const setParts = []; const values = []; let idx = 1;
+        for (const key of allowed) {
+            if (fields[key] !== undefined) { setParts.push(`${key} = $${idx++}`); values.push(fields[key]); }
+        }
+        if (setParts.length === 0) return res.status(400).json({ error: 'No fields to update' });
+        values.push(id);
         const result = await pool.query(
-            `UPDATE routes SET route_name = COALESCE($1, route_name), trunk_ids = COALESCE($2, trunk_ids), status = COALESCE($3, status), updated_at = NOW() WHERE id = $4 RETURNING *`,
-            [route_name, trunk_ids, status, id]
+            `UPDATE routes SET ${setParts.join(', ')} WHERE id = $${values.length} RETURNING *`,
+            values
         );
         if (result.rows.length === 0) return res.status(404).json({ error: 'Route not found' });
         res.json({ success: true, data: result.rows[0] });
@@ -381,10 +397,11 @@ app.get('/api/route-plans/:id', auth, async (req, res) => {
 
 app.post('/api/route-plans', auth, async (req, res) => {
     try {
-        const { plan_name, route_ids, status } = req.body;
+        const { plan_name, route_ids, is_default, allowed_channels } = req.body;
         const result = await pool.query(
-            `INSERT INTO route_plans (plan_name, route_ids, status, created_at, updated_at) VALUES ($1, $2, $3, NOW(), NOW()) RETURNING *`,
-            [plan_name, route_ids, status || 'active']
+            `INSERT INTO route_plans (plan_name, route_ids, is_default, allowed_channels, created_at)
+             VALUES ($1, $2, $3, $4, NOW()) RETURNING *`,
+            [plan_name, route_ids || null, is_default || false, allowed_channels || null]
         );
         res.json({ success: true, data: result.rows[0] });
     } catch (error) {
@@ -395,10 +412,17 @@ app.post('/api/route-plans', auth, async (req, res) => {
 app.put('/api/route-plans/:id', auth, async (req, res) => {
     try {
         const { id } = req.params;
-        const { plan_name, route_ids, status } = req.body;
+        const fields = req.body;
+        const allowed = ['plan_name','route_ids','is_default','allowed_channels'];
+        const setParts = []; const values = []; let idx = 1;
+        for (const key of allowed) {
+            if (fields[key] !== undefined) { setParts.push(`${key} = $${idx++}`); values.push(fields[key]); }
+        }
+        if (setParts.length === 0) return res.status(400).json({ error: 'No fields to update' });
+        values.push(id);
         const result = await pool.query(
-            `UPDATE route_plans SET plan_name = COALESCE($1, plan_name), route_ids = COALESCE($2, route_ids), status = COALESCE($3, status), updated_at = NOW() WHERE id = $4 RETURNING *`,
-            [plan_name, route_ids, status, id]
+            `UPDATE route_plans SET ${setParts.join(', ')} WHERE id = $${values.length} RETURNING *`,
+            values
         );
         if (result.rows.length === 0) return res.status(404).json({ error: 'Route plan not found' });
         res.json({ success: true, data: result.rows[0] });

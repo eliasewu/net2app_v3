@@ -113,17 +113,8 @@ function generateTenants(): TenantRemote[] {
   return tenants.sort((a, b) => a.tenant_name.localeCompare(b.tenant_name));
 }
 
-const SAVED_KEY = 'tenant_monitor_data';
-function loadTenants(): TenantRemote[] {
-  try { const s = localStorage.getItem(SAVED_KEY); if (s) return JSON.parse(s); } catch {}
-  const data = generateTenants();
-  localStorage.setItem(SAVED_KEY, JSON.stringify(data));
-  return data;
-}
-
-export const TenantMonitor: React.FC = () => {
+  const [tenants, setTenants] = useState<TenantRemote[]>(generateTenants());
   const { user, isSuperAdmin } = useAuth();
-  const [tenants, setTenants] = useState<TenantRemote[]>(loadTenants);
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('all');
   const [typeFilter, setTypeFilter] = useState<string>('all');
@@ -155,7 +146,6 @@ export const TenantMonitor: React.FC = () => {
   const handleRefresh = async () => {
     setRefreshing(true);
     const fresh = generateTenants();
-    localStorage.setItem(SAVED_KEY, JSON.stringify(fresh));
     setTenants(fresh);
     setLastRefresh(new Date());
     setRefreshing(false);

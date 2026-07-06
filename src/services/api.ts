@@ -172,22 +172,22 @@ export const ratesApi = {
 // ==================== ROUTING API ====================
 export const routingApi = {
   // Trunks
-  getTrunks: () => api.get<any[]>('/routing/trunks'),
-  createTrunk: (data: any) => api.post<any>('/routing/trunks', data),
-  updateTrunk: (id: string, data: any) => api.put<any>(`/routing/trunks/${id}`, data),
-  deleteTrunk: (id: string) => api.delete(`/routing/trunks/${id}`),
+  getTrunks: () => api.get<any[]>('/trunks'),
+  createTrunk: (data: any) => api.post<any>('/trunks', data),
+  updateTrunk: (id: string, data: any) => api.put<any>(`/trunks/${id}`, data),
+  deleteTrunk: (id: string) => api.delete(`/trunks/${id}`),
   
   // Routes
-  getRoutes: () => api.get<any[]>('/routing/routes'),
-  createRoute: (data: any) => api.post<any>('/routing/routes', data),
-  updateRoute: (id: string, data: any) => api.put<any>(`/routing/routes/${id}`, data),
-  deleteRoute: (id: string) => api.delete(`/routing/routes/${id}`),
+  getRoutes: () => api.get<any[]>('/routes'),
+  createRoute: (data: any) => api.post<any>('/routes', data),
+  updateRoute: (id: string, data: any) => api.put<any>(`/routes/${id}`, data),
+  deleteRoute: (id: string) => api.delete(`/routes/${id}`),
   
   // Route Plans
-  getRoutePlans: () => api.get<any[]>('/routing/plans'),
-  createRoutePlan: (data: any) => api.post<any>('/routing/plans', data),
-  updateRoutePlan: (id: string, data: any) => api.put<any>(`/routing/plans/${id}`, data),
-  deleteRoutePlan: (id: string) => api.delete(`/routing/plans/${id}`),
+  getRoutePlans: () => api.get<any[]>('/route-plans'),
+  createRoutePlan: (data: any) => api.post<any>('/route-plans', data),
+  updateRoutePlan: (id: string, data: any) => api.put<any>(`/route-plans/${id}`, data),
+  deleteRoutePlan: (id: string) => api.delete(`/route-plans/${id}`),
   
   // Route Maps (Client -> Route -> Supplier mapping)
   getRouteMaps: () => api.get<any[]>('/routing/maps'),

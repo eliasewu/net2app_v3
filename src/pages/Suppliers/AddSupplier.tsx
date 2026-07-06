@@ -15,7 +15,6 @@ interface VoiceSip { id:string; client_name:string; sip_host:string; sip_port:nu
 interface RcsAgent { id:string; name:string; bot_id:string; is_active:boolean; }
 interface FlashProvider { id:string; name:string; sender_id:string; ttl:number; is_active:boolean; }
 
-function load<T>(k:string,f:T):T{try{const s=localStorage.getItem(k);if(s)return JSON.parse(s);}catch{}return f;}
 
 export const AddSupplier: React.FC = () => {
   const navigate = useNavigate();
@@ -25,11 +24,11 @@ export const AddSupplier: React.FC = () => {
   const isEditing = !!existingSupplier;
 
   // Load all available endpoints from other pages
-  const [apiConnectors] = useState<ApiConnector[]>(()=>load('api_connectors_db',[]));
-  const [ottDevices] = useState<OttDevice[]>(()=>load('ott_devices_db',[]));
-  const [voiceSips] = useState<VoiceSip[]>(()=>load('voice_sips_db',[]));
-  const [rcsAgents] = useState<RcsAgent[]>(()=>load('rcs_configs_db',[]));
-  const [flashProviders] = useState<FlashProvider[]>(()=>load('flash_configs_db',[]));
+  const [apiConnectors] = useState<ApiConnector[]>([]);
+  const [ottDevices] = useState<OttDevice[]>([]);
+  const [voiceSips] = useState<VoiceSip[]>([]);
+  const [rcsAgents] = useState<RcsAgent[]>([]);
+  const [flashProviders] = useState<FlashProvider[]>([]);
 
   const [formData, setFormData] = useState({
     supplier_code: existingSupplier?.supplier_code || '',
