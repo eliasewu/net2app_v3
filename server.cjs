@@ -509,11 +509,134 @@ app.get('/api/invoices', auth, async (req, res) => {
     }
 });
 
+app.post('/api/invoices', auth, async (req, res) => {
+    try {
+        const b = req.body || {};
+        if (!b.entity_type || !b.entity_id) return res.status(400).json({ error: 'entity_type and entity_id are required' });
+        // Auto-generate invoice number if not provided
+        let invNum = b.invoice_number;
+        if (!invNum) {
+            const seq = await pool.query("SELECT COUNT(*) + 1 AS next FROM invoices");
+            invNum = `INV-${new Date().getFullYear()}-${String(seq.rows[0].next).padStart(4, '0')}`;
+        }
+        const result = await pool.query(
+            `INSERT INTO invoices (invoice_number, entity_type, entity_id, entity_name,
+             period_start, period_end, total_sms, total_amount, tax_amount, tax_rate, grand_total,
+             currency, status, due_date, notes, created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NOW()) RETURNING *`,
+            [invNum, b.entity_type, b.entity_id, b.entity_name || '',
+             b.period_start || new Date().toISOString().split('T')[0], b.period_end || new Date().toISOString().split('T')[0],
+             b.total_sms || 0, b.total_amount || 0, b.tax_amount || 0, b.tax_rate || 0, b.grand_total || 0,
+             b.currency || 'EUR', b.status || 'draft', b.due_date || null, b.notes || '']
+        );
+        res.json({ success: true, data: result.rows[0] });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.put('/api/invoices/:id', auth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const fields = req.body;
+        const allowed = ['invoice_number','entity_type','entity_id','entity_name',
+            'period_start','period_end','total_sms','total_amount','tax_amount','tax_rate','grand_total',
+            'currency','status','due_date','paid_date','payment_method','payment_reference','notes',
+            'invoice_to_name','invoice_to_address','invoice_to_email',
+            'invoice_by_name','invoice_by_address','invoice_by_email','invoice_by_vat',
+            'bank_name','bank_account','bank_iban','bank_bic'];
+        const setParts = []; const values = []; let idx = 1;
+        for (const key of allowed) {
+            if (fields[key] !== undefined) { setParts.push(`${key} = $${idx++}`); values.push(fields[key]); }
+        }
+        if (setParts.length === 0) return res.status(400).json({ error: 'No fields to update' });
+        values.push(id);
+        const result = await pool.query(
+            `UPDATE invoices SET ${setParts.join(', ')} WHERE id = $${values.length} RETURNING *`,
+            values
+        );
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Invoice not found' });
+        res.json({ success: true, data: result.rows[0] });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.delete('/api/invoices/:id', auth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const result = await pool.query('DELETE FROM invoices WHERE id = $1 RETURNING invoice_number', [id]);
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Invoice not found' });
+        res.json({ success: true, message: 'Invoice deleted', invoice_number: result.rows[0].invoice_number });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // ==================== PAYMENTS ====================
 app.get('/api/payments', auth, async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM payments ORDER BY id DESC LIMIT 500');
         res.json({ success: true, data: result.rows });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/api/payments', auth, async (req, res) => {
+    try {
+        const b = req.body || {};
+        if (!b.entity_type || !b.entity_id) return res.status(400).json({ error: 'entity_type and entity_id are required' });
+        if (!b.amount) return res.status(400).json({ error: 'amount is required' });
+        // Auto-generate payment number if not provided
+        let payNum = b.payment_number;
+        if (!payNum) {
+            const seq = await pool.query("SELECT COUNT(*) + 1 AS next FROM payments");
+            payNum = `PAY-${new Date().getFullYear()}-${String(seq.rows[0].next).padStart(4, '0')}`;
+        }
+        const result = await pool.query(
+            `INSERT INTO payments (payment_number, entity_type, entity_id, entity_name,
+             amount, currency, payment_method, reference, status, notes, created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW()) RETURNING *`,
+            [payNum, b.entity_type, b.entity_id, b.entity_name || '',
+             b.amount, b.currency || 'EUR', b.payment_method || 'bank_transfer', b.reference || '',
+             b.status || 'completed', b.notes || '']
+        );
+        res.json({ success: true, data: result.rows[0] });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.put('/api/payments/:id', auth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const fields = req.body;
+        const allowed = ['payment_number','entity_type','entity_id','entity_name',
+            'amount','currency','payment_method','reference','status','notes'];
+        const setParts = []; const values = []; let idx = 1;
+        for (const key of allowed) {
+            if (fields[key] !== undefined) { setParts.push(`${key} = $${idx++}`); values.push(fields[key]); }
+        }
+        if (setParts.length === 0) return res.status(400).json({ error: 'No fields to update' });
+        values.push(id);
+        const result = await pool.query(
+            `UPDATE payments SET ${setParts.join(', ')} WHERE id = $${values.length} RETURNING *`,
+            values
+        );
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Payment not found' });
+        res.json({ success: true, data: result.rows[0] });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.delete('/api/payments/:id', auth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const result = await pool.query('DELETE FROM payments WHERE id = $1 RETURNING payment_number', [id]);
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Payment not found' });
+        res.json({ success: true, message: 'Payment deleted', payment_number: result.rows[0].payment_number });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -529,11 +652,121 @@ app.get('/api/campaigns', auth, async (req, res) => {
     }
 });
 
+app.post('/api/campaigns', auth, async (req, res) => {
+    try {
+        const b = req.body || {};
+        if (!b.campaign_name) return res.status(400).json({ error: 'campaign_name is required' });
+        const result = await pool.query(
+            `INSERT INTO campaigns (campaign_name, client_id, sender_id, message_template,
+             recipients_count, sent_count, delivered_count, failed_count,
+             status, scheduled_at, created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW()) RETURNING *`,
+            [b.campaign_name, b.client_id || null, b.sender_id || '', b.message_template || '',
+             b.recipients_count || 0, 0, 0, 0,
+             b.status || 'draft', b.scheduled_at || null]
+        );
+        res.json({ success: true, data: result.rows[0] });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.put('/api/campaigns/:id', auth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const fields = req.body;
+        const allowed = ['campaign_name','client_id','sender_id','message_template',
+            'recipients_count','sent_count','delivered_count','failed_count',
+            'status','scheduled_at','started_at','completed_at'];
+        const setParts = []; const values = []; let idx = 1;
+        for (const key of allowed) {
+            if (fields[key] !== undefined) { setParts.push(`${key} = $${idx++}`); values.push(fields[key]); }
+        }
+        if (setParts.length === 0) return res.status(400).json({ error: 'No fields to update' });
+        values.push(id);
+        const result = await pool.query(
+            `UPDATE campaigns SET ${setParts.join(', ')} WHERE id = $${values.length} RETURNING *`,
+            values
+        );
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Campaign not found' });
+        res.json({ success: true, data: result.rows[0] });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.delete('/api/campaigns/:id', auth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const result = await pool.query('DELETE FROM campaigns WHERE id = $1 RETURNING campaign_name', [id]);
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Campaign not found' });
+        res.json({ success: true, message: 'Campaign deleted', campaign_name: result.rows[0].campaign_name });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // ==================== TRANSLATIONS ====================
 app.get('/api/translations', auth, async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM translations ORDER BY id DESC LIMIT 500');
         res.json({ success: true, data: result.rows });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/api/translations', auth, async (req, res) => {
+    try {
+        const b = req.body || {};
+        if (!b.translation_type) return res.status(400).json({ error: 'translation_type is required' });
+        if (!b.source_pattern) return res.status(400).json({ error: 'source_pattern is required' });
+        if (b.target_value === undefined || b.target_value === null) return res.status(400).json({ error: 'target_value is required' });
+        const result = await pool.query(
+            `INSERT INTO translations (translation_type, source_pattern, target_value,
+             client_id, supplier_id, route_id, mcc, mnc,
+             name, description, subtype, priority, apply_to, apply_entity_id, is_active, created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NOW()) RETURNING *`,
+            [b.translation_type, b.source_pattern, b.target_value || '',
+             b.client_id || null, b.supplier_id || null, b.route_id || null, b.mcc || null, b.mnc || null,
+             b.name || '', b.description || '', b.subtype || '', b.priority || 1, b.apply_to || 'client', b.apply_entity_id || 'all', b.is_active !== false]
+        );
+        res.json({ success: true, data: result.rows[0] });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.put('/api/translations/:id', auth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const fields = req.body;
+        const allowed = ['translation_type','source_pattern','target_value',
+            'client_id','supplier_id','route_id','mcc','mnc',
+            'name','description','subtype','priority','apply_to','apply_entity_id','is_active'];
+        const setParts = []; const values = []; let idx = 1;
+        for (const key of allowed) {
+            if (fields[key] !== undefined) { setParts.push(`${key} = $${idx++}`); values.push(fields[key]); }
+        }
+        if (setParts.length === 0) return res.status(400).json({ error: 'No fields to update' });
+        values.push(id);
+        const result = await pool.query(
+            `UPDATE translations SET ${setParts.join(', ')} WHERE id = $${values.length} RETURNING *`,
+            values
+        );
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Translation not found' });
+        res.json({ success: true, data: result.rows[0] });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.delete('/api/translations/:id', auth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const result = await pool.query('DELETE FROM translations WHERE id = $1 RETURNING id', [id]);
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Translation not found' });
+        res.json({ success: true, message: 'Translation deleted' });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }

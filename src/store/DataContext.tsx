@@ -187,21 +187,57 @@ export const DataProvider:React.FC<{children:ReactNode}> = ({children}) => {
   const deleteMCCMNC=useCallback((id:string)=>{setMCCMNC(p=>{const n=p.filter(x=>x.id!==id);save(DB.mccmnc,n);return n;});},[]);
 
   // Invoices, Payments
-  const addInvoice=useCallback((i:Omit<Invoice,'id'|'created_at'>)=>{setInvoices(p=>{const n=[...p,{...i,id:gid(),created_at:nw()}];save(DB.invoices,n);return n;});},[]);
-  const updateInvoice=useCallback((id:string,i:Partial<Invoice>)=>{setInvoices(p=>{const n=p.map(x=>x.id===id?{...x,...i}:x);save(DB.invoices,n);return n;});},[]);
-  const addPayment=useCallback((p:Omit<Payment,'id'|'created_at'>)=>{setPayments(prev=>{const n=[...prev,{...p,id:gid(),created_at:nw()}];save(DB.payments,n);return n;});},[]);
+  const addInvoice=useCallback(async (i:Omit<Invoice,'id'|'created_at'>) => {
+    const res: any = await api.post('/invoices', i);
+    if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to create invoice');
+    setInvoices(p=>{const n=[...p,res.data.data];save(DB.invoices,n);return n;});
+  },[]);
+  const updateInvoice=useCallback(async (id:string,i:Partial<Invoice>) => {
+    const res: any = await api.put(`/invoices/${id}`, i);
+    if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to update invoice');
+    setInvoices(p=>{const n=p.map(x=>x.id===id?res.data.data:x);save(DB.invoices,n);return n;});
+  },[]);
+  const addPayment=useCallback(async (p:Omit<Payment,'id'|'created_at'>) => {
+    const res: any = await api.post('/payments', p);
+    if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to create payment');
+    setPayments(prev=>{const n=[...prev,res.data.data];save(DB.payments,n);return n;});
+  },[]);
 
   // OTT, Notifications, Campaigns, Translations
   const addOTTDevice=useCallback((d:Omit<OTTDevice,'id'|'created_at'>)=>{setOTTDevices(p=>{const n=[...p,{...d,id:gid(),created_at:nw()}];save(DB.ott_devices,n);return n;});},[]);
   const updateOTTDevice=useCallback((id:string,d:Partial<OTTDevice>)=>{setOTTDevices(p=>{const n=p.map(x=>x.id===id?{...x,...d}:x);save(DB.ott_devices,n);return n;});},[]);
   const deleteOTTDevice=useCallback((id:string)=>{setOTTDevices(p=>{const n=p.filter(x=>x.id!==id);save(DB.ott_devices,n);return n;});},[]);
   const markNotificationRead=useCallback((id:string)=>{setNotifications(p=>{const n=p.map(x=>x.id===id?{...x,is_read:true}:x);save(DB.notifications,n);return n;});},[]);
-  const addCampaign=useCallback((c:Omit<Campaign,'id'|'created_at'>)=>{setCampaigns(p=>{const n=[...p,{...c,id:gid(),created_at:nw()}];save(DB.campaigns,n);return n;});},[]);
-  const updateCampaign=useCallback((id:string,c:Partial<Campaign>)=>{setCampaigns(p=>{const n=p.map(x=>x.id===id?{...x,...c}:x);save(DB.campaigns,n);return n;});},[]);
-  const deleteCampaign=useCallback((id:string)=>{setCampaigns(p=>{const n=p.filter(x=>x.id!==id);save(DB.campaigns,n);return n;});},[]);
-  const addTranslation=useCallback((t:Omit<Translation,'id'|'created_at'>)=>{setTranslations(p=>{const n=[...p,{...t,id:gid(),created_at:nw()}];save(DB.translations,n);return n;});},[]);
-  const updateTranslation=useCallback((id:string,t:Partial<Translation>)=>{setTranslations(p=>{const n=p.map(x=>x.id===id?{...x,...t}:x);save(DB.translations,n);return n;});},[]);
-  const deleteTranslation=useCallback((id:string)=>{setTranslations(p=>{const n=p.filter(x=>x.id!==id);save(DB.translations,n);return n;});},[]);
+  const addCampaign=useCallback(async (c:Omit<Campaign,'id'|'created_at'>) => {
+    const res: any = await api.post('/campaigns', c);
+    if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to create campaign');
+    setCampaigns(p=>{const n=[...p,res.data.data];save(DB.campaigns,n);return n;});
+  },[]);
+  const updateCampaign=useCallback(async (id:string,c:Partial<Campaign>) => {
+    const res: any = await api.put(`/campaigns/${id}`, c);
+    if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to update campaign');
+    setCampaigns(p=>{const n=p.map(x=>x.id===id?res.data.data:x);save(DB.campaigns,n);return n;});
+  },[]);
+  const deleteCampaign=useCallback(async (id:string) => {
+    const res: any = await api.delete(`/campaigns/${id}`);
+    if (!res.success) throw new Error(res.error || 'Failed to delete campaign');
+    setCampaigns(p=>{const n=p.filter(x=>x.id!==id);save(DB.campaigns,n);return n;});
+  },[]);
+  const addTranslation=useCallback(async (t:Omit<Translation,'id'|'created_at'>) => {
+    const res: any = await api.post('/translations', t);
+    if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to create translation');
+    setTranslations(p=>{const n=[...p,res.data.data];save(DB.translations,n);return n;});
+  },[]);
+  const updateTranslation=useCallback(async (id:string,t:Partial<Translation>) => {
+    const res: any = await api.put(`/translations/${id}`, t);
+    if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to update translation');
+    setTranslations(p=>{const n=p.map(x=>x.id===id?res.data.data:x);save(DB.translations,n);return n;});
+  },[]);
+  const deleteTranslation=useCallback(async (id:string) => {
+    const res: any = await api.delete(`/translations/${id}`);
+    if (!res.success) throw new Error(res.error || 'Failed to delete translation');
+    setTranslations(p=>{const n=p.filter(x=>x.id!==id);save(DB.translations,n);return n;});
+  },[]);
 
   // Settings
   const updatePlatformSetting=useCallback((key:string,value:string)=>{setPlatformSettings(p=>{const n={...p,[key]:value};save(DB.platform_settings,n);return n;});},[]);
