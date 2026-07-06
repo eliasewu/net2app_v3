@@ -65,8 +65,6 @@ export const VoiceOTP: React.FC = () => {
   const [showModal, setShowModal] = useState(false);
   const [editing, setEditing] = useState<VoiceSIPConfig | null>(null);
   const [testResult, setTestResult] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<'sip' | 'audio' | 'logs'>('sip');
-
   const [form, setForm] = useState({
     name: '', client_id: '', client_code: '', client_name: '',
     sip_host: '', sip_port: 5060, sip_user: '', sip_pass: '',

@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useState, useCallback, useEffect, ReactNode } from 'react';
 import { Client, Supplier, Trunk, Route, RoutePlan, Rate, MCCMNC, Invoice, Payment, SMSLog, EmailTemplate, OTTDevice, APIConnector, User, DashboardStats, Notification, Campaign, Translation, VoiceOTPConfig } from '../types';
 import { mockUsers, hourlyTrafficData, dailyRevenueData, topDestinations } from './mockData';
-import { clientsApi, suppliersApi, routingApi } from '../services/api';
+import { clientsApi, suppliersApi, routingApi, smsApi } from '../services/api';
 
 // Database persistence — localStorage keys (PostgreSQL via API in production)
 const DB = {
@@ -71,18 +71,20 @@ export const DataProvider:React.FC<{children:ReactNode}> = ({children}) => {
   useEffect(() => {
     const fetchAll = async () => {
       try {
-        const [clientsRes, suppliersRes, trunksRes, routesRes, plansRes] = await Promise.all([
+        const [clientsRes, suppliersRes, trunksRes, routesRes, plansRes, smsRes] = await Promise.all([
           clientsApi.getAll(),
           suppliersApi.getAll(),
           routingApi.getTrunks(),
           routingApi.getRoutes(),
           routingApi.getRoutePlans(),
+          smsApi.getLogs({}).catch(() => ({ success: false, data: null })),
         ]);
         const cd: any = clientsRes.data;
         const sd: any = suppliersRes.data;
         const td: any = trunksRes.data;
         const rd: any = routesRes.data;
         const pd: any = plansRes.data;
+        const md: any = smsRes.data;
         if (clientsRes.success && cd?.data) {
           setClients(cd.data); save(DB.clients, cd.data);
         }
@@ -97,6 +99,9 @@ export const DataProvider:React.FC<{children:ReactNode}> = ({children}) => {
         }
         if (plansRes.success && pd?.data) {
           setRoutePlans(pd.data); save(DB.route_plans, pd.data);
+        }
+        if (smsRes.success && (md as any)?.data) {
+          setSMSLogs((md as any).data); save(DB.sms_logs, (md as any).data);
         }
       } catch (e) {
         console.warn('[DataContext] API fetch failed, using localStorage cache:', e);

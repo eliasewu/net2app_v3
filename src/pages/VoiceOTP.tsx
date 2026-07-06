@@ -1,7 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { useData } from '../store/DataContext';
 import { Phone, RotateCcw, CheckCircle, XCircle, Clock, RefreshCw } from 'lucide-react';
-import api from '../services/api';
+import { api } from '../services/api';
 
 interface VoiceCall {
   id: number;
@@ -32,7 +31,7 @@ export const VoiceOTP: React.FC = () => {
 
   const loadCalls = async () => {
     try {
-      const response = await api.get('/voice-otp/logs');
+      const response: any = await api.get('/voice-otp/logs');
       if (response.data.success) {
         setCalls(response.data.data);
       }
@@ -51,7 +50,7 @@ export const VoiceOTP: React.FC = () => {
     if (pollingCallId) {
       interval = setInterval(async () => {
         try {
-          const response = await api.get(`/voice-otp/dlr/${pollingCallId}`);
+          const response: any = await api.get(`/voice-otp/dlr/${pollingCallId}`);
           if (response.data.success && response.data.dlr_status) {
             // Update call status
             loadCalls();
@@ -75,7 +74,7 @@ export const VoiceOTP: React.FC = () => {
     setSending(true);
     
     try {
-      const response = await api.post('/voice-otp/send', {
+      const response: any = await api.post('/voice-otp/send', {
         destination: form.destination,
         otp_code: form.otp_code || undefined,
         max_retries: form.max_retries,
@@ -98,7 +97,7 @@ export const VoiceOTP: React.FC = () => {
 
   const retryCall = async (callId: string) => {
     try {
-      const response = await api.post(`/voice-otp/retry/${callId}`);
+      const response: any = await api.post(`/voice-otp/retry/${callId}`, {});
       if (response.data.success) {
         loadCalls();
         setPollingCallId(callId);

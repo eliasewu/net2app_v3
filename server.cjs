@@ -478,6 +478,47 @@ app.delete('/api/rates/:id', auth, async (req, res) => {
     }
 });
 
+// ==================== SMS LOGS ====================
+app.post('/api/sms/logs', auth, async (req, res) => {
+    try {
+        const f = req.body || {};
+        let q = 'SELECT * FROM sms_logs WHERE 1=1';
+        const p = []; let i = 1;
+        if (f.status)      { q += ` AND status = $${i++}`; p.push(f.status); }
+        if (f.client_code) { q += ` AND client_code = $${i++}`; p.push(f.client_code); }
+        if (f.supplier_code){ q += ` AND supplier_code = $${i++}`; p.push(f.supplier_code); }
+        if (f.source)      { q += ` AND source = $${i++}`; p.push(f.source); }
+        if (f.start_date)  { q += ` AND submit_time >= $${i++}`; p.push(f.start_date); }
+        if (f.end_date)    { q += ` AND submit_time <= $${i++}`; p.push(f.end_date); }
+        if (f.search)      { q += ` AND (destination ILIKE $${i} OR message_id ILIKE $${i} OR sender_id ILIKE $${i})`; p.push(`%${f.search}%`); i++; }
+        q += ' ORDER BY submit_time DESC LIMIT 1000';
+        const result = await pool.query(q, p);
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ==================== BIND STATUS ====================
+app.get('/api/bind/status', auth, async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT s.id, s.supplier_code, s.company_name, s.bind_status, s.consecutive_failures,
+                    s.smpp_host, s.smpp_port, s.smpp_username, s.connection_type, s.status as supplier_status,
+                    sess.system_id as session_system_id, sess.connected_at, sess.ip_address,
+                    sess.status as session_status, sess.bind_mode,
+                    CASE WHEN sess.id IS NOT NULL THEN 'connected' ELSE 'disconnected' END as session_state
+             FROM suppliers s
+             LEFT JOIN active_smpp_sessions sess ON s.id = sess.entity_id AND sess.entity_type = 'supplier'
+             WHERE s.connection_type = 'smpp'
+             ORDER BY s.id`
+        );
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // Health check
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
