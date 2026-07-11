@@ -43,7 +43,7 @@ export const RoutesList: React.FC = () => {
       setEditingRoute(route);
       setFormData({
         route_name: route.route_name,
-        trunk_ids: route.trunk_ids,
+        trunk_ids: route.trunk_ids || [],
         route_method: route.route_method,
         is_active: route.is_active,
       });
@@ -105,13 +105,13 @@ export const RoutesList: React.FC = () => {
       header: 'Trunks',
       render: (route: Route) => (
         <div className="flex flex-wrap gap-1">
-          {route.trunk_ids.map((trunkId, i) => {
+          {(route.trunk_ids || []).map((trunkId, i) => {
             const trunk = getTrunkById(trunkId);
             return trunk ? (
               <Badge key={i} variant="default" size="sm">{trunk.trunk_name}</Badge>
             ) : null;
           })}
-          {route.trunk_ids.length === 0 && (
+          {(route.trunk_ids || []).length === 0 && (
             <span className="text-sm text-gray-500">No trunks assigned</span>
           )}
         </div>

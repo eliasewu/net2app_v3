@@ -46,7 +46,7 @@ const DEFAULT_PERMISSIONS: Record<string, string[]> = {
 };
 
 export const UserManagement: React.FC = () => {
-  const { user: currentUser, isSuperAdmin, isAdmin } = useAuth();
+  const { user: currentUser, isAdmin } = useAuth();
   const { users } = useData();
   const isSuper = currentUser?.role === 'super_admin';
 

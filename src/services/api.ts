@@ -13,20 +13,9 @@ interface ApiResponse<T> {
 // HTTP Client
 class ApiClient {
   private baseUrl: string;
-  private token: string | null = null;
 
   constructor(baseUrl: string) {
     this.baseUrl = baseUrl;
-    this.token = localStorage.getItem('auth_token');
-  }
-
-  setToken(token: string | null) {
-    this.token = token;
-    if (token) {
-      localStorage.setItem('auth_token', token);
-    } else {
-      localStorage.removeItem('auth_token');
-    }
   }
 
   private async request<T>(
@@ -35,7 +24,6 @@ class ApiClient {
   ): Promise<ApiResponse<T>> {
     const headers: HeadersInit = {
       'Content-Type': 'application/json',
-      ...(this.token && { Authorization: `Bearer ${this.token}` }),
       ...options.headers,
     };
 
@@ -43,6 +31,7 @@ class ApiClient {
       const response = await fetch(`${this.baseUrl}${endpoint}`, {
         ...options,
         headers,
+        credentials: 'include',  // Send cookies with every request
       });
 
       const data = await response.json();
@@ -83,15 +72,14 @@ class ApiClient {
   }
 
   async upload<T>(endpoint: string, formData: FormData): Promise<ApiResponse<T>> {
-    const headers: HeadersInit = {
-      ...(this.token && { Authorization: `Bearer ${this.token}` }),
-    };
+    const headers: HeadersInit = {};
 
     try {
       const response = await fetch(`${this.baseUrl}${endpoint}`, {
         method: 'POST',
         headers,
         body: formData,
+        credentials: 'include',
       });
 
       const data = await response.json();
@@ -124,11 +112,12 @@ export const authApi = {
 
 // ==================== CLIENTS API ====================
 export const clientsApi = {
-  getAll: () => api.get<any[]>('/clients'),
+  getAll: (includeDeleted?: boolean) => api.get<any[]>(`/clients${includeDeleted ? '?include_deleted=true' : ''}`),
   getById: (id: string) => api.get<any>(`/clients/${id}`),
   create: (data: any) => api.post<any>('/clients', data),
   update: (id: string, data: any) => api.put<any>(`/clients/${id}`, data),
   delete: (id: string) => api.delete(`/clients/${id}`),
+  restore: (id: string) => api.post<{ data: any }>(`/clients/${id}/restore`, {}),
   bulkDelete: (ids: string[]) => api.post('/clients/bulk-delete', { ids }),
   getUsage: (id: string, period: string) => api.get<any>(`/clients/${id}/usage?period=${period}`),
   getCDR: (id: string, filters: any) => api.post<any[]>(`/clients/${id}/cdr`, filters),
@@ -139,11 +128,12 @@ export const clientsApi = {
 
 // ==================== SUPPLIERS API ====================
 export const suppliersApi = {
-  getAll: () => api.get<any[]>('/suppliers'),
+  getAll: (includeDeleted?: boolean) => api.get<any[]>(`/suppliers${includeDeleted ? '?include_deleted=true' : ''}`),
   getById: (id: string) => api.get<any>(`/suppliers/${id}`),
   create: (data: any) => api.post<any>('/suppliers', data),
   update: (id: string, data: any) => api.put<any>(`/suppliers/${id}`, data),
   delete: (id: string) => api.delete(`/suppliers/${id}`),
+  restore: (id: string) => api.post<{ data: any }>(`/suppliers/${id}/restore`, {}),
   bulkDelete: (ids: string[]) => api.post('/suppliers/bulk-delete', { ids }),
   getUsage: (id: string, period: string) => api.get<any>(`/suppliers/${id}/usage?period=${period}`),
   getCDR: (id: string, filters: any) => api.post<any[]>(`/suppliers/${id}/cdr`, filters),
@@ -189,17 +179,19 @@ export const routingApi = {
   updateRoutePlan: (id: string, data: any) => api.put<any>(`/route-plans/${id}`, data),
   deleteRoutePlan: (id: string) => api.delete(`/route-plans/${id}`),
   
-  // Route Maps (Client -> Route -> Supplier mapping)
-  getRouteMaps: () => api.get<any[]>('/routing/maps'),
-  getClientRouteMaps: (clientId: string) => api.get<any[]>(`/routing/maps/client/${clientId}`),
-  createRouteMap: (data: any) => api.post<any>('/routing/maps', data),
-  updateRouteMap: (id: string, data: any) => api.put<any>(`/routing/maps/${id}`, data),
-  deleteRouteMap: (id: string) => api.delete(`/routing/maps/${id}`),
 };
 
 // ==================== MCCMNC API ====================
 export const mccmncApi = {
-  getAll: () => api.get<any[]>('/mccmnc'),
+  getAll: (params?: { search?: string; country?: string; offset?: number; limit?: number }) => {
+    const qs = new URLSearchParams();
+    if (params?.search) qs.set('search', params.search);
+    if (params?.country && params.country !== 'all') qs.set('country', params.country);
+    if (params?.offset !== undefined) qs.set('offset', String(params.offset));
+    if (params?.limit !== undefined) qs.set('limit', String(params.limit));
+    const q = qs.toString();
+    return api.get<any>(`/mccmnc${q ? '?' + q : ''}`);
+  },
   create: (data: any) => api.post<any>('/mccmnc', data),
   update: (id: string, data: any) => api.put<any>(`/mccmnc/${id}`, data),
   delete: (id: string) => api.delete(`/mccmnc/${id}`),
@@ -232,7 +224,7 @@ export const billingApi = {
 
 // ==================== SMS API ====================
 export const smsApi = {
-  getLogs: (filters: any) => api.post<any[]>('/sms/logs', filters),
+  getLogs: (filters: any & { offset?: number; limit?: number }) => api.post<any>('/sms/logs', filters),
   getLog: (id: string) => api.get<any>(`/sms/logs/${id}`),
   sendTest: (data: any) => api.post<any>('/sms/test', data),
   getStats: (period: string) => api.get<any>(`/sms/stats?period=${period}`),
@@ -241,10 +233,23 @@ export const smsApi = {
 
 // ==================== BIND STATUS API ====================
 export const bindApi = {
-  getStatus: () => api.get<any[]>('/bind/status'),
-  reconnect: (supplierId: string) => api.post(`/bind/${supplierId}/reconnect`, {}),
-  disconnect: (supplierId: string) => api.post(`/bind/${supplierId}/disconnect`, {}),
-  getHistory: (supplierId: string) => api.get<any[]>(`/bind/${supplierId}/history`),
+  getStatus: (showDeleted?: boolean) => api.get<any[]>(`/bind/status${showDeleted ? '?show_deleted=true' : ''}`),
+  getClientStatus: () => api.get<any[]>('/bind/clients'),
+  bindSupplier: (supplierId: string) => suppliersApi.bind(supplierId),
+  unbindSupplier: (supplierId: string) => suppliersApi.unbind(supplierId),
+  bindClient: (clientId: string) => api.post<any>(`/clients/${clientId}/bind`, {}),
+  unbindClient: (clientId: string) => api.post<any>(`/clients/${clientId}/unbind`, {}),
+  getHistory: (filters?: { entity_type?: string; entity_id?: number; status?: string; include_deleted?: boolean; limit?: number; offset?: number }) => {
+    const qs = new URLSearchParams();
+    if (filters?.entity_type) qs.set('entity_type', filters.entity_type);
+    if (filters?.entity_id) qs.set('entity_id', String(filters.entity_id));
+    if (filters?.status) qs.set('status', filters.status);
+    if (filters?.include_deleted) qs.set('include_deleted', 'true');
+    if (filters?.limit !== undefined) qs.set('limit', String(filters.limit));
+    if (filters?.offset !== undefined) qs.set('offset', String(filters.offset));
+    const q = qs.toString();
+    return api.get<any>(`/bind/history${q ? '?' + q : ''}`);
+  },
 };
 
 // ==================== OTT DEVICES API ====================
@@ -304,6 +309,10 @@ export const systemApi = {
   backup: () => api.post<any>('/system/backup', {}),
   restore: (formData: FormData) => api.upload<any>('/system/restore', formData),
   getLogs: (type: string) => api.get<any[]>(`/system/logs/${type}`),
+  
+  // Data Retention Cleanup — purge non-financial data older than N months
+  // Preserves: sms_logs, payments, invoices, rates, clients, suppliers, users
+  cleanupRetention: (months?: number) => api.post<{ data: { cutoff_months: number; total_cleaned: number; breakdown: Record<string, number>; preserved: string } }>('/system/cleanup-retention', { months: months || 6 }),
 };
 
 // ==================== LICENSE API ====================
@@ -350,6 +359,14 @@ export const translationsApi = {
   test: (data: any) => api.post<any>('/translations/test', data),
 };
 
+// ==================== CHANNELS API (RCS, Flash SMS, WhatsApp, Telegram, HTTP) ====================
+export const channelsApi = {
+  send: (data: { channel: string; destination: string; message: string; device_id?: string; sender_id?: string; media_url?: string; api_connector_id?: string }) =>
+    api.post<any>('/channels/send', data),
+  getLogs: (filters?: { channel?: string; status?: string; destination?: string; start_date?: string; end_date?: string }) =>
+    api.post<any[]>('/channels/logs', filters || {}),
+};
+
 // ==================== VOICE OTP API ====================
 export const voiceOtpApi = {
   getConfigs: () => api.get<any[]>('/voice-otp/configs'),
@@ -358,8 +375,14 @@ export const voiceOtpApi = {
   deleteConfig: (id: string) => api.delete(`/voice-otp/configs/${id}`),
   uploadAudio: (id: string, formData: FormData) => 
     api.upload<any>(`/voice-otp/configs/${id}/audio`, formData),
-  getLogs: (filters: any) => api.post<any[]>('/voice-otp/logs', filters),
+  getSipSettings: () => api.get<any>('/voice-otp/sip-settings'),
+  updateSipSettings: (data: any) => api.put<any>('/voice-otp/sip-settings', data),
+  getSipServers: () => api.get<any>('/voice-otp/sip-servers'),
+  updateSipServers: (data: any) => api.put<any>('/voice-otp/sip-servers', data),
+  getLogs: (filters?: any) => api.post<any[]>('/voice-otp/logs', filters || {}),
   testCall: (data: any) => api.post<any>('/voice-otp/test', data),
+  testMulti: (data: { client_id: string; destination: string; otp_code?: string }) => api.post<any>('/voice-otp/test-multi', data),
+  retryCall: (callId: string) => api.post(`/voice-otp/retry/${callId}`, {}),
 };
 
 // ==================== API CONNECTORS ====================

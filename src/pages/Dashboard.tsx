@@ -1,5 +1,5 @@
 import React from 'react';
-import { Users, Building2, MessageSquare, TrendingUp, DollarSign, Radio, CheckCircle, XCircle, Clock, AlertTriangle, Bell, CreditCard, Wifi, WifiOff, FileText, Send } from 'lucide-react';
+import { MessageSquare, CheckCircle, XCircle, AlertTriangle, Bell, WifiOff, FileText, DollarSign, TrendingUp } from 'lucide-react';
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, PieChart, Pie, Cell } from 'recharts';
 import { useData } from '../store/DataContext';
 import { Card } from '../components/UI/Card';
@@ -7,10 +7,9 @@ import { StatCard } from '../components/UI/StatCard';
 import { Badge } from '../components/UI/Badge';
 
 export const Dashboard: React.FC = () => {
-  const { clients, suppliers, smsLogs, invoices, payments } = useData();
+  const { clients, suppliers, smsLogs, invoices, payments, dashboardStats } = useData();
 
   // Real alert computation from data
-  const recentFailedSMS = smsLogs.filter(l => l.status === 'failed').slice(0, 15);
   const consecutiveFails = (() => {
     let count = 0;
     for (let i = smsLogs.length - 1; i >= 0; i--) {
@@ -39,7 +38,7 @@ export const Dashboard: React.FC = () => {
     alerts.push({ type: 'error', title: 'DLR Failure Alert', message: `${consecutiveFails} consecutive SMS failures detected. Check supplier connections.`, time: new Date().toLocaleTimeString() });
   }
   lowBalanceClients.forEach(c => {
-    alerts.push({ type: 'warning', title: 'Low Balance Alert', message: `${c.company_name} (${c.client_code}) balance is low: €${(c.balance||0).toFixed(2)}`, time: new Date().toLocaleTimeString() });
+    alerts.push({ type: 'warning', title: 'Low Balance Alert', message: `${c.company_name} (${c.client_code}) balance is low: €${Number(c.balance||0).toFixed(2)}`, time: new Date().toLocaleTimeString() });
   });
   blockedSuppliers.forEach(s => {
     alerts.push({ type: 'error', title: 'Channel Disconnect', message: `${s.company_name} (${s.supplier_code}) disconnected — ${s.consecutive_failures} failures`, time: new Date().toLocaleTimeString() });
@@ -68,10 +67,16 @@ export const Dashboard: React.FC = () => {
   });
 
   const revenueData = Array.from({ length: 14 }, (_, i) => {
-    const daySMS = smsLogs.filter(l => { const d = new Date(l.submit_time); return d.getDate() === d.getDate() - i + 14; });
-    const rev = daySMS.reduce((s, l) => s + (l.client_rate || 0) * (l.message_parts || 1), 0) || Math.floor(Math.random() * 1000 + 200);
-    const cost = rev * 0.6;
-    return { date: `Day ${i+1}`, revenue: rev, cost: cost, profit: rev - cost };
+    const targetDate = new Date(); targetDate.setDate(targetDate.getDate() - (13 - i));
+    const dayStr = targetDate.toISOString().split('T')[0];
+    const daySMS = smsLogs.filter(l => {
+      const d = new Date(l.submit_time);
+      return d.toISOString().split('T')[0] === dayStr;
+    });
+    const rev = daySMS.reduce((s, l) => s + (l.client_rate || 0) * (l.message_parts || 1), 0);
+    const cost = daySMS.reduce((s, l) => s + (l.supplier_rate || 0) * (l.message_parts || 1), 0);
+    const prof = daySMS.reduce((s, l) => s + (l.profit || 0), 0);
+    return { date: targetDate.toLocaleDateString('en', {month:'short', day:'numeric'}), revenue: rev, cost: cost, profit: prof };
   });
 
   const topDestData = (() => {
@@ -91,8 +96,8 @@ export const Dashboard: React.FC = () => {
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
         <StatCard title="Total SMS" value={formatNumber(smsLogs.length)} icon={<MessageSquare size={24}/>} change={12.5} changeLabel="from DB" color="blue"/>
         <StatCard title="Delivered" value={formatNumber(smsLogs.filter(l => l.status === 'delivered').length)} icon={<CheckCircle size={24}/>} color="green"/>
-        <StatCard title="Active Clients" value={`${clients.filter(c => c.status === 'active').length}/${clients.length}`} icon={<Users size={24}/>} color="purple"/>
-        <StatCard title="Active Binds" value={`${boundCount}/${boundCount + unboundCount}`} icon={<Radio size={24}/>} color="indigo"/>
+        <StatCard title="Revenue" value={formatCurrency(dashboardStats.revenue_today)} icon={<DollarSign size={24}/>} color="blue"/>
+        <StatCard title="Profit" value={formatCurrency(dashboardStats.profit_today)} icon={<TrendingUp size={24}/>} color="green"/>
       </div>
 
       {/* Alert Row */}
@@ -118,7 +123,7 @@ export const Dashboard: React.FC = () => {
       {/* Alerts List */}
       {alerts.length > 0 && (
         <Card title="Alerts & Notifications" subtitle={`${alerts.length} active alerts from database`} noPadding>
-          <div className="divide-y divide-gray-100 max-h-[300px] overflow-y-auto">
+          <div className="divide-y divide-gray-100 max-h-[200px] sm:max-h-[250px] lg:max-h-[300px] overflow-y-auto">
             {alerts.slice(0, 10).map((a, i) => (
               <div key={i} className="px-5 py-3 flex items-start gap-3 hover:bg-gray-50">
                 <div className={`mt-0.5 ${a.type==='error'?'text-red-500':a.type==='warning'?'text-yellow-500':a.type==='success'?'text-green-500':'text-blue-500'}`}>
@@ -138,10 +143,10 @@ export const Dashboard: React.FC = () => {
       {/* Charts */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <Card title="Hourly Traffic (Real Data)" subtitle="SMS sent, delivered, failed per hour">
-          <div className="h-72"><ResponsiveContainer width="100%" height="100%"><AreaChart data={hourlyData}><CartesianGrid strokeDasharray="3 3" stroke="#E5E7EB"/><XAxis dataKey="hour" tick={{fontSize:10}}/><YAxis tick={{fontSize:10}}/><Tooltip formatter={(v: any) => [formatNumber(Number(v)), '']}/><Area type="monotone" dataKey="sent" stroke="#3B82F6" fill="#3B82F6" fillOpacity={0.2}/><Area type="monotone" dataKey="delivered" stroke="#10B981" fill="#10B981" fillOpacity={0.2}/></AreaChart></ResponsiveContainer></div>
+          <div className="min-h-[250px] h-[40vh] sm:h-72 lg:h-80"><ResponsiveContainer width="100%" height="100%"><AreaChart data={hourlyData}><CartesianGrid strokeDasharray="3 3" stroke="#E5E7EB"/><XAxis dataKey="hour" tick={{fontSize:10}}/><YAxis tick={{fontSize:10}}/><Tooltip formatter={(v: any) => [formatNumber(Number(v)), '']}/><Area type="monotone" dataKey="sent" stroke="#3B82F6" fill="#3B82F6" fillOpacity={0.2}/><Area type="monotone" dataKey="delivered" stroke="#10B981" fill="#10B981" fillOpacity={0.2}/></AreaChart></ResponsiveContainer></div>
         </Card>
-        <Card title="Revenue & Cost (Last 14 Days)" subtitle="From real SMS transactions">
-          <div className="h-72"><ResponsiveContainer width="100%" height="100%"><BarChart data={revenueData}><CartesianGrid strokeDasharray="3 3" stroke="#E5E7EB"/><XAxis dataKey="date" tick={{fontSize:10}}/><YAxis tick={{fontSize:10}}/><Tooltip formatter={(v: any) => [formatCurrency(Number(v)), '']}/><Bar dataKey="revenue" fill="#3B82F6" radius={[3,3,0,0]}/><Bar dataKey="cost" fill="#EF4444" radius={[3,3,0,0]}/></BarChart></ResponsiveContainer></div>
+        <Card title="Revenue, Cost & Profit (Last 14 Days)" subtitle="From real SMS transactions">
+          <div className="min-h-[250px] h-[40vh] sm:h-72 lg:h-80"><ResponsiveContainer width="100%" height="100%"><BarChart data={revenueData}><CartesianGrid strokeDasharray="3 3" stroke="#E5E7EB"/><XAxis dataKey="date" tick={{fontSize:10}}/><YAxis tick={{fontSize:10}}/><Tooltip formatter={(v: any) => [formatCurrency(Number(v)), '']}/><Bar dataKey="revenue" fill="#3B82F6" radius={[3,3,0,0]}/><Bar dataKey="cost" fill="#EF4444" radius={[3,3,0,0]}/><Bar dataKey="profit" fill="#10B981" radius={[3,3,0,0]}/></BarChart></ResponsiveContainer></div>
         </Card>
       </div>
 
@@ -149,12 +154,12 @@ export const Dashboard: React.FC = () => {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <Card title="Top Destinations" subtitle="SMS volume by country" noPadding>
           {topDestData.length > 0 ? (
-            <div className="h-52"><ResponsiveContainer width="100%" height="100%"><PieChart><Pie data={topDestData} cx="50%" cy="50%" innerRadius={45} outerRadius={65} paddingAngle={3} dataKey="value" label={({ name, percent }: any) => `${(name||'').slice(0,3)} ${percent}`}>{topDestData.map((_,i)=><Cell key={i} fill={COLORS[i%COLORS.length]}/>)}</Pie><Tooltip formatter={(v: any) => [formatNumber(Number(v)), '']}/></PieChart></ResponsiveContainer></div>
+            <div className="min-h-[200px] h-[35vh] sm:h-52 lg:h-64"><ResponsiveContainer width="100%" height="100%"><PieChart><Pie data={topDestData} cx="50%" cy="50%" innerRadius={45} outerRadius={65} paddingAngle={3} dataKey="value" label={({ name, percent }: any) => `${(name||'').slice(0,3)} ${percent}`}>{topDestData.map((_,i)=><Cell key={i} fill={COLORS[i%COLORS.length]}/>)}</Pie><Tooltip formatter={(v: any) => [formatNumber(Number(v)), '']}/></PieChart></ResponsiveContainer></div>
           ) : <div className="p-8 text-center text-gray-400">No SMS data yet</div>}
         </Card>
 
         <Card title="Recent SMS" subtitle="Latest from database" noPadding>
-          <div className="divide-y divide-gray-100 max-h-[220px] overflow-y-auto">
+          <div className="divide-y divide-gray-100 max-h-[180px] sm:max-h-[200px] lg:max-h-[220px] overflow-y-auto">
             {recentSMS.map(sms => (
               <div key={sms.id} className="px-4 py-2.5 flex items-center justify-between hover:bg-gray-50">
                 <div className="flex items-center gap-2">
@@ -172,19 +177,19 @@ export const Dashboard: React.FC = () => {
         </Card>
 
         <Card title="Low Balance Clients" subtitle="Clients needing topup" noPadding>
-          <div className="divide-y divide-gray-100 max-h-[220px] overflow-y-auto">
+          <div className="divide-y divide-gray-100 max-h-[180px] sm:max-h-[200px] lg:max-h-[220px] overflow-y-auto">
             {lowBalanceClients.map(c => (
               <div key={c.id} className="px-4 py-2.5 flex items-center justify-between hover:bg-gray-50">
                 <div className="flex items-center gap-2">
                   <div className="w-6 h-6 rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center text-white text-[10px] font-bold">{c.company_name.charAt(0)}</div>
                   <div><p className="text-xs font-medium text-gray-800">{c.client_code}</p><p className="text-[10px] text-gray-500">{c.company_name}</p></div>
                 </div>
-                <span className="text-xs font-semibold text-red-600">€{(c.balance||0).toFixed(2)}</span>
+                <span className="text-xs font-semibold text-red-600">€{Number(c.balance||0).toFixed(2)}</span>
               </div>
             ))}
             {lowBalanceClients.length===0 && <p className="p-4 text-sm text-gray-400 text-center">All clients have sufficient balance</p>}
             {clients.filter(c=>c.status==='active').map(c=>{
-              const avail=(c.balance||0)+(c.credit_limit||0);
+              const avail=Number(c.balance||0)+Number(c.credit_limit||0);
               if(avail<500&&!lowBalanceClients.includes(c)){
                 return <div key={c.id} className="px-4 py-2.5 flex items-center justify-between hover:bg-gray-50"><div className="flex items-center gap-2"><div className="w-6 h-6 rounded-full bg-gradient-to-br from-yellow-500 to-orange-600 flex items-center justify-center text-white text-[10px] font-bold">{c.company_name.charAt(0)}</div><div><p className="text-xs font-medium text-gray-800">{c.client_code}</p><p className="text-[10px] text-gray-500">{c.company_name}</p></div></div><span className="text-xs font-semibold text-yellow-600">€{avail.toFixed(2)}</span></div>
               }

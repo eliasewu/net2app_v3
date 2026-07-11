@@ -40,7 +40,7 @@ interface TenantRemote {
 }
 
 export const TenantMonitor: React.FC = () => {
-  const { user, isSuperAdmin } = useAuth();
+  const { isSuperAdmin } = useAuth();
   const [tenants, setTenants] = useState<TenantRemote[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');

@@ -53,7 +53,9 @@ export const TABLES = {
     force_dlr BOOLEAN DEFAULT false,
     dlr_timeout INTEGER DEFAULT 150,
     routing_plan_id INTEGER REFERENCES route_plans(id),
+    rate_plan_id INTEGER,
     status VARCHAR(20) DEFAULT 'active',
+    is_deleted BOOLEAN DEFAULT false,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
@@ -71,15 +73,30 @@ export const TABLES = {
     smpp_username VARCHAR(100),
     smpp_password VARCHAR(255),
     system_id VARCHAR(100),
+    smpp_version VARCHAR(20) DEFAULT 'auto',
+    smpp_system_type VARCHAR(50) DEFAULT '',
+    smpp_bind_type VARCHAR(10) DEFAULT 'trx',
+    smpp_addr_ton INTEGER DEFAULT 0,
+    smpp_addr_npi INTEGER DEFAULT 0,
+    smpp_addr_range VARCHAR(100) DEFAULT '',
+    is_inbound BOOLEAN DEFAULT false,
     api_url TEXT,
     api_key TEXT,
+    api_secret TEXT,
     api_method VARCHAR(10) DEFAULT 'POST',
+    api_connector_id INTEGER,
+    voice_otp_config_id INTEGER,
+    whatsapp_device_ids TEXT,
+    telegram_device_ids TEXT,
+    force_dlr BOOLEAN DEFAULT false,
     balance DECIMAL(15,2) DEFAULT 0,
     credit_limit DECIMAL(15,2) DEFAULT 0,
     currency VARCHAR(3) DEFAULT 'EUR',
     bind_status VARCHAR(20) DEFAULT 'unbound',
     consecutive_failures INTEGER DEFAULT 0,
+    max_failures INTEGER DEFAULT 20,
     status VARCHAR(20) DEFAULT 'active',
+    is_deleted BOOLEAN DEFAULT false,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
@@ -93,6 +110,7 @@ export const TABLES = {
     percentage INTEGER DEFAULT 100,
     is_active BOOLEAN DEFAULT true,
     mccmnc_allowed TEXT[] DEFAULT '{"*"}',
+    mccmnc_denied TEXT[] DEFAULT '{}',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
   
@@ -101,6 +119,9 @@ export const TABLES = {
     route_name VARCHAR(255) NOT NULL,
     trunk_ids INTEGER[] DEFAULT '{}',
     route_method VARCHAR(20) DEFAULT 'priority',
+    preferred_channel VARCHAR(50),
+    mccmnc_allowed TEXT[] DEFAULT '{"*"}',
+    mccmnc_denied TEXT[] DEFAULT '{}',
     is_active BOOLEAN DEFAULT true,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
@@ -110,18 +131,7 @@ export const TABLES = {
     plan_name VARCHAR(255) NOT NULL,
     route_ids INTEGER[] DEFAULT '{}',
     is_default BOOLEAN DEFAULT false,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  )`,
-  
-  route_maps: `CREATE TABLE IF NOT EXISTS route_maps (
-    id SERIAL PRIMARY KEY,
-    client_id INTEGER REFERENCES clients(id) NOT NULL,
-    route_id INTEGER REFERENCES routes(id) NOT NULL,
-    supplier_id INTEGER REFERENCES suppliers(id) NOT NULL,
-    mccmnc_pattern VARCHAR(50) NOT NULL DEFAULT '*',
-    priority INTEGER DEFAULT 1,
-    percentage INTEGER DEFAULT 100,
-    is_active BOOLEAN DEFAULT true,
+    allowed_channels TEXT[] DEFAULT '{}',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
   
@@ -138,8 +148,8 @@ export const TABLES = {
     effective_from DATE NOT NULL,
     effective_to DATE,
     is_active BOOLEAN DEFAULT true,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    version INTEGER DEFAULT 1
+    version INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
   
   mccmnc: `CREATE TABLE IF NOT EXISTS mccmnc (
@@ -151,6 +161,7 @@ export const TABLES = {
     operator VARCHAR(255) NOT NULL,
     network_type VARCHAR(50) DEFAULT 'GSM',
     status VARCHAR(20) DEFAULT 'active',
+    is_deleted BOOLEAN DEFAULT false,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
   
@@ -158,7 +169,9 @@ export const TABLES = {
     id SERIAL PRIMARY KEY,
     message_id VARCHAR(100) UNIQUE NOT NULL,
     client_id INTEGER REFERENCES clients(id),
+    client_code VARCHAR(50),
     supplier_id INTEGER REFERENCES suppliers(id),
+    supplier_code VARCHAR(50),
     sender_id VARCHAR(100) NOT NULL,
     destination VARCHAR(50) NOT NULL,
     mcc VARCHAR(10),
@@ -178,10 +191,14 @@ export const TABLES = {
     error_message TEXT,
     route_id INTEGER REFERENCES routes(id),
     trunk_id INTEGER REFERENCES trunks(id),
+    route_name VARCHAR(255),
+    trunk_name VARCHAR(255),
     smpp_message_id VARCHAR(100),
     registered_delivery INTEGER DEFAULT 1,
     data_coding INTEGER DEFAULT 0,
     esm_class INTEGER DEFAULT 0,
+    source VARCHAR(100),
+    is_deleted BOOLEAN DEFAULT false,
     submit_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     delivery_time TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -193,17 +210,32 @@ export const TABLES = {
     entity_type VARCHAR(20) NOT NULL,
     entity_id INTEGER NOT NULL,
     entity_name VARCHAR(255) NOT NULL,
+    invoice_to_name VARCHAR(255),
+    invoice_to_address TEXT,
+    invoice_to_email VARCHAR(255),
+    invoice_by_name VARCHAR(255) DEFAULT 'NET2APP Hub',
+    invoice_by_address TEXT,
+    invoice_by_email VARCHAR(255) DEFAULT 'billing@net2app.com',
+    invoice_by_vat VARCHAR(50),
     period_start DATE NOT NULL,
     period_end DATE NOT NULL,
     total_sms INTEGER DEFAULT 0,
     total_amount DECIMAL(15,2) DEFAULT 0,
     tax_amount DECIMAL(15,2) DEFAULT 0,
+    tax_rate DECIMAL(5,2) DEFAULT 19.00,
     grand_total DECIMAL(15,2) DEFAULT 0,
     currency VARCHAR(3) DEFAULT 'EUR',
     status VARCHAR(20) DEFAULT 'draft',
     due_date DATE,
     paid_date DATE,
+    payment_method VARCHAR(50),
+    payment_reference VARCHAR(255),
     notes TEXT,
+    bank_name VARCHAR(255),
+    bank_account VARCHAR(100),
+    bank_iban VARCHAR(50),
+    bank_bic VARCHAR(50),
+    is_deleted BOOLEAN DEFAULT false,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     sent_at TIMESTAMP
   )`,
@@ -220,6 +252,7 @@ export const TABLES = {
     reference VARCHAR(255),
     status VARCHAR(20) DEFAULT 'pending',
     notes TEXT,
+    is_deleted BOOLEAN DEFAULT false,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
   
@@ -247,18 +280,21 @@ export const TABLES = {
   api_connectors: `CREATE TABLE IF NOT EXISTS api_connectors (
     id SERIAL PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
+    type VARCHAR(50) DEFAULT 'http',
     provider VARCHAR(100) NOT NULL,
-    region VARCHAR(100),
-    auth_type VARCHAR(50) DEFAULT 'API_KEY',
-    http_method VARCHAR(10) DEFAULT 'POST',
+    base_url TEXT,
+    send_url TEXT,
     api_key TEXT,
-    send_url TEXT NOT NULL,
-    dlr_url TEXT,
-    submit_pattern VARCHAR(255),
-    dlr_pattern VARCHAR(255),
-    dlr_value VARCHAR(100),
-    params TEXT,
+    api_secret TEXT,
+    region VARCHAR(100),
+    description TEXT,
+    username VARCHAR(255),
+    password TEXT,
+    phone_number_id VARCHAR(100),
+    business_account_id VARCHAR(100),
+    bot_token TEXT,
     is_active BOOLEAN DEFAULT true,
+    connection_status VARCHAR(20) DEFAULT 'untested',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
   
@@ -277,13 +313,21 @@ export const TABLES = {
   voice_otp_configs: `CREATE TABLE IF NOT EXISTS voice_otp_configs (
     id SERIAL PRIMARY KEY,
     language VARCHAR(100) NOT NULL,
-    language_code VARCHAR(10) NOT NULL,
-    greeting_text TEXT NOT NULL,
+    language_code VARCHAR(10) NOT NULL DEFAULT 'en',
+    country_prefix VARCHAR(10) DEFAULT '',
+    primary_language_code VARCHAR(10) DEFAULT 'en',
+    secondary_language_code VARCHAR(10) DEFAULT 'en',
+    primary_greeting_text TEXT,
+    primary_retry_text TEXT,
+    secondary_greeting_text TEXT,
+    secondary_retry_text TEXT,
+    greeting_text TEXT,
     retry_text TEXT,
-    audio_file_url TEXT,
-    sip_host VARCHAR(255) DEFAULT 'sip.provider.com',
-    sip_port INTEGER DEFAULT 5060,
-    caller_id VARCHAR(50),
+    greeting_audio_url TEXT,
+    secondary_greeting_audio_url TEXT,
+    audio_0_9 JSONB DEFAULT '{}',
+    audio_files JSONB DEFAULT '{}',
+    secondary_audio_files JSONB DEFAULT '{}',
     is_active BOOLEAN DEFAULT true,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
@@ -299,7 +343,12 @@ export const TABLES = {
     max_retries INTEGER DEFAULT 4,
     status VARCHAR(20) DEFAULT 'initiated',
     dlr_status VARCHAR(20),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    error_message TEXT,
+    sip_call_id VARCHAR(100),
+    client_id INTEGER,
+    next_retry_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP
   )`,
   
   campaigns: `CREATE TABLE IF NOT EXISTS campaigns (
@@ -316,6 +365,7 @@ export const TABLES = {
     scheduled_at TIMESTAMP,
     started_at TIMESTAMP,
     completed_at TIMESTAMP,
+    is_deleted BOOLEAN DEFAULT false,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
   
@@ -327,6 +377,14 @@ export const TABLES = {
     client_id INTEGER REFERENCES clients(id),
     supplier_id INTEGER REFERENCES suppliers(id),
     route_id INTEGER REFERENCES routes(id),
+    mcc VARCHAR(10),
+    mnc VARCHAR(10),
+    name VARCHAR(255) DEFAULT '',
+    description TEXT DEFAULT '',
+    subtype VARCHAR(100) DEFAULT '',
+    priority INTEGER DEFAULT 1,
+    apply_to VARCHAR(20) DEFAULT 'client',
+    apply_entity_id VARCHAR(50) DEFAULT 'all',
     is_active BOOLEAN DEFAULT true,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`,
@@ -386,9 +444,11 @@ export const TABLES = {
     retry_count INTEGER DEFAULT 0,
     max_retries INTEGER DEFAULT 150,
     force_dlr BOOLEAN DEFAULT false,
+    dlr_timeout INTEGER DEFAULT 150,
     submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_retry_at TIMESTAMP,
-    dlr_received_at TIMESTAMP
+    dlr_received_at TIMESTAMP,
+    dlr_result VARCHAR(50)
   )`,
 };
 
@@ -407,8 +467,6 @@ export const INIT_DATABASE_SQL = `
   CREATE INDEX IF NOT EXISTS idx_invoices_entity ON invoices(entity_type, entity_id);
   CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(is_read);
   CREATE INDEX IF NOT EXISTS idx_dlr_queue_status ON dlr_queue(status);
-  CREATE INDEX IF NOT EXISTS idx_route_maps_client ON route_maps(client_id);
-  CREATE INDEX IF NOT EXISTS idx_route_maps_mccmnc ON route_maps(mccmnc_pattern);
   CREATE INDEX IF NOT EXISTS idx_trunks_supplier ON trunks(supplier_id);
   CREATE INDEX IF NOT EXISTS idx_routes_active ON routes(is_active);
   CREATE INDEX IF NOT EXISTS idx_mccmnc_mcc ON mccmnc(mcc);
@@ -450,11 +508,11 @@ export const SMS_PROCESSING_FLOW = `
   
   2. Validation Check:
      → Check client balance (SELECT balance, credit_limit FROM clients WHERE id=?)
-     → Check if client has route (SELECT route_id FROM route_maps WHERE client_id=? AND mccmnc_pattern LIKE ?)
+     → Check if client has a route plan (SELECT * FROM route_plans WHERE id IN (SELECT routing_plan_id FROM clients WHERE id=?))
      → Check rate exists (SELECT rate FROM rates WHERE entity_type='client' AND entity_id=? AND is_active=true)
   
   3. Route Selection:
-     → Find route map (SELECT supplier_id, priority FROM route_maps WHERE client_id=? AND ? LIKE mccmnc_pattern)
+     → Find route plan (SELECT * FROM route_plans WHERE id IN (SELECT routing_plan_id FROM clients WHERE id=?))
      → Find trunk (SELECT * FROM trunks WHERE id IN (SELECT unnest(trunk_ids) FROM routes WHERE id=?) AND is_active=true)
      → Check supplier bind (SELECT bind_status, consecutive_failures FROM suppliers WHERE id=? AND status='active')
   

@@ -1,6 +1,7 @@
-import React, { useState, useRef } from 'react';
-import { Plus, Search, Upload, Download, Edit, Trash2, Globe } from 'lucide-react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { Plus, Search, Upload, Download, Edit, Trash2, Globe, Loader2 } from 'lucide-react';
 import { useData } from '../../store/DataContext';
+import { api } from '../../services/api';
 import { Card } from '../../components/UI/Card';
 import { Button } from '../../components/UI/Button';
 import { Badge } from '../../components/UI/Badge';
@@ -19,7 +20,7 @@ India,IN,404,10,Airtel India,GSM
 India,IN,405,45,Airtel India,GSM`;
 
 export const MCCMNCDatabase: React.FC = () => {
-  const { mccmnc, addMCCMNC, updateMCCMNC, deleteMCCMNC } = useData();
+  const { mccmnc, mccmncTotal, fetchMCCMNC, addMCCMNC, updateMCCMNC, deleteMCCMNC } = useData();
   const [search, setSearch] = useState('');
   const [countryFilter, setCountryFilter] = useState<string>('all');
   const [currentPage, setCurrentPage] = useState(1);
@@ -30,19 +31,58 @@ export const MCCMNCDatabase: React.FC = () => {
   const [importText, setImportText] = useState('');
   const [importResult, setImportResult] = useState<{added:number;skipped:number;errors:string[]} | null>(null);
   const [selectedEntries, setSelectedEntries] = useState<string[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [countries, setCountries] = useState<string[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [formData, setFormData] = useState({ country:'', country_code:'', mcc:'', mnc:'', operator:'', network_type:'GSM', status:'active' as 'active'|'inactive' });
   const itemsPerPage = 20;
 
-  const countries = [...new Set(mccmnc.map(m => m.country))].sort();
-  const filteredMCCMNC = mccmnc.filter(entry => {
-    const ms = entry.country.toLowerCase().includes(search.toLowerCase()) || entry.operator.toLowerCase().includes(search.toLowerCase()) || entry.mcc.includes(search) || entry.mnc.includes(search);
-    const mc = countryFilter === 'all' || entry.country === countryFilter;
-    return ms && mc;
-  });
-  const totalPages = Math.ceil(filteredMCCMNC.length / itemsPerPage);
-  const paginatedMCCMNC = filteredMCCMNC.slice((currentPage-1)*itemsPerPage, currentPage*itemsPerPage);
+  // Load country list once
+  useEffect(() => {
+    (async () => {
+      const res: any = await api.get('/mccmnc/countries');
+      if (res.success && res.data?.data) {
+        setCountries(res.data.data as string[]);
+      }
+    })().catch(() => {});
+  }, []);
+
+  // Server-side pagination fetch
+  const loadPage = useCallback(async (page: number, s: string, country: string) => {
+    setLoading(true);
+    try {
+      await fetchMCCMNC({
+        search: s || undefined,
+        country: country !== 'all' ? country : undefined,
+        offset: (page - 1) * itemsPerPage,
+        limit: itemsPerPage,
+      });
+    } catch (e) {
+      console.warn('MCCMNC fetch failed:', e);
+    } finally {
+      setLoading(false);
+    }
+  }, [fetchMCCMNC, itemsPerPage]);
+
+  // Fetch page data on mount and on page/filter change
+  useEffect(() => { loadPage(currentPage, search, countryFilter); }, [currentPage, search, countryFilter, loadPage]);
+
+  const totalPages = Math.max(1, Math.ceil(mccmncTotal / itemsPerPage));
+
+  const handlePageChange = (page: number) => {
+    setCurrentPage(page);
+  };
+
+  const handleSearchChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setSearch(e.target.value);
+    setCurrentPage(1);
+  };
+
+  const handleCountryChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    setCountryFilter(e.target.value);
+    setCurrentPage(1);
+  };
 
   const openModal = (entry?: MCCMNC) => {
     if (entry) { setEditingEntry(entry); setFormData({ country:entry.country, country_code:entry.country_code, mcc:entry.mcc, mnc:entry.mnc, operator:entry.operator, network_type:entry.network_type, status:entry.status }); }
@@ -50,13 +90,16 @@ export const MCCMNCDatabase: React.FC = () => {
     setShowModal(true);
   };
 
-  const handleSubmit = () => {
-    if (editingEntry) { updateMCCMNC(editingEntry.id, formData); }
-    else { addMCCMNC(formData); }
+  const handleSubmit = async () => {
+    if (editingEntry) { await updateMCCMNC(editingEntry.id, formData); }
+    else { await addMCCMNC(formData); }
     setShowModal(false);
+    loadPage(currentPage, search, countryFilter);
   };
 
-  const handleDelete = () => { if (deleteModal) { deleteMCCMNC(deleteModal.id); setDeleteModal(null); } };
+  const handleDelete = async () => {
+    if (deleteModal) { await deleteMCCMNC(deleteModal.id); setDeleteModal(null); loadPage(currentPage, search, countryFilter); }
+  };
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -89,27 +132,34 @@ export const MCCMNCDatabase: React.FC = () => {
     return entries;
   };
 
-  const handleImport = () => {
+  const handleImport = async () => {
     const entries = parseCSV(importText);
     let added = 0, skipped = 0;
     const errors: string[] = [];
     for (const e of entries) {
       if (!e.mcc || !e.mnc || !e.country) { skipped++; errors.push(`Skipped: missing MCC/MNC for ${e.country || 'unknown'}`); continue; }
-      const exists = mccmnc.find(m => m.mcc === e.mcc && m.mnc === e.mnc);
-      if (exists) { updateMCCMNC(exists.id, e); skipped++; }
-      else { addMCCMNC(e); added++; }
+      try {
+        await addMCCMNC(e);
+        added++;
+      } catch (err: any) {
+        errors.push(err?.message || 'Import failed');
+      }
     }
     setImportResult({ added, skipped, errors });
     setImportText('');
+    loadPage(1, search, countryFilter);
   };
 
-  const handleExportCSV = () => {
+  const handleExportCSV = async () => {
+    // Fetch all records for export
+    const res: any = await api.get('/mccmnc?limit=10000');
+    const all = res.success && res.data?.data ? res.data.data : [];
     const header = 'country,country_code,mcc,mnc,operator,network_type,status';
-    const rows = filteredMCCMNC.map(m => `${m.country},${m.country_code},${m.mcc},${m.mnc},${m.operator},${m.network_type},${m.status}`).join('\n');
+    const rows = all.map((m: MCCMNC) => `${m.country},${m.country_code},${m.mcc},${m.mnc},${m.operator},${m.network_type},${m.status}`).join('\n');
     const csv = header + '\n' + rows;
     const blob = new Blob([csv], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
-    const a = document.createElement('a'); a.href = url; a.download = 'mccmnc_export.csv'; a.click();
+    const a = document.createElement('a'); a.href = url; a.download = `mccmnc_export_${new Date().toISOString().split('T')[0]}.csv`; a.click();
     URL.revokeObjectURL(url);
   };
 
@@ -119,10 +169,10 @@ export const MCCMNCDatabase: React.FC = () => {
   const columns = [
     { key:'select', header:'☑', width:'40px', render:(entry:MCCMNC) => <button onClick={(e)=>{e.stopPropagation();toggleSelect(entry.id);}} className="p-1">{selectedEntries.includes(entry.id) ? <span className="text-blue-600 font-bold">☑</span> : <span className="text-gray-400">☐</span>}</button> },
     { key:'country', header:'Country', render:(entry:MCCMNC) => <div className="flex items-center gap-2"><Globe size={14} className="text-gray-400"/><div><p className="font-medium text-sm">{entry.country}</p><p className="text-[10px] text-gray-500">{entry.country_code}</p></div></div> },
-    { key:'mcc', header:'MCC', render:(entry:MCCMNC) => <span className="font-mono bg-blue-50 text-blue-700 px-2 py-0.5 rounded text-xs">{entry.mcc}</span> },
-    { key:'mnc', header:'MNC', render:(entry:MCCMNC) => <span className="font-mono bg-purple-50 text-purple-700 px-2 py-0.5 rounded text-xs">{entry.mnc}</span> },
+    { key:'mcc', header:'MCC', hideOnMobile:true, render:(entry:MCCMNC) => <span className="font-mono bg-blue-50 text-blue-700 px-2 py-0.5 rounded text-xs">{entry.mcc}</span> },
+    { key:'mnc', header:'MNC', hideOnMobile:true, render:(entry:MCCMNC) => <span className="font-mono bg-purple-50 text-purple-700 px-2 py-0.5 rounded text-xs">{entry.mnc}</span> },
     { key:'operator', header:'Operator', render:(entry:MCCMNC) => <span className="text-sm">{entry.operator}</span> },
-    { key:'network_type', header:'Network', render:(entry:MCCMNC) => <Badge variant="default" size="sm">{entry.network_type}</Badge> },
+    { key:'network_type', header:'Network', hideOnMobile:true, render:(entry:MCCMNC) => <Badge variant="default" size="sm">{entry.network_type}</Badge> },
     { key:'status', header:'Status', render:(entry:MCCMNC) => <Badge variant={entry.status==='active'?'success':'danger'} dot size="sm">{entry.status}</Badge> },
     { key:'actions', header:'', render:(entry:MCCMNC) => <div className="flex gap-1"><button onClick={()=>openModal(entry)} className="p-1 rounded hover:bg-gray-100"><Edit size={14} className="text-gray-500"/></button><button onClick={()=>setDeleteModal(entry)} className="p-1 rounded hover:bg-gray-100"><Trash2 size={14} className="text-red-500"/></button></div> },
   ];
@@ -130,7 +180,7 @@ export const MCCMNCDatabase: React.FC = () => {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <div><h1 className="text-2xl font-bold text-gray-800">MCC/MNC Database</h1><p className="text-gray-500 mt-1">{mccmnc.length} operators across {countries.length} countries</p></div>
+        <div><h1 className="text-2xl font-bold text-gray-800">MCC/MNC Database</h1><p className="text-gray-500 mt-1">{mccmncTotal.toLocaleString()} operators across {countries.length} countries</p></div>
         <div className="flex gap-2">
           <Button variant="secondary" icon={<Upload size={16}/>} onClick={()=>{setShowImportModal(true);setImportResult(null);}}>Import CSV</Button>
           <Button variant="secondary" icon={<Download size={16}/>} onClick={handleExportCSV}>Export CSV</Button>
@@ -140,9 +190,9 @@ export const MCCMNCDatabase: React.FC = () => {
 
       {/* Stats */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-        <div className="bg-white rounded-xl p-4 border"><p className="text-sm text-gray-500">Total Entries</p><p className="text-2xl font-bold">{mccmnc.length}</p></div>
+        <div className="bg-white rounded-xl p-4 border"><p className="text-sm text-gray-500">Total Entries</p><p className="text-2xl font-bold">{mccmncTotal.toLocaleString()}</p></div>
         <div className="bg-white rounded-xl p-4 border"><p className="text-sm text-gray-500">Countries</p><p className="text-2xl font-bold text-blue-600">{countries.length}</p></div>
-        <div className="bg-white rounded-xl p-4 border"><p className="text-sm text-gray-500">Active</p><p className="text-2xl font-bold text-green-600">{mccmnc.filter(m=>m.status==='active').length}</p></div>
+        <div className="bg-white rounded-xl p-4 border"><p className="text-sm text-gray-500">Showing</p><p className="text-2xl font-bold text-green-600">{mccmnc.length}</p></div>
         <div className="bg-white rounded-xl p-4 border"><p className="text-sm text-gray-500">Selected</p><p className="text-2xl font-bold text-purple-600">{selectedEntries.length}</p></div>
       </div>
 
@@ -157,15 +207,21 @@ export const MCCMNCDatabase: React.FC = () => {
       {/* Filters */}
       <Card>
         <div className="flex flex-col md:flex-row gap-3">
-          <div className="flex-1 relative"><Search size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"/><input type="text" placeholder="Search by country, operator, MCC..." value={search} onChange={e=>setSearch(e.target.value)} className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"/></div>
-          <select value={countryFilter} onChange={e=>{setCountryFilter(e.target.value);setCurrentPage(1);}} className="px-4 py-2 border border-gray-300 rounded-lg text-sm"><option value="all">All Countries ({countries.length})</option>{countries.map(c=><option key={c} value={c}>{c}</option>)}</select>
+          <div className="flex-1 relative"><Search size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"/><input type="text" placeholder="Search by country, operator, MCC..." value={search} onChange={handleSearchChange} className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"/></div>
+          <select value={countryFilter} onChange={handleCountryChange} className="px-4 py-2 border border-gray-300 rounded-lg text-sm"><option value="all">All Countries ({countries.length})</option>{countries.map(c=><option key={c} value={c}>{c}</option>)}</select>
         </div>
       </Card>
 
       {/* Table */}
       <Card noPadding>
-        <Table columns={columns} data={paginatedMCCMNC} keyExtractor={e=>e.id}/>
-        <Pagination currentPage={currentPage} totalPages={totalPages} onPageChange={setCurrentPage} totalItems={filteredMCCMNC.length} itemsPerPage={itemsPerPage}/>
+        {loading ? (
+          <div className="flex items-center justify-center py-12"><Loader2 size={24} className="animate-spin text-blue-500 mr-2"/><span className="text-gray-500">Loading...</span></div>
+        ) : (
+          <>
+            <Table columns={columns} data={mccmnc} keyExtractor={e=>e.id}/>
+            <Pagination currentPage={currentPage} totalPages={totalPages} onPageChange={handlePageChange} totalItems={mccmncTotal} itemsPerPage={itemsPerPage}/>
+          </>
+        )}
       </Card>
 
       {/* Add/Edit Modal */}

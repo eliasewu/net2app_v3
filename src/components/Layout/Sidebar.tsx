@@ -1,10 +1,10 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import {
   LayoutDashboard, Users, Building2, GitBranch, DollarSign, CreditCard,
   MessageSquare, BarChart3, Megaphone, Radio, FlaskConical, Languages,
   Bell, UserCog, Settings, ChevronDown, ChevronRight, Smartphone,
-  Mic, Globe, FileText, Database, Plug, Send
+  Mic, Globe, FileText, Database, Plug, Send, Clock, X, BookOpen
 } from 'lucide-react';
 
 interface MenuItem {
@@ -43,7 +43,6 @@ const menuItems: MenuItem[] = [
     children: [
       { label: 'Trunks', icon: <GitBranch size={16} />, path: '/routing/trunks' },
       { label: 'Routes', icon: <GitBranch size={16} />, path: '/routing/routes' },
-      { label: 'Route Maps', icon: <GitBranch size={16} />, path: '/routing/maps' },
       { label: 'Route Plans', icon: <GitBranch size={16} />, path: '/routing/plans' },
     ]
   },
@@ -67,6 +66,7 @@ const menuItems: MenuItem[] = [
   },
   { label: 'SMS Logs', icon: <MessageSquare size={20} />, path: '/sms-logs' },
   { label: 'SMS Inbox (MO)', icon: <MessageSquare size={20} />, path: '/sms-inbox' },
+  { label: 'Channels', icon: <Send size={20} />, path: '/channels' },
   {
     label: 'Reports',
     icon: <BarChart3 size={20} />,
@@ -78,6 +78,7 @@ const menuItems: MenuItem[] = [
     ]
   },
   { label: 'Campaigns', icon: <Megaphone size={20} />, path: '/campaigns' },
+  { label: 'DLR Queue', icon: <Clock size={20} />, path: '/dlr-queue' },
   { label: 'Bind Status', icon: <Radio size={20} />, path: '/bind-status' },
   {
     label: 'Testing',
@@ -113,20 +114,54 @@ const menuItems: MenuItem[] = [
       { label: 'License', icon: <Settings size={16} />, path: '/system/license' },
       { label: 'Database', icon: <Database size={16} />, path: '/system/database' },
       { label: 'Backup', icon: <Settings size={16} />, path: '/system/backup' },
+      { label: 'API Docs', icon: <BookOpen size={16} />, path: '/system/api-docs' },
     ]
   },
 ];
 
 interface SidebarProps {
   isCollapsed: boolean;
+  isMobileOpen: boolean;
+  onCloseMobile: () => void;
 }
 
 import { useTheme } from '../../store/ThemeContext';
 
-export const Sidebar: React.FC<SidebarProps> = ({ isCollapsed }) => {
+export const Sidebar: React.FC<SidebarProps> = ({ isCollapsed, isMobileOpen, onCloseMobile }) => {
   const { isDark } = useTheme();
   const location = useLocation();
   const [expandedItems, setExpandedItems] = useState<string[]>(['Clients', 'Suppliers', 'Routing']);
+  const touchStartX = useRef(0);
+  const SWIPE_THRESHOLD = 80; // px to swipe before closing
+
+  // Close mobile sidebar on Escape key
+  useEffect(() => {
+    if (!isMobileOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onCloseMobile();
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [isMobileOpen, onCloseMobile]);
+
+  // Touch swipe handlers — swipe left on the sidebar to close it
+  const handleTouchStart = useCallback((e: React.TouchEvent) => {
+    touchStartX.current = e.touches[0].clientX;
+  }, []);
+
+  const handleTouchEnd = useCallback((e: React.TouchEvent) => {
+    const deltaX = touchStartX.current - e.changedTouches[0].clientX;
+    // Swiped left past threshold → close the sidebar
+    if (deltaX > SWIPE_THRESHOLD) {
+      onCloseMobile();
+    }
+    touchStartX.current = 0;
+  }, [onCloseMobile]);
+
+  // Reset on touch cancel (e.g. system takeover, incoming call)
+  const handleTouchCancel = useCallback(() => {
+    touchStartX.current = 0;
+  }, []);
 
   const toggleExpand = (label: string) => {
     setExpandedItems(prev =>
@@ -172,10 +207,16 @@ export const Sidebar: React.FC<SidebarProps> = ({ isCollapsed }) => {
       );
     }
 
+    const handleClick = () => {
+      // On mobile, close sidebar when a nav link is clicked
+      onCloseMobile();
+    };
+
     return (
       <Link
         key={item.path}
         to={item.path!}
+        onClick={handleClick}
         className={`flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all duration-200
           ${isActive(item.path)
             ? 'bg-blue-600 text-white font-semibold shadow-md shadow-blue-500/30'
@@ -189,15 +230,15 @@ export const Sidebar: React.FC<SidebarProps> = ({ isCollapsed }) => {
     );
   };
 
-  return (
+  const sidebarContent = (
     <aside
-      className={`fixed left-0 top-0 h-screen border-r border-blue-200/20 transition-all duration-300 z-40 overflow-hidden
+      className={`h-screen border-r border-blue-200/20 transition-all duration-300 z-40 overflow-hidden
         bg-gradient-to-b from-blue-700 via-blue-800 to-indigo-900
         ${isDark ? 'from-slate-800 via-slate-900 to-slate-950 border-slate-700' : 'from-blue-700 via-blue-800 to-indigo-900 border-blue-200/20'}
         ${isCollapsed ? 'w-16' : 'w-64'}`}
     >
       {/* Logo */}
-      <div className="h-16 flex items-center justify-center border-b border-blue-500/30 bg-gradient-to-r from-blue-600 to-indigo-600">
+      <div className="h-16 flex items-center justify-between lg:justify-center border-b border-blue-500/30 bg-gradient-to-r from-blue-600 to-indigo-600 px-3">
         {isCollapsed ? (
           <span className="text-2xl">📡</span>
         ) : (
@@ -206,6 +247,14 @@ export const Sidebar: React.FC<SidebarProps> = ({ isCollapsed }) => {
             <span className="text-xl font-bold text-white">NET2APP Hub</span>
           </div>
         )}
+        {/* Close button — visible only on mobile */}
+        <button
+          onClick={onCloseMobile}
+          className="lg:hidden p-1.5 rounded-lg text-white/70 hover:text-white hover:bg-white/10 transition-colors"
+          aria-label="Close menu"
+        >
+          <X size={20} />
+        </button>
       </div>
 
       {/* Navigation */}
@@ -213,5 +262,35 @@ export const Sidebar: React.FC<SidebarProps> = ({ isCollapsed }) => {
         {menuItems.map(item => renderMenuItem(item))}
       </nav>
     </aside>
+  );
+
+  return (
+    <>
+      {/* Mobile backdrop overlay */}
+      <div
+        onClick={onCloseMobile}
+        role="button"
+        tabIndex={-1}
+        aria-label="Close sidebar"
+        className={`fixed inset-0 bg-black/50 z-40 transition-opacity duration-300 lg:hidden
+          ${isMobileOpen ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'}`}
+      />
+
+      {/* Mobile sidebar — slides in from left, swipe left to close */}
+      <div
+        onTouchStart={handleTouchStart}
+        onTouchEnd={handleTouchEnd}
+        onTouchCancel={handleTouchCancel}
+        className={`fixed left-0 top-0 z-50 transition-transform duration-300 ease-in-out lg:hidden touch-pan-y
+          ${isMobileOpen ? 'translate-x-0' : '-translate-x-full'}`}
+      >
+        {sidebarContent}
+      </div>
+
+      {/* Desktop sidebar — always visible, controlled by collapse */}
+      <div className="hidden lg:block fixed left-0 top-0 z-40">
+        {sidebarContent}
+      </div>
+    </>
   );
 };

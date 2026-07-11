@@ -19,7 +19,7 @@ import { APIConnectors } from './pages/Suppliers/APIConnectors';
 import { VoiceOTP } from './pages/Suppliers/VoiceOTP';
 import { TrunksList } from './pages/Routing/TrunksList';
 import { RoutesList } from './pages/Routing/RoutesList';
-import { RouteMaps } from './pages/Routing/RouteMaps';
+
 import { MCCMNCDatabase } from './pages/Rates/MCCMNCDatabase';
 import { SMSLogs } from './pages/SMSLogs';
 import { InvoicesList } from './pages/Billing/InvoicesList';
@@ -30,13 +30,15 @@ import { License } from './pages/System/License';
 import { TranslationsPage } from './pages/Translations';
 import { CampaignsPage } from './pages/Campaigns';
 import { SMSInbox } from './pages/SMSInbox';
+import { Channels } from './pages/Channels';
+import { DLRQueuePage } from './pages/DLRQueue';
 import { UserManagement } from './pages/Users/UserManagement';
 import {
   RoutePlans, RateManagement, BulkUpload, BillingOverview, PaymentsPage,
   RealtimeReport, HourlyReport, DailyReport, MonthlyReport,
   AlertsPage,
   RolesPage, PlatformSettings, DatabasePage, BackupPage,
-  TestSMPPBind, TestHTTPAPI
+  TestSMPPBind, TestHTTPAPI, ApiDocs
 } from './pages/RemainingPages';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -79,7 +81,7 @@ function AppRoutes() {
         <Route path="routing/trunks" element={<TrunksList />} />
         <Route path="routing/routes" element={<RoutesList />} />
         <Route path="routing/plans" element={<RoutePlans />} />
-        <Route path="routing/maps" element={<RouteMaps />} />
+
         <Route path="rates" element={<RateManagement />} />
         <Route path="rates/upload" element={<BulkUpload />} />
         <Route path="rates/mccmnc" element={<MCCMNCDatabase />} />
@@ -92,7 +94,9 @@ function AppRoutes() {
         <Route path="reports/daily" element={<DailyReport />} />
         <Route path="reports/monthly" element={<MonthlyReport />} />
         <Route path="campaigns" element={<CampaignsPage />} />
+          <Route path="channels" element={<Channels />} />
           <Route path="sms-inbox" element={<SMSInbox />} />
+        <Route path="dlr-queue" element={<DLRQueuePage />} />
         <Route path="bind-status" element={<BindStatus />} />
         <Route path="testing/sms" element={<TestSMS />} />
         <Route path="testing/smpp" element={<TestSMPPBind />} />
@@ -106,6 +110,7 @@ function AppRoutes() {
         <Route path="system/license" element={<License />} />
         <Route path="system/database" element={<DatabasePage />} />
         <Route path="system/backup" element={<BackupPage />} />
+        <Route path="system/api-docs" element={<ApiDocs />} />
       </Route>
 
       {/* Catch all */}

@@ -5,7 +5,6 @@
 -- Drop existing tables (for fresh install)
 DROP TABLE IF EXISTS dlr_queue CASCADE;
 DROP TABLE IF EXISTS sms_logs CASCADE;
-DROP TABLE IF EXISTS route_maps CASCADE;
 DROP TABLE IF EXISTS route_plans CASCADE;
 DROP TABLE IF EXISTS routes CASCADE;
 DROP TABLE IF EXISTS trunks CASCADE;
@@ -13,6 +12,24 @@ DROP TABLE IF EXISTS rates CASCADE;
 DROP TABLE IF EXISTS mccmnc CASCADE;
 DROP TABLE IF EXISTS invoices CASCADE;
 DROP TABLE IF EXISTS payments CASCADE;
+DROP TABLE IF EXISTS voice_call_retry_queue CASCADE;
+DROP TABLE IF EXISTS social_api_suppliers CASCADE;
+DROP TABLE IF EXISTS sip_server_destinations CASCADE;
+DROP TABLE IF EXISTS sip_servers CASCADE;
+DROP TABLE IF EXISTS number_validation_results CASCADE;
+DROP TABLE IF EXISTS number_validation_providers CASCADE;
+DROP TABLE IF EXISTS pending_deliver_sm CASCADE;
+DROP TABLE IF EXISTS smpp_sessions CASCADE;
+DROP VIEW IF EXISTS active_smpp_sessions CASCADE;
+DROP TABLE IF EXISTS bind_history CASCADE;
+DROP TABLE IF EXISTS asterisk_settings CASCADE;
+DROP TABLE IF EXISTS api_keys CASCADE;
+DROP TABLE IF EXISTS mo_sms CASCADE;
+DROP TABLE IF EXISTS ip_lists CASCADE;
+DROP TABLE IF EXISTS idempotency_keys CASCADE;
+DROP TABLE IF EXISTS residential_proxies CASCADE;
+DROP TABLE IF EXISTS schema_migrations CASCADE;
+DROP TABLE IF EXISTS channel_messages CASCADE;
 DROP TABLE IF EXISTS voice_otp_logs CASCADE;
 DROP TABLE IF EXISTS voice_otp_configs CASCADE;
 DROP TABLE IF EXISTS ott_devices CASCADE;
@@ -80,13 +97,26 @@ CREATE TABLE clients (
     currency VARCHAR(3) DEFAULT 'EUR',
     balance DECIMAL(15,4) DEFAULT 0.0000,
     credit_limit DECIMAL(15,4) DEFAULT 0.0000,
+    api_key VARCHAR(255),
     api_enabled BOOLEAN DEFAULT false,
     webhook_url TEXT,
+    dlr_callback_url VARCHAR(500),
     force_dlr BOOLEAN DEFAULT false,
+    force_dlr_timeout_mode VARCHAR(20) DEFAULT 'fixed',
     dlr_timeout INTEGER DEFAULT 150,
+    connection_type VARCHAR(50) DEFAULT 'smpp',
+    preferred_channel VARCHAR(40) DEFAULT 'sms',
+    allowed_channels TEXT[] DEFAULT ARRAY['sms','whatsapp','telegram','rcs','flash_sms','voice_otp'],
+    api_connector_id INTEGER,
+    voice_otp_config_id INTEGER,
+    voice_otp_use_secondary BOOLEAN DEFAULT false,
+    whatsapp_device_ids TEXT[] DEFAULT '{}',
+    telegram_device_ids TEXT[] DEFAULT '{}',
+    client_ips TEXT DEFAULT '',
     routing_plan_id INTEGER,
     rate_plan_id INTEGER,
     status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active','inactive','suspended')),
+    is_deleted BOOLEAN DEFAULT false,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -112,10 +142,25 @@ CREATE TABLE suppliers (
     smpp_username VARCHAR(100),
     smpp_password VARCHAR(255),
     system_id VARCHAR(100),
+    smpp_version VARCHAR(20) DEFAULT 'auto',
+    smpp_system_type VARCHAR(50) DEFAULT '',
+    smpp_bind_type VARCHAR(10) DEFAULT 'trx',
+    smpp_addr_ton INTEGER DEFAULT 0,
+    smpp_addr_npi INTEGER DEFAULT 0,
+    smpp_addr_range VARCHAR(100) DEFAULT '',
+    is_inbound BOOLEAN DEFAULT false,
     api_url TEXT,
     api_key TEXT,
     api_secret TEXT,
     api_method VARCHAR(10) DEFAULT 'POST',
+    api_connector_id INTEGER,
+    voice_otp_config_id INTEGER,
+    whatsapp_device_ids TEXT,
+    telegram_device_ids TEXT,
+    force_dlr BOOLEAN DEFAULT false,
+    dlr_timeout INTEGER DEFAULT 150,
+    force_dlr_timeout_mode VARCHAR(20) DEFAULT 'fixed',
+    routed_via_asterisk BOOLEAN DEFAULT false,
     balance DECIMAL(15,4) DEFAULT 0.0000,
     credit_limit DECIMAL(15,4) DEFAULT 0.0000,
     currency VARCHAR(3) DEFAULT 'EUR',
@@ -123,6 +168,7 @@ CREATE TABLE suppliers (
     consecutive_failures INTEGER DEFAULT 0,
     max_failures INTEGER DEFAULT 20,
     status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active','inactive','suspended')),
+    is_deleted BOOLEAN DEFAULT false,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -147,6 +193,7 @@ CREATE TABLE trunks (
     percentage INTEGER DEFAULT 100,
     is_active BOOLEAN DEFAULT true,
     mccmnc_allowed TEXT[] DEFAULT '{*}',
+    mccmnc_denied TEXT[] DEFAULT '{}',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -165,6 +212,9 @@ CREATE TABLE routes (
     route_name VARCHAR(255) NOT NULL,
     trunk_ids INTEGER[] DEFAULT '{}',
     route_method VARCHAR(20) DEFAULT 'priority' CHECK (route_method IN ('priority','percentage','lcr')),
+    preferred_channel VARCHAR(50),
+    mccmnc_allowed TEXT[] DEFAULT '{*}',
+    mccmnc_denied TEXT[] DEFAULT '{}',
     is_active BOOLEAN DEFAULT true,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -183,33 +233,13 @@ CREATE TABLE route_plans (
     plan_name VARCHAR(255) NOT NULL,
     route_ids INTEGER[] DEFAULT '{}',
     is_default BOOLEAN DEFAULT false,
+    allowed_channels TEXT[] DEFAULT '{}',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 INSERT INTO route_plans (plan_name, route_ids, is_default) VALUES
 ('Premium Plan', ARRAY[1,3,4], true),
 ('Marketing Plan', ARRAY[2], false);
-
--- ============================================================
--- 7. ROUTE MAPS TABLE (Client -> Route -> Supplier mapping)
--- ============================================================
-CREATE TABLE route_maps (
-    id SERIAL PRIMARY KEY,
-    client_id INTEGER REFERENCES clients(id) NOT NULL,
-    route_id INTEGER REFERENCES routes(id) NOT NULL,
-    supplier_id INTEGER REFERENCES suppliers(id) NOT NULL,
-    mccmnc_pattern VARCHAR(50) NOT NULL DEFAULT '*',
-    priority INTEGER DEFAULT 1,
-    percentage INTEGER DEFAULT 100,
-    is_active BOOLEAN DEFAULT true,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-INSERT INTO route_maps (client_id, route_id, supplier_id, mccmnc_pattern, priority, percentage) VALUES
-(1, 1, 1, '310*', 1, 100),
-(1, 1, 3, '234*', 2, 100),
-(2, 1, 2, '*', 1, 70),
-(1, 4, 5, '*', 1, 100);
 
 -- ============================================================
 -- 8. RATES TABLE (with versioning)
@@ -251,6 +281,8 @@ CREATE TABLE mccmnc (
     operator VARCHAR(255) NOT NULL,
     network_type VARCHAR(50) DEFAULT 'GSM',
     status VARCHAR(20) DEFAULT 'active',
+    calling_code VARCHAR(10),
+    is_deleted BOOLEAN DEFAULT false,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -294,13 +326,23 @@ CREATE TABLE sms_logs (
     dlr_timestamp TIMESTAMP,
     error_code VARCHAR(10),
     error_message TEXT,
+    channel VARCHAR(40) DEFAULT 'sms',
     route_id INTEGER,
     route_name VARCHAR(255),
+    trunk_id INTEGER,
     trunk_name VARCHAR(255),
     smpp_message_id VARCHAR(100),
     registered_delivery INTEGER DEFAULT 1,
     data_coding INTEGER DEFAULT 0,
     esm_class INTEGER DEFAULT 0,
+    source VARCHAR(50) DEFAULT 'external_api',
+    trace JSONB DEFAULT '[]',
+    dlr_callback_url VARCHAR(500),
+    is_billed BOOLEAN DEFAULT false,
+    billing_mode_snapshot VARCHAR(10),
+    is_force_dlr BOOLEAN DEFAULT false,
+    refund_amount DECIMAL(10,6) DEFAULT 0,
+    is_deleted BOOLEAN DEFAULT false,
     submit_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     delivery_time TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -322,7 +364,8 @@ CREATE TABLE dlr_queue (
     submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_retry_at TIMESTAMP,
     dlr_received_at TIMESTAMP,
-    dlr_result VARCHAR(50)
+    dlr_result VARCHAR(50),
+    channel VARCHAR(40) DEFAULT 'sms'
 );
 
 -- ============================================================
@@ -359,6 +402,7 @@ CREATE TABLE invoices (
     bank_account VARCHAR(100),
     bank_iban VARCHAR(50),
     bank_bic VARCHAR(50),
+    is_deleted BOOLEAN DEFAULT false,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     sent_at TIMESTAMP
 );
@@ -378,6 +422,7 @@ CREATE TABLE payments (
     reference VARCHAR(255),
     status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending','completed','failed','refunded')),
     notes TEXT,
+    is_deleted BOOLEAN DEFAULT false,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -402,18 +447,31 @@ CREATE TABLE ott_devices (
 CREATE TABLE api_connectors (
     id SERIAL PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
+    type VARCHAR(50) DEFAULT 'http',
     provider VARCHAR(100) NOT NULL,
-    region VARCHAR(100),
-    auth_type VARCHAR(50) DEFAULT 'API_KEY' CHECK (auth_type IN ('API_KEY','BASIC','BEARER','OAUTH2')),
-    http_method VARCHAR(10) DEFAULT 'POST' CHECK (http_method IN ('POST','GET','PUT')),
-    api_key TEXT,
-    api_secret TEXT,
+    connector_type VARCHAR(50) DEFAULT 'http',
+    auth_type VARCHAR(50) DEFAULT 'API_KEY',
+    http_method VARCHAR(10) DEFAULT 'POST',
+    base_url TEXT,
     send_url TEXT NOT NULL,
     dlr_url TEXT,
+    region VARCHAR(100),
     submit_pattern VARCHAR(255),
     dlr_pattern VARCHAR(255),
     dlr_value VARCHAR(100),
     params TEXT,
+    api_key TEXT,
+    api_secret TEXT,
+    description TEXT,
+    username VARCHAR(255),
+    password TEXT,
+    phone_number_id VARCHAR(100),
+    business_account_id VARCHAR(100),
+    bot_token TEXT,
+    dlr_webhook_secret TEXT,
+    dlr_status_mapping JSONB DEFAULT '{"failed": "UNDELIV", "delivered": "DELIVRD"}',
+    test_payload JSONB,
+    last_tested_at TIMESTAMP,
     is_active BOOLEAN DEFAULT true,
     connection_status VARCHAR(20) DEFAULT 'untested' CHECK (connection_status IN ('untested','connected','failed','testing')),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -425,21 +483,49 @@ CREATE TABLE api_connectors (
 CREATE TABLE voice_otp_configs (
     id SERIAL PRIMARY KEY,
     language VARCHAR(100) NOT NULL,
-    language_code VARCHAR(10) NOT NULL,
-    greeting_text TEXT NOT NULL,
+    language_code VARCHAR(10) NOT NULL DEFAULT 'en',
+    country_prefix VARCHAR(10) DEFAULT '',
+    primary_language_code VARCHAR(10) DEFAULT 'en',
+    secondary_language_code VARCHAR(10) DEFAULT 'en',
+    primary_greeting_text TEXT,
+    primary_retry_text TEXT,
+    secondary_greeting_text TEXT,
+    secondary_retry_text TEXT,
+    greeting_text TEXT,
     retry_text TEXT,
+    greeting_audio_url TEXT,
+    secondary_greeting_audio_url TEXT,
     audio_0_9 JSONB DEFAULT '{}',
-    sip_host VARCHAR(255) DEFAULT 'sip.provider.com',
-    sip_port INTEGER DEFAULT 5060,
-    sip_username VARCHAR(100),
-    sip_password VARCHAR(255),
-    caller_id VARCHAR(50),
+    audio_files JSONB DEFAULT '{}',
+    secondary_audio_files JSONB DEFAULT '{}',
     is_active BOOLEAN DEFAULT true,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- ============================================================
--- 17. VOICE OTP LOGS TABLE
+-- 17a. CHANNEL MESSAGES TABLE (RCS, Flash SMS, WhatsApp, Telegram, HTTP)
+-- ============================================================
+CREATE TABLE channel_messages (
+    id SERIAL PRIMARY KEY,
+    message_id VARCHAR(255) UNIQUE NOT NULL,
+    channel VARCHAR(50) NOT NULL,
+    destination VARCHAR(100) NOT NULL,
+    message_text TEXT,
+    media_url TEXT,
+    device_id INTEGER,
+    sender_id VARCHAR(100),
+    api_connector_id INTEGER,
+    status VARCHAR(50) DEFAULT 'queued',
+    http_status INTEGER,
+    error TEXT,
+    submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    delivered_at TIMESTAMP,
+    retry_language_code VARCHAR(10) DEFAULT '',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================================
+-- 17b. VOICE OTP LOGS TABLE
 -- ============================================================
 CREATE TABLE voice_otp_logs (
     id SERIAL PRIMARY KEY,
@@ -450,10 +536,16 @@ CREATE TABLE voice_otp_logs (
     duration INTEGER DEFAULT 0,
     retry_count INTEGER DEFAULT 0,
     max_retries INTEGER DEFAULT 4,
-    status VARCHAR(20) DEFAULT 'initiated' CHECK (status IN ('initiated','ringing','answered','completed','failed','busy','no_answer','timeout')),
+    status VARCHAR(20) DEFAULT 'initiated' CHECK (status IN ('initiated','ringing','answered','completed','failed','busy','no_answer','timeout','sent')),
     dlr_status VARCHAR(20),
     error_message TEXT,
     sip_call_id VARCHAR(100),
+    client_id INTEGER,
+    channel VARCHAR(40) DEFAULT 'voice_otp',
+    asterisk_channel_id VARCHAR(100),
+    dial_status VARCHAR(50),
+    sip_server_id INTEGER,
+    next_retry_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     completed_at TIMESTAMP
 );
@@ -475,6 +567,7 @@ CREATE TABLE campaigns (
     scheduled_at TIMESTAMP,
     started_at TIMESTAMP,
     completed_at TIMESTAMP,
+    is_deleted BOOLEAN DEFAULT false,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -498,6 +591,14 @@ CREATE TABLE translations (
     client_id INTEGER REFERENCES clients(id),
     supplier_id INTEGER REFERENCES suppliers(id),
     route_id INTEGER REFERENCES routes(id),
+    mcc VARCHAR(10),
+    mnc VARCHAR(10),
+    name VARCHAR(255) DEFAULT '',
+    description TEXT DEFAULT '',
+    subtype VARCHAR(100) DEFAULT '',
+    priority INTEGER DEFAULT 1,
+    apply_to VARCHAR(20) DEFAULT 'client',
+    apply_entity_id VARCHAR(50) DEFAULT 'all',
     is_active BOOLEAN DEFAULT true,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -640,6 +741,349 @@ CREATE TABLE audit_logs (
 );
 
 -- ============================================================
+-- 27. SMPP SESSIONS TABLE
+-- ============================================================
+CREATE TABLE smpp_sessions (
+    id SERIAL PRIMARY KEY,
+    entity_type VARCHAR(20) NOT NULL CHECK (entity_type IN ('client','supplier')),
+    entity_id INTEGER NOT NULL,
+    system_id VARCHAR(100) NOT NULL,
+    ip_address VARCHAR(50),
+    port INTEGER DEFAULT 2775,
+    bind_mode VARCHAR(20) DEFAULT 'transceiver',
+    status VARCHAR(20) DEFAULT 'unbound',
+    connected_at TIMESTAMP,
+    disconnected_at TIMESTAMP,
+    last_activity TIMESTAMP,
+    bound_count INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    smpp_session_id TEXT,
+    remote_ip VARCHAR(50),
+    negotiated_version VARCHAR(10),
+    last_error VARCHAR(500),
+    last_error_at TIMESTAMP,
+    UNIQUE (entity_type, entity_id)
+);
+
+-- ============================================================
+-- 27a. ACTIVE SMPP SESSIONS VIEW (pre-filters deleted entities)
+-- ============================================================
+-- Joins smpp_sessions with clients/suppliers and excludes soft-deleted entities.
+-- Used by the supplier bind status query for zero-overhead filtering.
+-- Returns only sessions belonging to active (non-deleted) clients and suppliers.
+CREATE OR REPLACE VIEW active_smpp_sessions AS
+SELECT ss.id,
+    ss.entity_type,
+    ss.entity_id,
+    ss.system_id,
+    COALESCE(ss.remote_ip, ss.ip_address) AS ip_address,
+    ss.port,
+    ss.bind_mode,
+    ss.status,
+    ss.negotiated_version,
+    ss.connected_at,
+    ss.disconnected_at,
+    ss.last_activity,
+    ss.bound_count,
+    ss.smpp_session_id,
+    CASE
+        WHEN ss.entity_type = 'client' THEN c.client_code
+        WHEN ss.entity_type = 'supplier' THEN s.supplier_code
+        ELSE NULL
+    END AS entity_code,
+    CASE
+        WHEN ss.entity_type = 'client' THEN c.company_name
+        WHEN ss.entity_type = 'supplier' THEN s.company_name
+        ELSE NULL
+    END AS entity_name,
+    COALESCE(s.connection_type, 'smpp') AS connection_type,
+    COALESCE(s.is_inbound, false) AS is_inbound
+FROM smpp_sessions ss
+    LEFT JOIN clients c ON ss.entity_type = 'client' AND ss.entity_id = c.id
+        AND (c.is_deleted IS NULL OR c.is_deleted = false)
+    LEFT JOIN suppliers s ON ss.entity_type = 'supplier' AND ss.entity_id = s.id
+        AND (s.is_deleted IS NULL OR s.is_deleted = false)
+WHERE (c.id IS NOT NULL OR s.id IS NOT NULL);
+
+-- ============================================================
+-- 28. API KEYS TABLE
+-- ============================================================
+CREATE TABLE api_keys (
+    id SERIAL PRIMARY KEY,
+    client_id INTEGER NOT NULL REFERENCES clients(id),
+    api_key_hash VARCHAR(255) UNIQUE NOT NULL,
+    api_key_prefix VARCHAR(10) NOT NULL,
+    rate_limit_tps INTEGER DEFAULT 10,
+    daily_quota INTEGER DEFAULT 5000,
+    usage_count INTEGER DEFAULT 0,
+    usage_reset_at DATE DEFAULT CURRENT_DATE,
+    last_used_at TIMESTAMP,
+    is_active BOOLEAN DEFAULT true,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================================
+-- 29. ASTERISK SETTINGS TABLE
+-- ============================================================
+CREATE TABLE asterisk_settings (
+    id SERIAL PRIMARY KEY,
+    sip_host VARCHAR(255) DEFAULT '127.0.0.1' NOT NULL,
+    ami_host VARCHAR(255) DEFAULT '127.0.0.1' NOT NULL,
+    ami_port INTEGER DEFAULT 5038 NOT NULL,
+    ami_username VARCHAR(100) DEFAULT 'net2app',
+    ami_secret VARCHAR(255) DEFAULT 'net2app_secret',
+    dialplan_context VARCHAR(100) DEFAULT 'net2app-otp',
+    poll_interval_seconds INTEGER DEFAULT 5,
+    retries_2_wait_seconds INTEGER DEFAULT 70,
+    retries_3_wait_seconds INTEGER DEFAULT 105,
+    max_retries INTEGER DEFAULT 3,
+    asterisk_installed BOOLEAN DEFAULT false,
+    asterisk_running BOOLEAN DEFAULT false,
+    asterisk_config_path VARCHAR(500) DEFAULT '/etc/asterisk',
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    use_existing_config BOOLEAN DEFAULT true,
+    manager_conf_path VARCHAR(500) DEFAULT '/etc/asterisk/manager.conf'
+);
+
+-- ============================================================
+-- 30. BIND HISTORY TABLE
+-- ============================================================
+CREATE TABLE bind_history (
+    id SERIAL PRIMARY KEY,
+    entity_type VARCHAR(20) NOT NULL CHECK (entity_type IN ('client','supplier')),
+    entity_id INTEGER NOT NULL,
+    system_id VARCHAR(100) NOT NULL,
+    ip_address VARCHAR(50),
+    port INTEGER DEFAULT 2775,
+    bind_mode VARCHAR(20) DEFAULT 'transceiver',
+    status VARCHAR(20) NOT NULL CHECK (status IN ('bound','unbound','binding','error')),
+    negotiated_version VARCHAR(10),
+    smpp_session_id TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================================
+-- 31. IDEMPOTENCY KEYS TABLE
+-- ============================================================
+CREATE TABLE idempotency_keys (
+    idempotency_key VARCHAR(100) PRIMARY KEY,
+    endpoint VARCHAR(120) NOT NULL,
+    response_body JSONB,
+    status_code INTEGER DEFAULT 200,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================================
+-- 32. IP LISTS TABLE
+-- ============================================================
+CREATE TABLE ip_lists (
+    id SERIAL PRIMARY KEY,
+    ip_address VARCHAR(45) NOT NULL,
+    list_type VARCHAR(20) NOT NULL CHECK (list_type IN ('unaudited','blacklist','whitelist','web_login_blacklist')),
+    notes TEXT,
+    trunk_id INTEGER,
+    created_by VARCHAR(100),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (ip_address, list_type)
+);
+
+-- ============================================================
+-- 33. MO SMS TABLE (Mobile Originated / Incoming SMS)
+-- ============================================================
+CREATE TABLE mo_sms (
+    id SERIAL PRIMARY KEY,
+    channel VARCHAR(20) NOT NULL,
+    external_id VARCHAR(100),
+    sender VARCHAR(100),
+    sender_name VARCHAR(255),
+    recipient VARCHAR(100),
+    message TEXT,
+    message_type VARCHAR(30) DEFAULT 'text',
+    metadata JSONB,
+    reply_sent BOOLEAN DEFAULT false,
+    reply_text TEXT,
+    replied_at TIMESTAMPTZ,
+    processed BOOLEAN DEFAULT false,
+    received_at TIMESTAMPTZ DEFAULT now(),
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- ============================================================
+-- 34. NUMBER VALIDATION PROVIDERS TABLE
+-- ============================================================
+CREATE TABLE number_validation_providers (
+    id SERIAL PRIMARY KEY,
+    channel VARCHAR(40) UNIQUE NOT NULL,
+    provider_kind VARCHAR(40) NOT NULL,
+    enabled BOOLEAN DEFAULT true,
+    api_url TEXT,
+    api_key TEXT,
+    api_secret TEXT,
+    extra JSONB DEFAULT '{}',
+    last_test_at TIMESTAMP,
+    last_test_success BOOLEAN,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================================
+-- 35. NUMBER VALIDATION RESULTS TABLE
+-- ============================================================
+CREATE TABLE number_validation_results (
+    id SERIAL PRIMARY KEY,
+    phone_e164 VARCHAR(40) UNIQUE NOT NULL,
+    has_whatsapp BOOLEAN,
+    has_telegram BOOLEAN,
+    has_rcs BOOLEAN,
+    flash_sms_capable BOOLEAN,
+    voice_capable BOOLEAN,
+    provider VARCHAR(50),
+    raw_response JSONB,
+    checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP DEFAULT (CURRENT_TIMESTAMP + INTERVAL '24 hours'),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================================
+-- 36. PENDING DELIVER_SM TABLE (DLR Queue for ESME)
+-- ============================================================
+CREATE TABLE pending_deliver_sm (
+    id SERIAL PRIMARY KEY,
+    client_id INTEGER NOT NULL,
+    message_id VARCHAR(100) NOT NULL,
+    smpp_message_id VARCHAR(100),
+    dlr_status VARCHAR(20) NOT NULL,
+    error_code VARCHAR(10) DEFAULT '000',
+    destination VARCHAR(20),
+    source_addr VARCHAR(20),
+    created_at TIMESTAMPTZ DEFAULT now(),
+    delivered BOOLEAN DEFAULT false,
+    delivered_at TIMESTAMPTZ
+);
+
+-- ============================================================
+-- 37. RESIDENTIAL PROXIES TABLE
+-- ============================================================
+CREATE TABLE residential_proxies (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    proxy_type VARCHAR(20) NOT NULL DEFAULT 'socks5' CHECK (proxy_type IN ('residential','datacenter','isp','socks5')),
+    host VARCHAR(255) NOT NULL,
+    port INTEGER DEFAULT 1080 NOT NULL,
+    username VARCHAR(255) DEFAULT '',
+    password TEXT DEFAULT '',
+    public_ip VARCHAR(50),
+    is_active BOOLEAN DEFAULT true,
+    is_online BOOLEAN DEFAULT false,
+    last_heartbeat TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================================
+-- 38. SCHEMA MIGRATIONS TABLE
+-- ============================================================
+CREATE TABLE schema_migrations (
+    id SERIAL PRIMARY KEY,
+    hash TEXT UNIQUE NOT NULL,
+    label TEXT,
+    applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================================
+-- 39. SIP SERVERS TABLE
+-- ============================================================
+CREATE TABLE sip_servers (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    ami_host VARCHAR(255) NOT NULL,
+    sip_host VARCHAR(255) NOT NULL,
+    ami_port INTEGER DEFAULT 5038 NOT NULL,
+    ami_username VARCHAR(100) DEFAULT 'net2app' NOT NULL,
+    ami_secret VARCHAR(255) DEFAULT 'net2app_secret' NOT NULL,
+    transport VARCHAR(10) DEFAULT 'udp' NOT NULL CHECK (transport IN ('udp','tcp','tls')),
+    dialplan_context VARCHAR(100) DEFAULT 'net2app-otp',
+    priority INTEGER DEFAULT 10 NOT NULL,
+    is_active BOOLEAN DEFAULT true NOT NULL,
+    last_health_status VARCHAR(20) DEFAULT 'unknown',
+    last_health_at TIMESTAMP,
+    last_health_latency_ms INTEGER,
+    notes TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_dlr_pushed_at TIMESTAMP,
+    last_dlr_push_route VARCHAR(20),
+    last_dlr_push_message_id VARCHAR(100),
+    UNIQUE (ami_host, ami_port)
+);
+
+-- ============================================================
+-- 40. SIP SERVER DESTINATIONS TABLE
+-- ============================================================
+CREATE TABLE sip_server_destinations (
+    id SERIAL PRIMARY KEY,
+    sip_server_id INTEGER NOT NULL REFERENCES sip_servers(id) ON DELETE CASCADE,
+    kind VARCHAR(10) NOT NULL DEFAULT 'allow' CHECK (kind IN ('allow','deny')),
+    priority INTEGER DEFAULT 10 NOT NULL,
+    is_active BOOLEAN DEFAULT true NOT NULL,
+    pattern TEXT NOT NULL,
+    notes TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (sip_server_id, pattern)
+);
+
+-- ============================================================
+-- 41. SOCIAL API SUPPLIERS TABLE
+-- ============================================================
+CREATE TABLE social_api_suppliers (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    platform VARCHAR(20) NOT NULL CHECK (platform IN ('whatsapp_cloud','telegram_bot')),
+    phone_number_id VARCHAR(100),
+    business_account_id VARCHAR(100),
+    access_token TEXT,
+    webhook_verify_token VARCHAR(255),
+    bot_token TEXT,
+    bot_username VARCHAR(100),
+    proxy_enabled BOOLEAN DEFAULT false,
+    proxy_host VARCHAR(255),
+    proxy_port INTEGER DEFAULT 8080,
+    proxy_username VARCHAR(255),
+    proxy_password TEXT,
+    proxy_type VARCHAR(20) DEFAULT 'residential' CHECK (proxy_type IN ('residential','datacenter','isp')),
+    is_active BOOLEAN DEFAULT true,
+    connection_status VARCHAR(20) DEFAULT 'untested' CHECK (connection_status IN ('connected','disconnected','error','untested')),
+    last_tested_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================================
+-- 42. VOICE CALL RETRY QUEUE TABLE
+-- ============================================================
+CREATE TABLE voice_call_retry_queue (
+    id SERIAL PRIMARY KEY,
+    call_id VARCHAR(100) NOT NULL,
+    destination VARCHAR(40) NOT NULL,
+    otp_code VARCHAR(20) NOT NULL,
+    language VARCHAR(20) NOT NULL,
+    retry_count INTEGER DEFAULT 0,
+    max_retries INTEGER DEFAULT 3,
+    next_attempt_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    last_dial_result VARCHAR(40),
+    status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending','waiting','connected','failed','timeout','completed')),
+    error_message TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP,
+    client_id INTEGER REFERENCES clients(id),
+    sip_server_id INTEGER REFERENCES sip_servers(id),
+    next_sip_server_id INTEGER REFERENCES sip_servers(id)
+);
+
+-- ============================================================
 -- INDEXES (Performance Optimization)
 -- ============================================================
 CREATE INDEX idx_users_username ON users(username);
@@ -667,8 +1111,6 @@ CREATE INDEX idx_rates_entity_active ON rates(entity_type, entity_id, is_active)
 CREATE INDEX idx_rates_destination ON rates(entity_type, entity_id, mcc, mnc);
 CREATE INDEX idx_rates_effective ON rates(effective_from, effective_to);
 
-CREATE INDEX idx_route_maps_client_mccmnc ON route_maps(client_id, mccmnc_pattern);
-CREATE INDEX idx_route_maps_supplier ON route_maps(supplier_id);
 CREATE INDEX idx_trunks_supplier_active ON trunks(supplier_id, is_active);
 CREATE INDEX idx_routes_active ON routes(is_active) WHERE is_active = true;
 
@@ -807,9 +1249,62 @@ COMMENT ON TABLE suppliers IS 'SMPP suppliers and gateways';
 COMMENT ON TABLE sms_logs IS 'Complete SMS transaction log with DLR tracking';
 COMMENT ON TABLE dlr_queue IS 'DLR retry queue for undelivered messages';
 COMMENT ON TABLE rates IS 'Client/supplier rates with version history';
-COMMENT ON TABLE route_maps IS 'Client -> Route -> Supplier mapping with MCCMNC patterns';
 COMMENT ON TABLE invoices IS 'Professional invoices with destination breakdown';
 COMMENT ON TABLE voice_otp_configs IS 'Voice OTP language configs with audio files';
+COMMENT ON TABLE channel_messages IS 'Multi-channel message log (RCS, Flash SMS, WhatsApp, Telegram, HTTP)';
+COMMENT ON TABLE smpp_sessions IS 'Current and historical SMPP session tracking';
+COMMENT ON TABLE api_keys IS 'Client API keys with rate limiting and daily quotas';
+COMMENT ON TABLE asterisk_settings IS 'Asterisk PBX configuration (AMI/SIP)';
+COMMENT ON TABLE bind_history IS 'SMPP bind/unbind audit trail';
+COMMENT ON TABLE idempotency_keys IS 'API request idempotency for safe retries';
+COMMENT ON TABLE ip_lists IS 'IP allow/deny lists for trunks and web login';
+COMMENT ON TABLE mo_sms IS 'Mobile-Originated (incoming) SMS from all channels';
+COMMENT ON TABLE number_validation_providers IS 'External number validation API providers';
+COMMENT ON TABLE number_validation_results IS 'Cached phone number capability detection results';
+COMMENT ON TABLE pending_deliver_sm IS 'DLRs queued for delivery to ESME when it rebinds';
+COMMENT ON TABLE residential_proxies IS 'Proxy server pool for OTT channel connections';
+COMMENT ON TABLE schema_migrations IS 'Database schema version tracking';
+COMMENT ON TABLE sip_servers IS 'SIP server connections with health monitoring';
+COMMENT ON TABLE sip_server_destinations IS 'SIP routing patterns (allow/deny) per server';
+COMMENT ON TABLE social_api_suppliers IS 'Social media API suppliers (WhatsApp Cloud, Telegram Bot)';
+COMMENT ON TABLE voice_call_retry_queue IS 'Voice OTP call retry queue with failover SIP servers';
+COMMENT ON TABLE trunks IS 'Message routing trunks with priority and MCC/MNC filtering';
+COMMENT ON TABLE routes IS 'Route definitions combining trunks with routing strategies';
+COMMENT ON TABLE route_plans IS 'Grouped route plans assigned to clients';
+COMMENT ON TABLE mccmnc IS 'MCC/MNC operator database for number lookups';
+COMMENT ON TABLE payments IS 'Payment transactions against invoices';
+COMMENT ON TABLE ott_devices IS 'OTT device connections (WhatsApp/Telegram) with QR pairing';
+COMMENT ON TABLE api_connectors IS 'API gateway connectors with auth configs and DLR mapping';
+COMMENT ON TABLE voice_otp_logs IS 'Voice OTP call logs with retry tracking';
+COMMENT ON TABLE campaigns IS 'Bulk SMS/OTT campaign management';
+COMMENT ON TABLE campaigns_recipients IS 'Individual recipient status within a campaign';
+COMMENT ON TABLE translations IS 'Message routing and content translation rules';
+COMMENT ON TABLE notifications IS 'System notifications and alerts';
+
+-- ============================================================
+-- INDEXES FOR NEW TABLES
+-- ============================================================
+CREATE INDEX idx_bindhist_created ON bind_history(created_at DESC);
+CREATE INDEX idx_bindhist_entity ON bind_history(entity_type, entity_id, created_at DESC);
+CREATE INDEX idx_idempotency_keys_created_at ON idempotency_keys(created_at);
+CREATE UNIQUE INDEX idx_ip_lists_ip_type ON ip_lists(ip_address, list_type);
+CREATE INDEX idx_mo_sms_channel ON mo_sms(channel);
+CREATE INDEX idx_mo_sms_external ON mo_sms(channel, external_id);
+CREATE INDEX idx_mo_sms_received ON mo_sms(received_at DESC);
+CREATE INDEX idx_nvr_expires ON number_validation_results(expires_at);
+CREATE INDEX idx_nvr_phone ON number_validation_results(phone_e164);
+CREATE INDEX idx_pending_dlr_client ON pending_deliver_sm(client_id) WHERE delivered = false;
+CREATE INDEX idx_rp_online ON residential_proxies(is_online);
+CREATE INDEX idx_sas_active ON social_api_suppliers(is_active);
+CREATE INDEX idx_sas_platform ON social_api_suppliers(platform);
+CREATE INDEX idx_schema_migrations_hash ON schema_migrations(hash);
+CREATE INDEX idx_sip_active_priority ON sip_servers(is_active, priority, id);
+CREATE INDEX idx_sip_dlr_pushed ON sip_servers(last_dlr_pushed_at);
+CREATE INDEX idx_ssd_active_pri ON sip_server_destinations(is_active, priority, id);
+CREATE INDEX idx_ssd_server ON sip_server_destinations(sip_server_id);
+CREATE INDEX idx_vcrq_call_id ON voice_call_retry_queue(call_id);
+CREATE INDEX idx_vcrq_server ON voice_call_retry_queue(sip_server_id);
+CREATE INDEX idx_vcrq_status_next ON voice_call_retry_queue(status, next_attempt_at);
 COMMENT ON TABLE notification_templates IS 'Email notification templates with variables';
 COMMENT ON TABLE license IS 'Platform license and feature control';
 COMMENT ON TABLE tenants IS 'Tenant management with feature limits';

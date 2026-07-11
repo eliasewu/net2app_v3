@@ -46,18 +46,18 @@ export const mockRates: Rate[] = [
 
 // ==================== INVOICES ====================
 export const mockInvoices: Invoice[] = [
-  { id: '1', invoice_number: 'INV-2024-001', entity_type: 'client', entity_id: '1', entity_name: 'TechCorp Global', period_start: '2024-01-01', period_end: '2024-01-31', total_sms: 150000, total_amount: 3750.00, tax_amount: 712.50, grand_total: 4462.50, currency: 'EUR', status: 'paid', due_date: '2024-02-15', paid_date: '2024-02-10', notes: '', created_at: '2024-02-01T00:00:00Z' },
-  { id: '2', invoice_number: 'INV-2024-002', entity_type: 'client', entity_id: '2', entity_name: 'MegaBank Ltd', period_start: '2024-01-01', period_end: '2024-01-31', total_sms: 500000, total_amount: 11500.00, tax_amount: 2185.00, grand_total: 13685.00, currency: 'EUR', status: 'paid', due_date: '2024-02-15', paid_date: '2024-02-12', notes: '', created_at: '2024-02-01T00:00:00Z' },
-  { id: '3', invoice_number: 'INV-2024-003', entity_type: 'client', entity_id: '1', entity_name: 'TechCorp Global', period_start: '2024-02-01', period_end: '2024-02-29', total_sms: 180000, total_amount: 4500.00, tax_amount: 855.00, grand_total: 5355.00, currency: 'EUR', status: 'sent', due_date: '2024-03-15', paid_date: null, notes: '', created_at: '2024-03-01T00:00:00Z' },
-  { id: '4', invoice_number: 'INV-2024-004', entity_type: 'supplier', entity_id: '1', entity_name: 'GlobalSMS Gateway', period_start: '2024-02-01', period_end: '2024-02-29', total_sms: 800000, total_amount: 12000.00, tax_amount: 2280.00, grand_total: 14280.00, currency: 'EUR', status: 'overdue', due_date: '2024-03-10', paid_date: null, notes: 'Urgent payment required', created_at: '2024-03-01T00:00:00Z' },
+  { id: '1', invoice_number: 'INV-2024-001', entity_type: 'client', entity_id: '1', entity_name: 'TechCorp Global', invoice_to_name: 'TechCorp Global', invoice_to_address: '123 Tech Street', invoice_to_email: 'john@techcorp.com', invoice_by_name: 'NET2APP Hub', invoice_by_address: '123 Tech Park', invoice_by_email: 'billing@net2app.com', invoice_by_vat: 'VAT-001', period_start: '2024-01-01', period_end: '2024-01-31', total_sms: 150000, total_amount: 3750.00, tax_amount: 712.50, tax_rate: 19.00, grand_total: 4462.50, currency: 'EUR', status: 'paid', due_date: '2024-02-15', paid_date: '2024-02-10', payment_method: 'bank_transfer', payment_reference: 'BT-123', notes: '', bank_name: 'Deutsche Bank', bank_account: 'DE123456', bank_iban: 'DE89370400440532013000', bank_bic: 'DEUTDEBB', created_at: '2024-02-01T00:00:00Z', sent_at: '2024-02-01T00:00:00Z' },
+  { id: '2', invoice_number: 'INV-2024-002', entity_type: 'client', entity_id: '2', entity_name: 'MegaBank Ltd', invoice_to_name: 'MegaBank Ltd', invoice_to_address: '456 Finance Road', invoice_to_email: 'sarah@megabank.com', invoice_by_name: 'NET2APP Hub', invoice_by_address: '123 Tech Park', invoice_by_email: 'billing@net2app.com', invoice_by_vat: 'VAT-001', period_start: '2024-01-01', period_end: '2024-01-31', total_sms: 500000, total_amount: 11500.00, tax_amount: 2185.00, tax_rate: 19.00, grand_total: 13685.00, currency: 'EUR', status: 'paid', due_date: '2024-02-15', paid_date: '2024-02-12', payment_method: 'bank_transfer', payment_reference: 'BT-456', notes: '', bank_name: 'Deutsche Bank', bank_account: 'DE654321', bank_iban: 'DE89370400440532013001', bank_bic: 'DEUTDEBB', created_at: '2024-02-01T00:00:00Z', sent_at: '2024-02-01T00:00:00Z' },
+  { id: '3', invoice_number: 'INV-2024-003', entity_type: 'client', entity_id: '1', entity_name: 'TechCorp Global', invoice_to_name: 'TechCorp Global', invoice_to_address: '123 Tech Street', invoice_to_email: 'john@techcorp.com', invoice_by_name: 'NET2APP Hub', invoice_by_address: '123 Tech Park', invoice_by_email: 'billing@net2app.com', invoice_by_vat: 'VAT-001', period_start: '2024-02-01', period_end: '2024-02-29', total_sms: 180000, total_amount: 4500.00, tax_amount: 855.00, tax_rate: 19.00, grand_total: 5355.00, currency: 'EUR', status: 'sent', due_date: '2024-03-15', paid_date: null, payment_method: '', payment_reference: '', notes: '', bank_name: '', bank_account: '', bank_iban: '', bank_bic: '', created_at: '2024-03-01T00:00:00Z', sent_at: '2024-03-01T00:00:00Z' },
+  { id: '4', invoice_number: 'INV-2024-004', entity_type: 'supplier', entity_id: '1', entity_name: 'GlobalSMS Gateway', invoice_to_name: 'GlobalSMS Gateway', invoice_to_address: 'Gateway Street', invoice_to_email: 'alex@globalsms.com', invoice_by_name: 'NET2APP Hub', invoice_by_address: '123 Tech Park', invoice_by_email: 'billing@net2app.com', invoice_by_vat: 'VAT-001', period_start: '2024-02-01', period_end: '2024-02-29', total_sms: 800000, total_amount: 12000.00, tax_amount: 2280.00, tax_rate: 19.00, grand_total: 14280.00, currency: 'EUR', status: 'overdue', due_date: '2024-03-10', paid_date: null, payment_method: '', payment_reference: '', notes: 'Urgent payment required', bank_name: '', bank_account: '', bank_iban: '', bank_bic: '', created_at: '2024-03-01T00:00:00Z', sent_at: '2024-03-01T00:00:00Z' },
 ];
 
 // ==================== PAYMENTS ====================
 export const mockPayments: Payment[] = [
-  { id: '1', payment_number: 'PAY-2024-001', entity_type: 'client', entity_id: '1', entity_name: 'TechCorp Global', amount: 10000.00, currency: 'EUR', payment_method: 'bank_transfer', reference: 'BT-123456', status: 'completed', created_at: '2024-01-05T10:00:00Z' },
-  { id: '2', payment_number: 'PAY-2024-002', entity_type: 'client', entity_id: '2', entity_name: 'MegaBank Ltd', amount: 50000.00, currency: 'EUR', payment_method: 'bank_transfer', reference: 'BT-789012', status: 'completed', created_at: '2024-01-10T14:30:00Z' },
-  { id: '3', payment_number: 'PAY-2024-003', entity_type: 'client', entity_id: '1', entity_name: 'TechCorp Global', amount: 5000.00, currency: 'EUR', payment_method: 'credit_card', reference: 'CC-345678', status: 'completed', created_at: '2024-02-10T09:15:00Z' },
-  { id: '4', payment_number: 'PAY-2024-004', entity_type: 'supplier', entity_id: '1', entity_name: 'GlobalSMS Gateway', amount: 25000.00, currency: 'EUR', payment_method: 'bank_transfer', reference: 'BT-901234', status: 'completed', created_at: '2024-02-15T11:00:00Z' },
+  { id: '1', payment_number: 'PAY-2024-001', entity_type: 'client', entity_id: '1', entity_name: 'TechCorp Global', amount: 10000.00, currency: 'EUR', payment_method: 'bank_transfer', reference: 'BT-123456', status: 'completed', notes: '', created_at: '2024-01-05T10:00:00Z' },
+  { id: '2', payment_number: 'PAY-2024-002', entity_type: 'client', entity_id: '2', entity_name: 'MegaBank Ltd', amount: 50000.00, currency: 'EUR', payment_method: 'bank_transfer', reference: 'BT-789012', status: 'completed', notes: '', created_at: '2024-01-10T14:30:00Z' },
+  { id: '3', payment_number: 'PAY-2024-003', entity_type: 'client', entity_id: '1', entity_name: 'TechCorp Global', amount: 5000.00, currency: 'EUR', payment_method: 'credit_card', reference: 'CC-345678', status: 'completed', notes: '', created_at: '2024-02-10T09:15:00Z' },
+  { id: '4', payment_number: 'PAY-2024-004', entity_type: 'supplier', entity_id: '1', entity_name: 'GlobalSMS Gateway', amount: 25000.00, currency: 'EUR', payment_method: 'bank_transfer', reference: 'BT-901234', status: 'completed', notes: 'Payment for February invoices', created_at: '2024-02-15T11:00:00Z' },
 ];
 
 // ==================== SMS LOGS (cleared — real data from PostgreSQL) ====================
@@ -86,8 +86,8 @@ export const mockOTTDevices: OTTDevice[] = [
 
 // ==================== API CONNECTORS ====================
 export const mockAPIConnectors: APIConnector[] = [
-  { id: '1', name: 'Vonage SMS', provider: 'Vonage', region: 'Global', auth_type: 'api_key', http_method: 'POST', api_key: 'vonage_key_123', send_url_template: 'https://rest.nexmo.com/sms/json?api_key={{apiKey}}&to={{to}}&from={{from}}&text={{text}}', dlr_url_template: 'https://rest.nexmo.com/dlr', submit_success_pattern: '"status":"0"', dlr_success_pattern: '"status":"delivered"', dlr_success_value: 'delivered', is_active: true, created_at: '2024-01-15T00:00:00Z' },
-  { id: '2', name: 'Twilio SMS', provider: 'Twilio', region: 'Global', auth_type: 'basic', http_method: 'POST', api_key: 'twilio_auth_token', send_url_template: 'https://api.twilio.com/2010-04-01/Accounts/{{accountSid}}/Messages.json', dlr_url_template: '', submit_success_pattern: '"status":"queued"', dlr_success_pattern: '"status":"delivered"', dlr_success_value: 'delivered', is_active: true, created_at: '2024-01-20T00:00:00Z' },
+  { id: '1', name: 'Vonage SMS', type: 'http', provider: 'Vonage', base_url: 'https://rest.nexmo.com/sms/json', send_url: '', api_key: 'vonage_key_123', api_secret: '', region: 'Global', description: 'Vonage SMS API connector', username: '', password: '', phone_number_id: '', business_account_id: '', bot_token: '', is_active: true, created_at: '2024-01-15T00:00:00Z' },
+  { id: '2', name: 'Twilio SMS', type: 'http', provider: 'Twilio', base_url: 'https://api.twilio.com/2010-04-01/Accounts', send_url: '', api_key: 'twilio_auth_token', api_secret: '', region: 'Global', description: 'Twilio SMS API connector', username: '', password: '', phone_number_id: '', business_account_id: '', bot_token: '', is_active: true, created_at: '2024-01-20T00:00:00Z' },
 ];
 
 // ==================== USERS ====================
@@ -115,15 +115,42 @@ export const mockCampaigns: Campaign[] = [
 
 // ==================== TRANSLATIONS ====================
 export const mockTranslations: Translation[] = [
-  { id: '1', translation_type: 'sender_id', source_pattern: 'TECHCORP', target_value: 'TC-MSG', client_id: '1', supplier_id: '1', route_id: null, is_active: true, created_at: '2024-01-15T00:00:00Z' },
-  { id: '2', translation_type: 'destination', source_pattern: '+44', target_value: '0044', client_id: null, supplier_id: '2', route_id: null, is_active: true, created_at: '2024-02-01T00:00:00Z' },
+  { id: '1', translation_type: 'sender_id', source_pattern: 'TECHCORP', target_value: 'TC-MSG', client_id: '1', supplier_id: '1', route_id: null, mcc: null, mnc: null, name: 'Sender ID Mask', description: 'Mask TECHCORP to TC-MSG', subtype: 'sender_id_masking', priority: 1, apply_to: 'client', apply_entity_id: '1', is_active: true, created_at: '2024-01-15T00:00:00Z' },
+  { id: '2', translation_type: 'destination', source_pattern: '+44', target_value: '0044', client_id: null, supplier_id: '2', route_id: null, mcc: null, mnc: null, name: 'UK Prefix Rewrite', description: 'Rewrite +44 to 0044 for supplier', subtype: '', priority: 2, apply_to: 'supplier', apply_entity_id: '2', is_active: true, created_at: '2024-02-01T00:00:00Z' },
 ];
 
 // ==================== VOICE OTP CONFIG ====================
 export const mockVoiceOTPConfigs: VoiceOTPConfig[] = [
-  { id: '1', language: 'English', language_code: 'en-US', greeting_text: 'Your verification code is', retry_text: 'I repeat, your code is', audio_file_url: null, sip_host: 'sip.voiceotp.com', sip_port: 5060, caller_id: '+18001234567', is_active: true },
-  { id: '2', language: 'Spanish', language_code: 'es-ES', greeting_text: 'Su código de verificación es', retry_text: 'Repito, su código es', audio_file_url: null, sip_host: 'sip.voiceotp.com', sip_port: 5060, caller_id: '+18001234568', is_active: true },
-  { id: '3', language: 'French', language_code: 'fr-FR', greeting_text: 'Votre code de vérification est', retry_text: 'Je répète, votre code est', audio_file_url: null, sip_host: 'sip.voiceotp.com', sip_port: 5060, caller_id: '+18001234569', is_active: true },
+  {
+    id: '1', language: 'English', language_code: 'en-US', country_prefix: '1',
+    primary_language_code: 'en', secondary_language_code: 'en',
+    primary_greeting_text: 'Your verification code is', primary_retry_text: 'I repeat, your code is',
+    secondary_greeting_text: 'Your code is', secondary_retry_text: 'Repeating',
+    greeting_text: 'Your verification code is', retry_text: 'I repeat, your code is',
+    greeting_audio_url: null, secondary_greeting_audio_url: null,
+    audio_0_9: null, audio_files: null, secondary_audio_files: null,
+    is_active: true, created_at: '2024-01-01T00:00:00Z'
+  },
+  {
+    id: '2', language: 'Spanish', language_code: 'es-ES', country_prefix: '34',
+    primary_language_code: 'es', secondary_language_code: 'en',
+    primary_greeting_text: 'Su código de verificación es', primary_retry_text: 'Repito, su código es',
+    secondary_greeting_text: 'Your code is', secondary_retry_text: 'Repeating',
+    greeting_text: 'Su código de verificación es', retry_text: 'Repito, su código es',
+    greeting_audio_url: null, secondary_greeting_audio_url: null,
+    audio_0_9: null, audio_files: null, secondary_audio_files: null,
+    is_active: true, created_at: '2024-01-01T00:00:00Z'
+  },
+  {
+    id: '3', language: 'French', language_code: 'fr-FR', country_prefix: '33',
+    primary_language_code: 'fr', secondary_language_code: 'en',
+    primary_greeting_text: 'Votre code de vérification est', primary_retry_text: 'Je répète, votre code est',
+    secondary_greeting_text: 'Your code is', secondary_retry_text: 'Repeating',
+    greeting_text: 'Votre code de vérification est', retry_text: 'Je répète, votre code est',
+    greeting_audio_url: null, secondary_greeting_audio_url: null,
+    audio_0_9: null, audio_files: null, secondary_audio_files: null,
+    is_active: true, created_at: '2024-01-01T00:00:00Z'
+  },
 ];
 
 // ==================== DASHBOARD STATS ====================

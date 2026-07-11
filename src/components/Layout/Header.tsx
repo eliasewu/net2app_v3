@@ -8,6 +8,7 @@ import { useData } from '../../store/DataContext';
 
 interface HeaderProps {
   onToggleSidebar: () => void;
+  onToggleMobile: () => void;
   isSidebarCollapsed: boolean;
 }
 
@@ -17,7 +18,7 @@ function formatNumber(n: number): string {
   return n.toString();
 }
 
-export const Header: React.FC<HeaderProps> = ({ onToggleSidebar, isSidebarCollapsed }) => {
+export const Header: React.FC<HeaderProps> = ({ onToggleSidebar, onToggleMobile, isSidebarCollapsed }) => {
   const { notifications, smsLogs, suppliers } = useData();
   const { logout } = useAuth();
   const [showNotifications, setShowNotifications] = useState(false);
@@ -37,31 +38,44 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar, isSidebarCollap
 
   return (
     <header className={`fixed top-0 right-0 h-16 bg-white border-b border-gray-200 z-30 transition-all duration-300
-      ${isSidebarCollapsed ? 'left-16' : 'left-64'}`}>
-      <div className="h-full px-4 flex items-center justify-between">
+      left-0 ${isSidebarCollapsed ? 'lg:left-16' : 'lg:left-64'}`}>
+      <div className="h-full px-3 lg:px-4 flex items-center justify-between">
         {/* Left side */}
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-2 lg:gap-4">
+          {/* Mobile hamburger — opens the overlay sidebar */}
+          <button
+            onClick={onToggleMobile}
+            className="lg:hidden p-2 rounded-lg hover:bg-gray-100 transition-colors"
+            aria-label="Open menu"
+          >
+            <Menu size={20} className="text-gray-600" />
+          </button>
+          {/* Desktop hamburger — toggles sidebar collapse */}
           <button
             onClick={onToggleSidebar}
-            className="p-2 rounded-lg hover:bg-gray-100 transition-colors"
+            className="hidden lg:flex p-2 rounded-lg hover:bg-gray-100 transition-colors"
+            aria-label="Toggle sidebar"
           >
             <Menu size={20} className="text-gray-600" />
           </button>
 
-          {/* Search */}
+          {/* Brand on mobile */}
+          <span className="lg:hidden text-sm font-bold text-blue-600 truncate">NET2APP Hub</span>
+
+          {/* Search — hidden on mobile, visible on md+ */}
           <div className="relative hidden md:block">
             <Search size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
             <input
               type="text"
               placeholder="Search clients, suppliers, logs..."
-              className="w-80 pl-10 pr-4 py-2 bg-gray-50 border border-gray-200 rounded-lg text-sm
+              className="w-48 lg:w-80 pl-10 pr-4 py-2 bg-gray-50 border border-gray-200 rounded-lg text-sm
                 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             />
           </div>
         </div>
 
         {/* Right side */}
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1 lg:gap-2">
           {/* Quick stats */}
           <div className="hidden lg:flex items-center gap-4 mr-4 pr-4 border-r border-gray-200">
             <div className="text-center">
@@ -78,16 +92,17 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar, isSidebarCollap
             </div>
           </div>
 
-          {/* Theme toggle */}
+          {/* Theme toggle — hidden on small mobile */}
           <button
             onClick={() => setIsDarkMode(!isDarkMode)}
-            className="p-2 rounded-lg hover:bg-gray-100 transition-colors"
+            className="hidden sm:flex p-2 rounded-lg hover:bg-gray-100 transition-colors"
+            aria-label="Toggle theme"
           >
             {isDarkMode ? <Sun size={20} className="text-gray-600" /> : <Moon size={20} className="text-gray-600" />}
           </button>
 
-          {/* Language */}
-          <button className="p-2 rounded-lg hover:bg-gray-100 transition-colors">
+          {/* Language — hidden on mobile */}
+          <button className="hidden sm:flex p-2 rounded-lg hover:bg-gray-100 transition-colors" aria-label="Language">
             <Globe size={20} className="text-gray-600" />
           </button>
 

@@ -74,10 +74,16 @@ export const AddClient: React.FC = () => {
     if (!validate()) return;
     setLoading(true);
     try {
+      // Sanitize: convert empty string IDs to null to avoid "invalid input syntax for type integer"
+      const cleaned = {
+        ...formData,
+        routing_plan_id: formData.routing_plan_id === '' ? null : formData.routing_plan_id,
+        rate_plan_id: formData.rate_plan_id === '' ? null : formData.rate_plan_id,
+      };
       if (existingClient) {
-        await updateClient(existingClient.id, formData as Partial<Client>);
+        await updateClient(existingClient.id, cleaned as Partial<Client>);
       } else {
-        await addClient(formData as Omit<Client, 'id' | 'created_at' | 'updated_at'>);
+        await addClient(cleaned as Omit<Client, 'id' | 'created_at' | 'updated_at'>);
       }
       navigate('/clients');
     } catch (err: any) {

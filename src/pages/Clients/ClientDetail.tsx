@@ -1,12 +1,13 @@
 import React, { useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Edit, Trash2, Send, CreditCard, BarChart3, MessageSquare, Radio } from 'lucide-react';
+import { ArrowLeft, Edit, Trash2, Send, CreditCard, BarChart3, MessageSquare, Radio, PhoneCall, ToggleLeft, ToggleRight } from 'lucide-react';
 import { useData } from '../../store/DataContext';
 import { Card } from '../../components/UI/Card';
 import { Button } from '../../components/UI/Button';
 import { Badge } from '../../components/UI/Badge';
 import { Modal } from '../../components/UI/Modal';
 import { Input } from '../../components/UI/Input';
+import { voiceOtpApi } from '../../services/api';
 
 export const ClientDetail: React.FC = () => {
   const { id } = useParams<{ id: string }>();
@@ -16,6 +17,11 @@ export const ClientDetail: React.FC = () => {
   const [showTopup, setShowTopup] = useState(false);
   const [topupAmount, setTopupAmount] = useState(1000);
   const [activeTab, setActiveTab] = useState<'overview' | 'cdr' | 'usage' | 'payments'>('overview');
+  const [togglingSecondary, setTogglingSecondary] = useState(false);
+  const [showTestOtp, setShowTestOtp] = useState(false);
+  const [testDestination, setTestDestination] = useState('');
+  const [testingOtp, setTestingOtp] = useState(false);
+  const [testResult, setTestResult] = useState<any>(null);
 
   if (!client) {
     return (
@@ -153,6 +159,51 @@ export const ClientDetail: React.FC = () => {
             </div>
           </Card>
 
+          <Card title="Voice OTP Settings">
+            <div className="grid grid-cols-2 gap-4 text-sm">
+              <div><p className="text-gray-500">Play Count</p><p>{client.play_count || 1}x ({(client.play_count || 1) * 12}s approx)</p></div>
+              <div>
+                <p className="text-gray-500">2nd Language</p>
+                <button
+                  onClick={async () => {
+                    setTogglingSecondary(true);
+                    const newVal = !client.voice_otp_use_secondary;
+                    try { await updateClient(client.id, { voice_otp_use_secondary: newVal }); }
+                    catch (e) { console.error('Toggle secondary language failed:', e); }
+                    finally { setTogglingSecondary(false); }
+                  }}
+                  disabled={togglingSecondary}
+                  className="inline-flex items-center gap-1.5 text-sm font-medium transition-colors"
+                >
+                  {togglingSecondary ? (
+                    <span className="w-4 h-4 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
+                  ) : client.voice_otp_use_secondary ? (
+                    <ToggleRight size={20} className="text-green-600" />
+                  ) : (
+                    <ToggleLeft size={20} className="text-gray-400" />
+                  )}
+                  <span className={client.voice_otp_use_secondary ? 'text-green-700' : 'text-gray-500'}>
+                    {client.voice_otp_use_secondary ? 'On' : 'Off'}
+                  </span>
+                </button>
+                <p className="text-[10px] text-gray-400 mt-0.5">{client.voice_otp_use_secondary ? 'Plays both languages' : '1st language only'}</p>
+              </div>
+              <div><p className="text-gray-500">Force DLR Override</p><Badge variant={client.force_dlr_override ? 'warning' : 'default'}>{client.force_dlr_override ? 'On' : 'Off'}</Badge></div>
+              <div><p className="text-gray-500">Voice OTP Config</p><p>{client.voice_otp_config_id || 'Default'}</p></div>
+              <div className="col-span-2"><p className="text-gray-500">OTP Extraction Pattern</p><p className="font-mono text-xs">{client.otp_extraction_pattern || 'Auto'}</p></div>
+            </div>
+          </Card>
+
+          <Card>
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="font-medium text-gray-700">Test Multi-Language OTP Call</p>
+                <p className="text-xs text-gray-400">Verify the full pipeline with this client's settings</p>
+              </div>
+              <Button size="sm" variant="primary" icon={<PhoneCall size={14} />} onClick={() => { setTestDestination(''); setTestResult(null); setShowTestOtp(true); }}>Test OTP Call</Button>
+            </div>
+          </Card>
+
           <Card title="Routing Configuration">
             <div className="space-y-3">
               <div className="flex justify-between items-center p-3 bg-gray-50 rounded-lg">
@@ -285,6 +336,66 @@ export const ClientDetail: React.FC = () => {
           </table>
         </Card>
       )}
+
+      {/* Test Multi-Language OTP Modal */}
+      <Modal isOpen={showTestOtp} onClose={() => { setShowTestOtp(false); setTestResult(null); }} title="Test Multi-Language OTP Call" size="md"
+        footer={<div className="flex justify-end gap-3"><Button variant="secondary" onClick={() => setShowTestOtp(false)}>Close</Button><Button icon={<PhoneCall size={14} />} onClick={async () => {
+          if (!client) return;
+          setTestingOtp(true); setTestResult(null);
+          try {
+            const res: any = await voiceOtpApi.testMulti({ client_id: String(client.id), destination: testDestination });
+            setTestResult(res);
+          } catch (e: any) { setTestResult({ success: false, error: e.message }); }
+          setTestingOtp(false);
+        }} loading={testingOtp} disabled={!testDestination}>Send Test Call</Button></div>}>
+        <div className="space-y-4">
+          <div className="bg-gray-50 rounded-lg p-3 text-sm space-y-1">
+            <div className="flex justify-between"><span className="text-gray-500">Client:</span><span className="font-medium">{client.company_name} ({client.client_code})</span></div>
+            <div className="flex justify-between"><span className="text-gray-500">Play Count:</span><span className="font-medium">{client.play_count || 1}x</span></div>
+            <div className="flex justify-between"><span className="text-gray-500">2nd Language:</span><Badge variant={client.voice_otp_use_secondary ? 'success' : 'default'} size="sm">{client.voice_otp_use_secondary ? 'Enabled' : 'Disabled'}</Badge></div>
+            <div className="flex justify-between"><span className="text-gray-500">Config:</span><span>{client.voice_otp_config_id || 'Auto (prefix match)'}</span></div>
+          </div>
+          <Input label="Destination Number *" placeholder="+1234567890" value={testDestination} onChange={e => setTestDestination(e.target.value)} />
+          {testResult && (
+            <div className="space-y-3">
+              {testResult.success ? (() => {
+                const diag = testResult.data?.diagnostic || testResult.data?.data?.diagnostic;
+                const callData = testResult.data?.data || testResult.data;
+                return (<>
+                  <div className="bg-green-50 border border-green-200 rounded-lg p-3 text-sm text-green-700">
+                    <p className="font-semibold">✓ Call triggered</p>
+                    <p>OTP: {callData?.otp_code || 'N/A'} | Call ID: {(callData?.call_id || '').slice(-16) || 'N/A'}</p>
+                  </div>
+                  {diag && (
+                    <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 text-sm">
+                      <p className="font-semibold text-blue-800 mb-2">Playback Plan:</p>
+                      <p className="text-blue-700 text-xs">Play Count: {diag.playback_plan.play_count} | 2nd Language: {diag.playback_plan.use_secondary ? 'Yes' : 'No'}</p>
+                      <div className="space-y-0.5 mt-1">
+                        {diag.playback_plan.sequence.map((s: any, i: number) => (
+                          <div key={i} className="flex items-center gap-2 text-xs">
+                            <Badge variant={s.step === 'primary' ? 'info' : 'warning'} size="sm">R{s.round} {s.step === 'primary' ? '1st' : '2nd'}</Badge>
+                            <span className="text-gray-600">{s.language}</span>
+                            <span className="text-gray-400">| greeting: {s.greeting ? '✓' : '✗'} | digits: {s.digits}</span>
+                            {s.reusing_primary_audio && <Badge variant="info" size="sm">↻ reuse</Badge>}
+                          </div>
+                        ))}
+                      </div>
+                      <div className="mt-2 pt-2 border-t border-blue-200 text-xs text-blue-600 space-y-0.5">
+                        <p>Primary: {diag.config.primary_language_code} | digits: {diag.config.primary_digits_uploaded}</p>
+                        <p>Secondary: {diag.config.secondary_language_code} | digits: {diag.config.secondary_digits_uploaded}{diag.config.secondary_will_reuse_primary ? ' (will reuse primary)' : ''}</p>
+                      </div>
+                    </div>
+                  )}
+                </>);
+              })() : (
+                <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700">
+                  ✗ {(testResult.data || testResult).error || testResult.error || 'Call failed'}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </Modal>
 
       {/* Topup Modal */}
       <Modal isOpen={showTopup} onClose={() => setShowTopup(false)} title="Top Up Balance"

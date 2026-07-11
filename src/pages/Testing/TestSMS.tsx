@@ -1,11 +1,7 @@
 import React, { useState } from 'react';
 import { Send } from 'lucide-react';
 import { useData } from '../../store/DataContext';
-
-// WhatsApp/Telegram number validation API call
-function validateOTTNumber(n: string, ch: 'whatsapp'|'telegram'): Promise<{valid:boolean;msg:string}> {
-  return new Promise(r=>setTimeout(()=>{const v=Math.random()>0.25;r({valid:v,msg:v?`${ch==='whatsapp'?'WhatsApp':'Telegram'} ✓ on ${n}`:`${ch==='whatsapp'?'WhatsApp':'Telegram'} ✗ NOT on ${n}`});},800));
-}
+import { api, smsApi } from '../../services/api';
 import { Card } from '../../components/UI/Card';
 import { Button } from '../../components/UI/Button';
 import { Input, Select, Textarea } from '../../components/UI/Input';
@@ -23,10 +19,10 @@ interface TestResult {
 }
 
 export const TestSMS: React.FC = () => {
-  const { clients, routePlans, suppliers, rates, mccmnc, addSMSLog } = useData();
-  void validateOTTNumber;
+  const { clients, routePlans, rates, mccmnc, suppliers } = useData();
   const [formData, setFormData] = useState({
     client_id: '',
+    supplier_id: '',
     destination: '',
     sender_id: '',
     message: 'This is a test message from NET2APP Hub. Your OTP is: 123456',
@@ -55,7 +51,6 @@ export const TestSMS: React.FC = () => {
     setResults(prev => [newResult, ...prev]);
 
     // Step 1: Authentication Check
-    await new Promise(r => setTimeout(r, 500));
     const client = clients.find(c => c.id === formData.client_id);
     const authValid = !!client && client.status === 'active';
     const authMsg = authValid ? '✅ Authenticated' : '❌ Authentication failed';
@@ -67,8 +62,16 @@ export const TestSMS: React.FC = () => {
       setLoading(false); return;
     }
 
-    // Step 2: Route Plan Check (mandatory)
-    await new Promise(r => setTimeout(r, 500));
+    // Step 2: Supplier Check (if selected)
+    if (formData.supplier_id) {
+      const supplier = suppliers.find(s => s.id === formData.supplier_id);
+      if (supplier) {
+        const suppStatus = supplier.bind_status === 'bound' ? '✅ Bound' : '⚠ Unbound';
+        setValidationLog(prev => [...prev, `[Supplier] ${suppStatus} | ${supplier.supplier_code} (${supplier.company_name}) | Type: ${supplier.connection_type}`]);
+      }
+    }
+
+    // Step 3: Route Plan Check
     const rp = routePlans.find(p => p.id === formData.route_plan_id);
     if (!rp) {
       setValidationLog(prev => [...prev, '[Route Plan] ❌ Route plan is mandatory']);
@@ -77,17 +80,15 @@ export const TestSMS: React.FC = () => {
     }
     setValidationLog(prev => [...prev, `[Route Plan] ✅ Selected: ${rp.plan_name}`]);
 
-    // Step 3: MCCMNC Lookup
-    await new Promise(r => setTimeout(r, 400));
+    // Step 4: MCCMNC Lookup
     const destMCC = mccmnc.find(m => formData.destination.startsWith('+' + m.mcc));
     const mccmncValid = !!destMCC;
     setValidationLog(prev => [...prev, `[MCCMNC] ${mccmncValid ? `✅ Found: ${destMCC!.country} (${destMCC!.mcc}${destMCC!.mnc})` : '⚠ Using default route'}`]);
     newResult.validation!.mccmnc = mccmncValid ? `✅ ${destMCC!.country}` : '⚠ Default';
 
-    // Step 4: Rate Validation
-    await new Promise(r => setTimeout(r, 500));
+    // Step 5: Rate Validation
     const clientRate = rates.find(r => r.entity_type === 'client' && r.entity_id === formData.client_id && r.is_active);
-    const supplierRate = rates.find(r => r.entity_type === 'supplier' && r.is_active);
+    const supplierRate = rates.find(r => r.entity_type === 'supplier' && r.is_active && (formData.supplier_id ? r.entity_id === formData.supplier_id : true));
     const clientRateVal = clientRate?.rate || 0.025;
     const supplierRateVal = supplierRate?.rate || 0.015;
     const profit = clientRateVal - supplierRateVal;
@@ -97,19 +98,17 @@ export const TestSMS: React.FC = () => {
     newResult.currency = formData.currency;
 
     if (profit <= 0) {
-      setValidationLog(prev => [...prev, `[Rate] ❌ Profit negative! Client: €${clientRateVal.toFixed(4)} | Supplier: €${supplierRateVal.toFixed(4)} | Profit: €${profit.toFixed(4)}`]);
-      setValidationLog(prev => [...prev, '[Route] ❌ ROUTE BLOCKED - Supplier rate exceeds client rate']);
-      setResults(prev => prev.map(r => r.id === newResult.id ? { ...r, status: 'rejected' as const, error: `Route blocked: Profit negative (€${profit.toFixed(4)}). Client rate €${clientRateVal.toFixed(4)} < Supplier rate €${supplierRateVal.toFixed(4)}` } : r));
+      setValidationLog(prev => [...prev, `[Rate] ❌ Profit negative! Client: €${Number(clientRateVal).toFixed(4)} | Supplier: €${Number(supplierRateVal).toFixed(4)} | Profit: €${Number(profit).toFixed(4)}`]);
+      setResults(prev => prev.map(r => r.id === newResult.id ? { ...r, status: 'rejected' as const, error: `Route blocked: Profit negative (€${Number(profit).toFixed(4)}). Client rate €${Number(clientRateVal).toFixed(4)} < Supplier rate €${Number(supplierRateVal).toFixed(4)}` } : r));
       setLoading(false); return;
     }
-    setValidationLog(prev => [...prev, `[Rate] ✅ Client: €${clientRateVal.toFixed(4)} | Supplier: €${supplierRateVal.toFixed(4)} | Profit: €${profit.toFixed(4)}`]);
-    newResult.validation!.rate = `✅ €${profit.toFixed(4)} profit`;
-    newResult.validation!.profit = `✅ Profit €${profit.toFixed(4)}`;
+    setValidationLog(prev => [...prev, `[Rate] ✅ Client: €${Number(clientRateVal).toFixed(4)} | Supplier: €${Number(supplierRateVal).toFixed(4)} | Profit: €${Number(profit).toFixed(4)}`]);
+    newResult.validation!.rate = `✅ €${Number(profit).toFixed(4)} profit`;
+    newResult.validation!.profit = `✅ Profit €${Number(profit).toFixed(4)}`;
 
-    // Step 5: Balance + Credit Limit Check
-    await new Promise(r => setTimeout(r, 400));
-    const balance = client?.balance || 0;
-    const creditLimit = client?.credit_limit || 0;
+    // Step 6: Balance + Credit Limit Check
+    const balance = Number(client?.balance || 0);
+    const creditLimit = Number(client?.credit_limit || 0);
     const totalAvailable = balance + creditLimit;
     const estimatedCost = clientRateVal;
 
@@ -122,48 +121,63 @@ export const TestSMS: React.FC = () => {
     newResult.validation!.balance = `✅ €${balance.toFixed(2)}`;
     newResult.validation!.credit = `✅ €${creditLimit.toFixed(2)}`;
 
-    // Step 6: SEND SMS
-    await new Promise(r => setTimeout(r, 800));
-    const msgId = 'MSG' + Date.now();
-    setResults(prev => prev.map(r => r.id === newResult.id ? { ...r, status: 'sent' as const, message_id: msgId, route: rp.plan_name } : r));
-    setValidationLog(prev => [...prev, `[Send] ✅ Sent! Message ID: ${msgId}`]);
+    // Step 7: SEND SMS via real API endpoint
+    setValidationLog(prev => [...prev, `[Send] ⏳ Sending to server...`]);
+    const sendStart = Date.now();
+    try {
+      const res: any = await api.post('/sms/test', {
+        destination: formData.destination,
+        message: formData.message,
+        sender_id: formData.sender_id,
+        client_id: formData.client_id || null,
+        supplier_id: formData.supplier_id || null,
+      });
 
-    // Add to global CDR (SMS logs)
-    const routeName = rp.plan_name;
-    const supplierName = suppliers[0]?.company_name || 'Auto';
-    addSMSLog({
-      message_id: msgId,
-      client_id: formData.client_id || '0',
-      client_code: client?.client_code || 'TEST',
-      supplier_code: suppliers[0]?.supplier_code || 'SUP001',
-      sender_id: formData.sender_id,
-      destination: formData.destination,
-      mcc: destMCC?.mcc || '000',
-      mnc: destMCC?.mnc || '00',
-      country: destMCC?.country || 'Unknown',
-      operator: destMCC?.operator || 'Unknown',
-      message: formData.message,
-      message_parts: Math.ceil(formData.message.length / 160),
-      client_rate: clientRateVal,
-      supplier_rate: supplierRateVal,
-      profit: profit,
-      currency: formData.currency,
-      status: 'sent',
-      route_name: routeName,
-      trunk_name: 'Direct',
-      supplier_id: undefined,
-      dlr_status: null,
-      dlr_timestamp: null,
-      delivery_time: null,
-      error_code: null,
-      error_message: null,
-    } as any);
+      if (res.success && res.data?.data) {
+        const serverData = res.data.data;
+        const msgId = serverData.message_id || `MSG_${Date.now()}`;
+        const latency = Date.now() - sendStart;
+        
+        // Log server response message
+        if (res.data?.message) {
+          setValidationLog(prev => [...prev, `[Server] ${res.data.message}`]);
+        }
+        setResults(prev => prev.map(r => r.id === newResult.id ? { 
+          ...r, 
+          status: 'sent' as const, 
+          message_id: msgId, 
+          route: rp.plan_name,
+          latency,
+          supplier: formData.supplier_id ? suppliers.find(s => s.id === formData.supplier_id)?.company_name || 'Server' : (res.data.supplier || 'Server'),
+        } : r));
+        setValidationLog(prev => [...prev, `[Send] ✅ Sent! Message ID: ${msgId} | Latency: ${latency}ms`]);
 
-    // Step 7: DLR Simulation
-    await new Promise(r => setTimeout(r, 1500 + Math.random() * 3000));
-    const delivered = Math.random() > 0.2;
-    setResults(prev => prev.map(r => r.id === newResult.id ? { ...r, status: delivered ? 'delivered' as const : 'failed' as const, latency: Math.floor(Math.random() * 2500 + 400), error: delivered ? undefined : 'Network timeout', supplier: supplierName } : r));
-    setValidationLog(prev => [...prev, `[DLR] ${delivered ? '✅ Delivered' : '❌ Failed'}`]);
+        // Server auto-delivers after 2s — poll for DLR status
+        setTimeout(async () => {
+          try {
+            const dlrRes: any = await smsApi.getLog(serverData.id);
+            const dlrStatus = dlrRes.success && dlrRes.data?.data?.status === 'delivered' ? 'delivered' : 'sent';
+            setResults(prev => prev.map(r => r.id === newResult.id ? { 
+              ...r, 
+              status: dlrStatus as 'delivered' | 'sent',
+              dlr_status: dlrStatus,
+            } : r));
+            setValidationLog(prev => [...prev, `[DLR] ${dlrStatus === 'delivered' ? '✅ Delivered' : '⏳ Sent (pending)'}`]);
+          } catch {
+            setValidationLog(prev => [...prev, `[DLR] ⚠ Could not verify DLR status`]);
+          }
+        }, 3000);
+      } else {
+        throw new Error(res.error || res.data?.error || 'Server returned failure');
+      }
+    } catch (err: any) {
+      setResults(prev => prev.map(r => r.id === newResult.id ? { 
+        ...r, 
+        status: 'failed' as const, 
+        error: err.message || 'SMS send failed',
+      } : r));
+      setValidationLog(prev => [...prev, `[Send] ❌ Failed: ${err.message || 'Unknown error'}`]);
+    }
     
     setLoading(false);
   };
@@ -189,16 +203,15 @@ export const TestSMS: React.FC = () => {
             <Select label="Client (Required for Auth)" value={formData.client_id} onChange={e => setFormData(p => ({ ...p, client_id: e.target.value }))}
               options={[{ value: '', label: 'Select Client' }, ...clients.map(c => ({ value: c.id, label: `${c.client_code} - ${c.company_name}` }))]} required />
 
+            <Select label="Supplier (Optional — route via specific supplier)" value={formData.supplier_id} onChange={e => setFormData(p => ({ ...p, supplier_id: e.target.value }))}
+              options={[{ value: '', label: 'Auto-select (default)' }, ...suppliers.filter(s => s.status === 'active').map(s => ({ value: s.id, label: `${s.supplier_code} - ${s.company_name} (${s.connection_type})` }))]} />
+
             <Select label="Route Plan * (Mandatory)" value={formData.route_plan_id} onChange={e => setFormData(p => ({ ...p, route_plan_id: e.target.value }))}
               options={[{ value: '', label: 'Select Route Plan (Mandatory)' }, ...routePlans.map(rp => ({ value: rp.id, label: rp.plan_name }))]} required />
 
             <Input label="Destination Number *" value={formData.destination} onChange={e => setFormData(p => ({ ...p, destination: e.target.value }))} placeholder="+1234567890" required />
             <Input label="Sender ID *" value={formData.sender_id} onChange={e => setFormData(p => ({ ...p, sender_id: e.target.value }))} placeholder="NET2APP" required />
             <Textarea label="Message *" value={formData.message} onChange={e => setFormData(p => ({ ...p, message: e.target.value }))} rows={3} required />
-
-            <Select label="Channel" value={formData.currency}
-              onChange={e => setFormData(p => ({ ...p, currency: e.target.value as 'EUR' }))}
-              options={[{ value: 'EUR', label: 'EUR (€)' }, { value: 'USD', label: 'USD ($)' }]} />
 
             <Select label="Currency" value={formData.currency}
               onChange={e => setFormData(p => ({ ...p, currency: e.target.value as 'EUR' }))}
@@ -250,7 +263,7 @@ export const TestSMS: React.FC = () => {
                     {/* Profit display */}
                     {r.profit !== undefined && (
                       <div className={`mt-1 text-xs font-semibold ${(r.profit || 0) > 0 ? 'text-green-600' : 'text-red-600'}`}>
-                        Client: €{r.client_rate?.toFixed(4)} | Supp: €{r.supplier_rate?.toFixed(4)} | Profit: €{r.profit?.toFixed(4)}
+                        Client: €{Number(r.client_rate||0).toFixed(4)} | Supp: €{Number(r.supplier_rate||0).toFixed(4)} | Profit: €{Number(r.profit||0).toFixed(4)}
                       </div>
                     )}
                     {r.error && <p className="text-xs text-red-600 mt-1">Error: {r.error}</p>}

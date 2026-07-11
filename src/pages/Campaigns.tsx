@@ -7,6 +7,7 @@ import { Badge } from '../components/UI/Badge';
 import { Table, Pagination } from '../components/UI/Table';
 import { Modal } from '../components/UI/Modal';
 import { Input, Select, Textarea } from '../components/UI/Input';
+import { api } from '../services/api';
 
 interface Campaign {
   id: string;
@@ -17,6 +18,7 @@ interface Campaign {
   route_plan_id: string;
   recipients_file: string | null;
   recipients_count: number;
+  numbers: string[];
   sent_count: number;
   delivered_count: number;
   failed_count: number;
@@ -51,6 +53,7 @@ export const CampaignsPage: React.FC = () => {
           route_plan_id: '',
           recipients_file: null,
           recipients_count: c.recipients_count || 0,
+          numbers: c.numbers || [],
           sent_count: c.sent_count || 0,
           delivered_count: c.delivered_count || 0,
           failed_count: c.failed_count || 0,
@@ -95,6 +98,7 @@ export const CampaignsPage: React.FC = () => {
       ...form,
       recipients_file: uploadFile?.name || null,
       recipients_count: uploadedNumbers.length,
+      numbers: [...uploadedNumbers],
       sent_count: 0, delivered_count: 0, failed_count: 0,
       status: form.send_type === 'scheduled' ? 'scheduled' : 'draft',
       scheduled_at: form.send_type === 'scheduled' ? form.scheduled_at : null,
@@ -110,26 +114,33 @@ export const CampaignsPage: React.FC = () => {
     setForm({ campaign_name:'', client_id:'', sender_id:'', message_template:'', route_plan_id:'', send_type:'immediate', scheduled_at:'', currency:'EUR' });
   };
 
-  const handleStart = (id: string) => {
-    setCampaigns(prev => prev.map(c => c.id===id ? { ...c, status:'running' as const, started_at: new Date().toISOString() } : c));
-    // Simulate sending
+  const handleStart = async (id: string) => {
     const campaign = campaigns.find(c => c.id===id);
-    if (campaign) {
-      let sent = 0;
-      const interval = setInterval(() => {
-        sent += Math.floor(Math.random()*500+200);
-        if (sent >= campaign.recipients_count) {
-          sent = campaign.recipients_count;
-          clearInterval(interval);
-          setCampaigns(prev => prev.map(c => c.id===id ? { ...c, sent_count: sent, delivered_count: Math.floor(sent*0.94), failed_count: Math.floor(sent*0.06), status:'completed', completed_at: new Date().toISOString() } : c));
-        } else {
-          setCampaigns(prev => prev.map(c => c.id===id ? { ...c, sent_count: sent, delivered_count: Math.floor(sent*0.94), failed_count: Math.floor(sent*0.06) } : c));
-        }
-      }, 1500);
+    if (!campaign || !campaign.client_id) return;
+    setCampaigns(prev => prev.map(c => c.id===id ? { ...c, status:'running' as const, started_at: new Date().toISOString() } : c));
+    // Send real SMS via API for each uploaded number
+    let sent = 0; let delivered = 0; let failed = 0;
+    for (const number of campaign.numbers) {
+      try {
+        await api.post('/sms/send', {
+          client_id: campaign.client_id,
+          destination: number,
+          sender_id: campaign.sender_id,
+          message: campaign.message_template,
+          source: 'campaign',
+        });
+        sent++;
+        setCampaigns(prev => prev.map(c => c.id===id ? { ...c, sent_count: sent, delivered_count: delivered, failed_count: failed } : c));
+      } catch {
+        failed++;
+      }
+      // Rate limit: 10 SMS/sec
+      if (sent % 10 === 0) await new Promise(r => setTimeout(r, 1000));
     }
+    setCampaigns(prev => prev.map(c => c.id===id ? { ...c, sent_count: sent, delivered_count: delivered, failed_count: failed, status:'completed', completed_at: new Date().toISOString() } : c));
   };
   const handlePause = (id: string) => setCampaigns(prev => prev.map(c => c.id===id ? {...c, status:'paused'} : c));
-  const handleResume = (id: string) => handleStart(id);
+  const handleResume = (id: string) => setCampaigns(prev => prev.map(c => c.id===id ? {...c, status:'running'} : c));
   const handleCancel = (id: string) => setCampaigns(prev => prev.map(c => c.id===id ? {...c, status:'cancelled', completed_at: new Date().toISOString()} : c));
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -153,8 +164,8 @@ export const CampaignsPage: React.FC = () => {
     { key:'name', header:'Campaign', render:(c:Campaign)=><div><p className="font-medium">{c.campaign_name}</p><p className="text-xs text-gray-500">{clients.find(x=>x.id===c.client_id)?.company_name||'Self'} · {routePlans.find(x=>x.id===c.route_plan_id)?.plan_name||'Auto'}</p></div> },
     { key:'progress', header:'Progress', render:(c:Campaign)=><div className="w-32"><div className="flex justify-between text-xs mb-1"><span>{c.recipients_count>0?((c.sent_count/c.recipients_count)*100).toFixed(0):0}%</span><span>{c.sent_count.toLocaleString()}/{c.recipients_count.toLocaleString()}</span></div><div className="w-full bg-gray-200 rounded-full h-2"><div className="bg-blue-500 h-2 rounded-full transition-all" style={{width:`${c.recipients_count>0?(c.sent_count/c.recipients_count)*100:0}%`}}/></div></div> },
     { key:'dlr', header:'DLR Rate', align:'center' as const, render:(c:Campaign)=><span className={`font-semibold ${c.sent_count>0&&((c.delivered_count/c.sent_count)*100)>90?'text-green-600':'text-red-600'}`}>{c.sent_count>0?((c.delivered_count/c.sent_count)*100).toFixed(1):'0'}%</span> },
-    { key:'profit', header:'Profit', align:'right' as const, render:(c:Campaign)=><span className={`font-semibold ${c.profit>0?'text-green-600':'text-red-600'}`}>€{c.profit.toFixed(4)}/sms</span> },
-    { key:'cost', header:'Est. Cost', align:'right' as const, render:(c:Campaign)=><span className="text-sm">€{(c.client_rate*c.sent_count).toFixed(2)}</span> },
+    { key:'profit', header:'Profit', align:'right' as const, render:(c:Campaign)=><span className={`font-semibold ${c.profit>0?'text-green-600':'text-red-600'}`}>€{Number(c.profit).toFixed(4)}/sms</span> },
+    { key:'cost', header:'Est. Cost', align:'right' as const, render:(c:Campaign)=><span className="text-sm">€{(Number(c.client_rate)*c.sent_count).toFixed(2)}</span> },
     { key:'type', header:'Type', render:(c:Campaign)=><Badge variant={c.send_type==='immediate'?'info':'warning'}>{c.send_type}</Badge> },
     { key:'status', header:'Status', render:(c:Campaign)=>getStatusBadge(c.status) },
     { key:'actions', header:'', render:(c:Campaign)=><div className="flex gap-1">{c.status==='draft'&&<button onClick={()=>handleStart(c.id)} className="p-1.5 rounded hover:bg-green-50"><Play size={14} className="text-green-500"/></button>}{c.status==='scheduled'&&<button onClick={()=>handleStart(c.id)} className="p-1.5 rounded hover:bg-green-50"><Play size={14} className="text-green-500"/></button>}{c.status==='running'&&<button onClick={()=>handlePause(c.id)} className="p-1.5 rounded hover:bg-yellow-50"><Pause size={14} className="text-yellow-500"/></button>}{c.status==='paused'&&<button onClick={()=>handleResume(c.id)} className="p-1.5 rounded hover:bg-green-50"><Play size={14} className="text-green-500"/></button>}{(c.status==='running'||c.status==='paused'||c.status==='scheduled')&&<button onClick={()=>handleCancel(c.id)} className="p-1.5 rounded hover:bg-red-50"><X size={14} className="text-red-500"/></button>}</div> },
@@ -207,7 +218,7 @@ export const CampaignsPage: React.FC = () => {
           {form.client_id && form.route_plan_id && (
             <div className="bg-blue-50 p-3 rounded-lg text-sm">
               <p className="font-medium text-blue-700">Profit Calculation:</p>
-              <p>Client Rate: €{(rates.find(r=>r.entity_type==='client'&&r.entity_id===form.client_id&&r.is_active)?.rate||0.025).toFixed(4)} - Supplier Rate: €{(rates.find(r=>r.entity_type==='supplier'&&r.is_active)?.rate||0.015).toFixed(4)} = <strong className="text-green-600">€{((rates.find(r=>r.entity_type==='client'&&r.entity_id===form.client_id&&r.is_active)?.rate||0.025)-(rates.find(r=>r.entity_type==='supplier'&&r.is_active)?.rate||0.015)).toFixed(4)} profit/SMS</strong></p>
+              <p>Client Rate: €{Number(rates.find(r=>r.entity_type==='client'&&r.entity_id===form.client_id&&r.is_active)?.rate||0.025).toFixed(4)} - Supplier Rate: €{Number(rates.find(r=>r.entity_type==='supplier'&&r.is_active)?.rate||0.015).toFixed(4)} = <strong className="text-green-600">€{((rates.find(r=>r.entity_type==='client'&&r.entity_id===form.client_id&&r.is_active)?.rate||0.025)-(rates.find(r=>r.entity_type==='supplier'&&r.is_active)?.rate||0.015)).toFixed(4)} profit/SMS</strong></p>
             </div>
           )}
         </div>

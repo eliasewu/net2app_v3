@@ -58,7 +58,7 @@ export const TrunksList: React.FC = () => {
         priority: trunk.priority,
         percentage: trunk.percentage,
         is_active: trunk.is_active,
-        mccmnc_allowed: trunk.mccmnc_allowed,
+        mccmnc_allowed: trunk.mccmnc_allowed || ['*'],
       });
     } else {
       setEditingTrunk(null);
@@ -141,11 +141,11 @@ export const TrunksList: React.FC = () => {
       header: 'MCCMNC Allowed',
       render: (trunk: Trunk) => (
         <div className="flex flex-wrap gap-1">
-          {trunk.mccmnc_allowed.slice(0, 3).map((m, i) => (
+          {(trunk.mccmnc_allowed || []).slice(0, 3).map((m, i) => (
             <Badge key={i} variant="default" size="sm">{m}</Badge>
           ))}
-          {trunk.mccmnc_allowed.length > 3 && (
-            <Badge variant="default" size="sm">+{trunk.mccmnc_allowed.length - 3}</Badge>
+          {(trunk.mccmnc_allowed || []).length > 3 && (
+            <Badge variant="default" size="sm">+{(trunk.mccmnc_allowed || []).length - 3}</Badge>
           )}
         </div>
       ),

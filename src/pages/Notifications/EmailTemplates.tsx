@@ -10,9 +10,8 @@ import { EmailTemplate } from '../../types';
 
 export const EmailTemplates: React.FC = () => {
   const { emailTemplates } = useData();
-  const [localTemplates, setLocalTemplates] = useState(emailTemplates);
+  const [, setLocalTemplates] = useState(emailTemplates);
   const updateEmailTemplate = (id: string, data: any) => { setLocalTemplates(prev => { return prev.map(t => t.id === id ? { ...t, ...data } : t); }); };
-  const allTemplates = localTemplates;
   const [search, setSearch] = useState('');
   const [editModal, setEditModal] = useState<EmailTemplate | null>(null);
   const [previewModal, setPreviewModal] = useState<EmailTemplate | null>(null);

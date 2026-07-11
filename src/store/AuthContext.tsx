@@ -24,26 +24,41 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const [user, setUser] = useState<User | null>(null);
   const [isLoading, setIsLoading] = useState(true);
 
+  // On mount, check if there's an existing session via httpOnly cookie
   useEffect(() => {
-    const storedToken = localStorage.getItem('auth_token');
-    const storedUser = localStorage.getItem('auth_user');
-    if (storedToken && storedUser) {
+    const checkSession = async () => {
       try {
-        api.setToken(storedToken);
-        setUser(JSON.parse(storedUser));
-      } catch {}
-    }
-    setIsLoading(false);
+        const res: any = await api.get('/auth/me');
+        if (res.success && res.data?.data) {
+          const serverUser = res.data.data;
+          setUser({
+            id: String(serverUser.id),
+            username: serverUser.username,
+            email: serverUser.email || '',
+            role: serverUser.role,
+            permissions: serverUser.permissions || [],
+            client_id: serverUser.client_id ? String(serverUser.client_id) : undefined,
+            supplier_id: serverUser.supplier_id ? String(serverUser.supplier_id) : undefined,
+            name: serverUser.name || serverUser.username,
+            is_active: serverUser.is_active ?? true,
+          });
+        }
+      } catch {
+        // No valid session — user will need to log in
+      }
+      setIsLoading(false);
+    };
+    checkSession();
   }, []);
 
   const login = async (username: string, password: string): Promise<{ success: boolean; error?: string }> => {
     try {
       const res: any = await api.post('/auth/login', { username, password });
-      if (!res.success || !res.data?.token) {
+      if (!res.success) {
         return { success: false, error: res.error || res.data?.error || 'Invalid credentials' };
       }
-      const { token, user: serverUser } = res.data;
-      api.setToken(token);
+      // Token is now set as httpOnly cookie by the server — no manual token handling needed
+      const serverUser = res.data.user;
       const appUser: User = {
         id: String(serverUser.id),
         username: serverUser.username,
@@ -55,17 +70,16 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         name: serverUser.name || serverUser.username,
         is_active: true,
       };
-      localStorage.setItem('auth_user', JSON.stringify(appUser));
       setUser(appUser);
       return { success: true };
     } catch (e: any) {
       return { success: false, error: e.message || 'Login failed' };
     }
   };
-  const logout = () => {
-    api.setToken(null);
-    localStorage.removeItem('auth_token');
-    localStorage.removeItem('auth_user');
+  const logout = async () => {
+    try {
+      await api.post('/auth/logout', {});
+    } catch { /* ignore */ }
     setUser(null);
     window.location.href = '/login';
   };

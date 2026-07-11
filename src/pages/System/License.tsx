@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Shield, Server, Users, MessageSquare, CheckCircle, XCircle, AlertTriangle, Copy, Plus, Edit, Trash2, Gauge, BarChart3, Key, Clock, Zap, Monitor, RefreshCw } from 'lucide-react';
+import { Shield, CheckCircle, AlertTriangle, Copy, Plus, Edit, Trash2, Monitor, RefreshCw, Clock } from 'lucide-react';
 import { useAuth } from '../../store/AuthContext';
 import { Card } from '../../components/UI/Card';
 import { Button } from '../../components/UI/Button';
@@ -7,7 +7,7 @@ import { Badge } from '../../components/UI/Badge';
 import { Modal } from '../../components/UI/Modal';
 import { Input, Select } from '../../components/UI/Input';
 import { Table } from '../../components/UI/Table';
-import { licenseApi } from '../../services/api';
+import { licenseApi, systemApi } from '../../services/api';
 
 const PACKAGES: Record<string, { name: string; days: number; sms_monthly: number; max_clients: number; max_suppliers: number; max_tps: number; features: { smpp: boolean; http: boolean; whatsapp: boolean; telegram: boolean; rcs: boolean; voice_otp: boolean; }; color: string; }> = {
   trial: { name: 'Trial', days: 30, sms_monthly: 1000, max_clients: 999999, max_suppliers: 999999, max_tps: 50, features: { smpp: true, http: true, whatsapp: false, telegram: false, rcs: false, voice_otp: false }, color: 'from-blue-500 to-blue-600' },
@@ -29,7 +29,7 @@ interface Tenant {
 }
 
 export const License: React.FC = () => {
-  const { user, isSuperAdmin } = useAuth();
+  const { user } = useAuth();
   const isSuperUser = user?.role === 'super_admin';
   const [license, setLicense] = useState<LicenseInfo>({});
   const [tenants, setTenants] = useState<Tenant[]>([]);
@@ -49,6 +49,12 @@ export const License: React.FC = () => {
 
   const [tenantForm, setTenantForm] = useState({ name:'', code:'', ip:'', mac:'', max_sms_monthly:100, max_tps:5 });
 
+  // Retention cleanup state
+  const [retentionLoading, setRetentionLoading] = useState(false);
+  const [retentionMonths, setRetentionMonths] = useState(6);
+  const [retentionResult, setRetentionResult] = useState<{ cutoff_months: number; total_cleaned: number; breakdown: Record<string, number>; preserved: string } | null>(null);
+  const [retentionError, setRetentionError] = useState('');
+
   const loadData = async () => {
     setLoading(true);
     try {
@@ -62,6 +68,23 @@ export const License: React.FC = () => {
       else if (tenantsRes.success && Array.isArray(tenantsRes.data)) setTenants(tenantsRes.data);
     } catch (e) { console.warn('License fetch failed'); }
     setLoading(false);
+  };
+
+  const handleRetentionCleanup = async () => {
+    setRetentionLoading(true);
+    setRetentionError('');
+    setRetentionResult(null);
+    try {
+      const res: any = await systemApi.cleanupRetention(retentionMonths);
+      if (res.success && res.data?.data) {
+        setRetentionResult(res.data.data);
+      } else {
+        setRetentionError(res.error || 'Cleanup failed');
+      }
+    } catch (e: any) {
+      setRetentionError(e.message || 'Cleanup failed');
+    }
+    setRetentionLoading(false);
   };
 
   useEffect(() => { loadData(); }, []);
@@ -167,6 +190,74 @@ export const License: React.FC = () => {
 
     <Card title="Tenants" subtitle={`${tenants.length} tenants`} action={isSuperUser?<Button size="sm" icon={<Plus size={16}/>} onClick={()=>openTenant()}>Add Tenant</Button>:undefined} noPadding>
       <Table columns={tenantCols} data={tenants} keyExtractor={t=>t.id}/>
+    </Card>
+
+    {/* Data Retention Cleanup */}
+    <Card title="Data Retention Cleanup" subtitle="Purge non-critical operational data older than N months. SMS logs, payments, invoices, and financial CDR data are preserved forever.">
+      <div className="flex flex-col gap-4">
+        <div className="flex items-center gap-4">
+          <div className="flex items-center gap-2">
+            <label className="text-sm text-gray-600 whitespace-nowrap">Purge data older than</label>
+            <select
+              value={retentionMonths}
+              onChange={e => setRetentionMonths(parseInt(e.target.value))}
+              className="px-3 py-1.5 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-purple-500"
+            >
+              <option value={3}>3 months</option>
+              <option value={6}>6 months</option>
+              <option value={12}>12 months</option>
+              <option value={24}>24 months</option>
+            </select>
+          </div>
+          <Button
+            variant="danger"
+            icon={<Trash2 size={16}/>}
+            onClick={handleRetentionCleanup}
+            loading={retentionLoading}
+          >
+            Run Cleanup
+          </Button>
+          <span className="text-xs text-gray-400">
+            <Clock size={12} className="inline mr-1"/>
+            Auto-runs weekly on the server
+          </span>
+        </div>
+
+        {retentionError && (
+          <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-red-700 text-sm">{retentionError}</div>
+        )}
+
+        {retentionResult && (
+          <div className="bg-green-50 border border-green-200 rounded-lg p-4">
+            <div className="flex items-center gap-2 mb-3">
+              <CheckCircle size={18} className="text-green-600"/>
+              <span className="font-semibold text-green-800">
+                {retentionResult.total_cleaned.toLocaleString()} rows purged (older than {retentionResult.cutoff_months} months)
+              </span>
+            </div>
+            {retentionResult.total_cleaned > 0 ? (
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
+                {Object.entries(retentionResult.breakdown)
+                  .filter(([, count]) => count > 0)
+                  .sort(([, a], [, b]) => b - a)
+                  .map(([table, count]) => (
+                    <div key={table} className="bg-white rounded-md px-3 py-1.5 border border-green-100 flex justify-between">
+                      <span className="text-gray-600 font-mono">{table}</span>
+                      <span className="font-semibold text-green-700">{count.toLocaleString()}</span>
+                    </div>
+                  ))}
+              </div>
+            ) : (
+              <p className="text-sm text-gray-500">No data to clean up — everything is within the retention window.</p>
+            )}
+            <div className="mt-3 pt-3 border-t border-green-200">
+              <p className="text-xs text-gray-500">
+                <span className="font-medium text-green-700">✓ Preserved:</span> {retentionResult.preserved}
+              </p>
+            </div>
+          </div>
+        )}
+      </div>
     </Card>
 
     <Modal isOpen={showActivate} onClose={()=>setShowActivate(false)} title="Activate License" footer={<div className="flex justify-end gap-3"><Button variant="secondary" onClick={()=>setShowActivate(false)}>Cancel</Button><Button onClick={handleActivate} loading={saving}>Activate</Button></div>}>

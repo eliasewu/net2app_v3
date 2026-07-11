@@ -6,6 +6,8 @@ interface Column<T> {
   render?: (item: T) => ReactNode;
   width?: string;
   align?: 'left' | 'center' | 'right';
+  /** Hides this column on screens below md (768px). Keep only priority columns visible on mobile. */
+  hideOnMobile?: boolean;
 }
 
 interface TableProps<T> {
@@ -35,13 +37,14 @@ export function Table<T>({
 
   return (
     <div className="overflow-x-auto">
-      <table className="w-full">
+      <table className="w-full min-w-[600px]">
         <thead>
           <tr className="border-b border-gray-200">
             {columns.map(col => (
               <th
                 key={col.key}
-                className={`px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider
+                className={`px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider whitespace-nowrap
+                  ${col.hideOnMobile ? 'hidden md:table-cell' : ''}
                   ${col.align === 'center' ? 'text-center' : col.align === 'right' ? 'text-right' : 'text-left'}`}
                 style={{ width: col.width }}
               >
@@ -67,7 +70,8 @@ export function Table<T>({
                 {columns.map(col => (
                   <td
                     key={col.key}
-                    className={`px-4 py-3 text-sm text-gray-700
+                    className={`px-4 py-3 text-sm text-gray-700 whitespace-nowrap
+                      ${col.hideOnMobile ? 'hidden md:table-cell' : ''}
                       ${col.align === 'center' ? 'text-center' : col.align === 'right' ? 'text-right' : 'text-left'}`}
                   >
                     {col.render ? col.render(item) : (item as any)[col.key]}

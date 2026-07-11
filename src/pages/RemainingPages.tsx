@@ -1,7 +1,7 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useAuth } from '../store/AuthContext';
 import { useData } from '../store/DataContext';
-import { Rate, User, SMSLog, DashboardStats } from '../types';
+import { Rate } from '../types';
 import { exportCSV } from '../services/exportService';
 import { Card } from '../components/UI/Card';
 import { Button } from '../components/UI/Button';
@@ -10,34 +10,57 @@ import { Table, Pagination } from '../components/UI/Table';
 import { Modal } from '../components/UI/Modal';
 import { Input, Select, Textarea } from '../components/UI/Input';
 import { StatCard } from '../components/UI/StatCard';
+import { api } from '../services/api';
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar } from 'recharts';
-import { DollarSign, TrendingUp, Download, FileText, Plus, Edit, Trash2, Upload, CreditCard, Send, Play, Pause, X, CheckCircle, AlertTriangle, CheckSquare, Square, Shield, Database, HardDrive, RotateCcw, Bell, Search as SearchIcon, Clock, UserPlus, Save, Lock } from 'lucide-react';
+import { DollarSign, TrendingUp, Download, FileText, Plus, Edit, Trash2, Upload, CreditCard, Send, Play, Pause, X, CheckCircle, AlertTriangle, CheckSquare, Square, Shield, Database, HardDrive, RotateCcw, Bell, Search as SearchIcon, Lock } from 'lucide-react';
+import API_ENDPOINTS, { API_BASE } from '../database/apiEndpoints';
+
 
 const roleLabels: Record<string,string> = { super_admin:'Super Admin', admin:'Admin', support:'Support', billing:'Billing', agent:'Agent', client:'Client', supplier:'Supplier' };
-const roleOptions = Object.entries(roleLabels).map(([v,l]) => ({ value:v, label:l }));
+
 
 // ==================== ROUTE PLANS ====================
+// Helper: normalize PostgreSQL array string (e.g. "{1,2,3}") to JS string array.
+// Always returns strings for consistent ID comparisons across the component.
+const ensureArray = (v: any): string[] => {
+  if (Array.isArray(v)) return v.map(String);
+  if (typeof v === 'string' && v.startsWith('{') && v.endsWith('}')) {
+    const inner = v.slice(1, -1);
+    if (inner === '') return [];
+    return inner.split(',').filter(Boolean).map(s => s.trim());
+  }
+  return [];
+};
 export const RoutePlans: React.FC = () => {
   const { routes, routePlans, addRoutePlan, updateRoutePlan, deleteRoutePlan } = useData();
-  const [plans, setPlans] = useState(routePlans.length > 0 ? routePlans.map(p => ({ id: p.id, name: p.plan_name, route_ids: p.route_ids, is_default: p.is_default, active: true })) : [{ id:'1', name:'Premium Plan', route_ids:['1','3','4'], is_default:true, active:true },{ id:'2', name:'Marketing Plan', route_ids:['2'], is_default:false, active:true },{ id:'3', name:'OTT Only', route_ids:['3'], is_default:false, active:true }]);
+  // Build display plans from routePlans context — sync via useEffect so API data populates after mount
+  const [plans, setPlans] = useState<any[]>([]);
+  useEffect(() => {
+    if (routePlans.length > 0) {
+      setPlans(routePlans.map(p => ({ id: String(p.id), name: p.plan_name, route_ids: ensureArray(p.route_ids), is_default: p.is_default, active: true })));
+    } else {
+      setPlans([{ id:'1', name:'Premium Plan', route_ids:['1','3','4'], is_default:true, active:true },{ id:'2', name:'Marketing Plan', route_ids:['2'], is_default:false, active:true },{ id:'3', name:'OTT Only', route_ids:['3'], is_default:false, active:true }]);
+    }
+  }, [routePlans]);
   const [showModal, setShowModal] = useState(false); const [editing, setEditing] = useState<any>(null);
-  const [form, setForm] = useState({ name:'', route_ids: [] as string[], is_default:false, active:true });
-  const allRoutes = routes;
+  const [form, setForm] = useState({ name:'', route_ids: [] as any[], is_default:false, active:true });
+  // Normalize route IDs for safe comparisons (DB returns numbers, fallback uses strings)
+  const normalizedRoutes = useMemo(() => routes.map(r => ({ ...r, id: String(r.id), trunk_ids: ensureArray(r.trunk_ids) })), [routes]);
   const open = (p?: any) => { if(p){setEditing(p);setForm({name:p.name,route_ids:p.route_ids||[],is_default:p.is_default,active:p.active});}else{setEditing(null);setForm({name:'',route_ids:[],is_default:false,active:true});} setShowModal(true); };
-  const toggleRoute = (rid: string) => { setForm(prev => ({...prev, route_ids: prev.route_ids.includes(rid) ? prev.route_ids.filter(id=>id!==rid) : [...prev.route_ids, rid]})); };
+  const toggleRoute = (rid: string) => { setForm(prev => ({...prev, route_ids: prev.route_ids.includes(rid) ? prev.route_ids.filter((id: any)=>String(id)!==rid) : [...prev.route_ids, rid]})); };
   const cols = [
     {key:'name',header:'Plan Name',render:(p:any)=><span className="font-semibold">{p.name}</span>},
-    {key:'routes',header:'Routes',render:(p:any)=><div className="flex flex-wrap gap-1">{(p.route_ids||[]).map((rid:string)=>{const r=allRoutes.find(r=>r.id===rid);return r?<Badge key={rid} variant="info">{r.route_name}</Badge>:null;})}{(p.route_ids||[]).length===0&&<span className="text-sm text-gray-500">No routes</span>}</div>},
+    {key:'routes',header:'Routes',render:(p:any)=><div className="flex flex-wrap gap-1">{(ensureArray(p.route_ids)).map((rid:any)=>{const r=normalizedRoutes.find(r=>String(r.id)===String(rid));return r?<Badge key={String(rid)} variant="info">{r.route_name}</Badge>:null;})}{ensureArray(p.route_ids).length===0&&<span className="text-sm text-gray-500">No routes</span>}</div>},
     {key:'default',header:'Default',render:(p:any)=><Badge variant={p.is_default?'success':'default'}>{p.is_default?'Yes':'No'}</Badge>},
     {key:'status',header:'Status',render:(p:any)=><Badge variant={p.active?'success':'danger'} dot>{p.active?'Active':'Inactive'}</Badge>},
-    {key:'actions',header:'',render:(p:any)=><div className="flex gap-1"><button onClick={()=>open(p)} className="p-1.5 rounded hover:bg-gray-100"><Edit size={14} className="text-gray-500"/></button><button onClick={()=>{setPlans(prev=>prev.filter(x=>x.id!==p.id));if(routePlans.find(rp=>rp.id===p.id))deleteRoutePlan(p.id);}} className="p-1.5 rounded hover:bg-gray-100"><Trash2 size={14} className="text-red-500"/></button></div>},
+    {key:'actions',header:'',render:(p:any)=><div className="flex gap-1"><button onClick={()=>open(p)} className="p-1.5 rounded hover:bg-gray-100"><Edit size={14} className="text-gray-500"/></button><button onClick={()=>{setPlans(prev=>prev.filter(x=>x.id!==p.id));if(routePlans.find(rp=>String(rp.id)===String(p.id)))deleteRoutePlan(p.id);}} className="p-1.5 rounded hover:bg-gray-100"><Trash2 size={14} className="text-red-500"/></button></div>},
   ];
-  return (<div className="space-y-6"><div className="flex items-center justify-between"><div><h1 className="text-2xl font-bold text-gray-800">Route Plans</h1><p className="text-gray-500 mt-1">Group routes - select all routes to assign</p></div><Button icon={<Plus size={18}/>} onClick={()=>open()}>Add Plan</Button></div><Card noPadding><Table columns={cols} data={plans} keyExtractor={p=>p.id}/></Card>
-    <Modal isOpen={showModal} onClose={()=>setShowModal(false)} title={editing?'Edit Route Plan':'Add Route Plan'} size="lg" footer={<div className="flex justify-end gap-3"><Button variant="secondary" onClick={()=>setShowModal(false)}>Cancel</Button><Button onClick={()=>{if(editing){setPlans(prev=>prev.map(p=>p.id===editing.id?{...p,name:form.name,route_ids:form.route_ids,is_default:form.is_default,active:form.active}:p));if(routePlans.find(rp=>rp.id===editing.id))updateRoutePlan(editing.id,{plan_name:form.name,route_ids:form.route_ids,is_default:form.is_default});}else{const nid=Date.now().toString();setPlans(prev=>[...prev,{...form,id:nid}]);addRoutePlan({plan_name:form.name,route_ids:form.route_ids,is_default:form.is_default});}setShowModal(false);}}>{editing?'Update':'Create'}</Button></div>}>
+  return (<div className="space-y-6"><div className="flex items-center justify-between"><div><h1 className="text-2xl font-bold text-gray-800">Route Plans</h1><p className="text-gray-500 mt-1">Group routes - select all routes to assign</p></div><Button icon={<Plus size={18}/>} onClick={()=>open()}>Add Plan</Button></div><Card noPadding><Table columns={cols} data={plans} keyExtractor={(p:any)=>String(p.id)}/></Card>
+    <Modal isOpen={showModal} onClose={()=>setShowModal(false)} title={editing?'Edit Route Plan':'Add Route Plan'} size="lg" footer={<div className="flex justify-end gap-3"><Button variant="secondary" onClick={()=>setShowModal(false)}>Cancel</Button><Button onClick={()=>{if(editing){setPlans(prev=>prev.map(p=>p.id===editing.id?{...p,name:form.name,route_ids:form.route_ids,is_default:form.is_default,active:form.active}:p));if(routePlans.find(rp=>String(rp.id)===String(editing.id)))updateRoutePlan(editing.id,{plan_name:form.name,route_ids:form.route_ids,is_default:form.is_default});}else{const nid=Date.now().toString();setPlans(prev=>[...prev,{...form,id:nid}]);addRoutePlan({plan_name:form.name,route_ids:form.route_ids,is_default:form.is_default});}setShowModal(false);}}>{editing?'Update':'Create'}</Button></div>}>
       <div className="space-y-4"><Input label="Plan Name" value={form.name} onChange={e=>setForm({...form,name:e.target.value})} required/>
         <div><label className="block text-sm font-medium text-gray-700 mb-3">Select Routes ({form.route_ids.length} selected)</label>
           <div className="grid grid-cols-2 gap-2 max-h-60 overflow-y-auto p-2 border border-gray-200 rounded-lg">
-            {allRoutes.map(route=><label key={route.id} className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${form.route_ids.includes(route.id)?'border-blue-500 bg-blue-50':'border-gray-200 hover:border-gray-300'}`}><input type="checkbox" checked={form.route_ids.includes(route.id)} onChange={()=>toggleRoute(route.id)} className="w-4 h-4 rounded border-gray-300 text-blue-600"/><div><p className="text-sm font-medium">{route.route_name}</p><p className="text-xs text-gray-500">{route.route_method} • {route.trunk_ids.length} trunks</p></div></label>)}</div></div>
+            {normalizedRoutes.map(route=><label key={route.id} className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${form.route_ids.includes(route.id)?'border-blue-500 bg-blue-50':'border-gray-200 hover:border-gray-300'}`}><input type="checkbox" checked={form.route_ids.includes(route.id)} onChange={()=>toggleRoute(route.id)} className="w-4 h-4 rounded border-gray-300 text-blue-600"/><div><p className="text-sm font-medium">{route.route_name}</p><p className="text-xs text-gray-500">{route.route_method} • {ensureArray(route.trunk_ids).length} trunks</p></div></label>)}</div></div>
         <label className="flex items-center gap-2"><input type="checkbox" checked={form.is_default} onChange={e=>setForm({...form,is_default:e.target.checked})} className="w-4 h-4 rounded"/><span className="text-sm">Default Plan</span></label>
         <label className="flex items-center gap-2"><input type="checkbox" checked={form.active} onChange={e=>setForm({...form,active:e.target.checked})} className="w-4 h-4 rounded"/><span className="text-sm">Active</span></label></div></Modal></div>);
 };
@@ -53,7 +76,7 @@ export const RateManagement: React.FC = () => {
   const itemsPerPage = 20;
   const filtered = allRates.filter(r => { const m = r.country.toLowerCase().includes(search.toLowerCase())||r.mcc.includes(search); const t = typeFilter==='all'||r.entity_type===typeFilter; return m&&t; });
   const totalPages = Math.ceil(filtered.length/itemsPerPage); const paginated = filtered.slice((currentPage-1)*itemsPerPage, currentPage*itemsPerPage);
-  const getName = (type:string, id:string) => { if(type==='client'){const c=clients.find(x=>x.id===id);return c?`${c.client_code} - ${c.company_name}`:'Unknown';} const s=suppliers.find(x=>x.id===id);return s?`${s.supplier_code} - ${s.company_name}`:'Unknown'; };
+  const getName = (type:string, id:string) => {    if(type==='client'){const c=clients.find(x=>x.id===id);return c?`${c.client_code} - ${c.company_name}`:'Unknown';} const s=suppliers.find(x=>x.id===id);return s?`${s.supplier_code} - ${s.company_name}`:'Unknown'; };
   const openModal = (rate?: Rate) => { if(rate){setEditingRate(rate);setFormData({entity_type:rate.entity_type,entity_id:rate.entity_id,mcc:rate.mcc,mnc:rate.mnc,country:rate.country,operator:rate.operator,rate:rate.rate,effective_from:rate.effective_from,effective_to:rate.effective_to||'',is_active:rate.is_active});}else{setEditingRate(null);setFormData({entity_type:'client',entity_id:'',mcc:'',mnc:'*',country:'',operator:'All',rate:0,effective_from:new Date().toISOString().split('T')[0],effective_to:'',is_active:true});}setShowModal(true); };
   const handleSubmit = () => { if(editingRate){if(editingRate.rate!==formData.rate&&editingRate.is_active){updateRate(editingRate.id,{is_active:false,effective_to:new Date().toISOString().split('T')[0]});addRate({...formData,currency:'EUR',entity_type:formData.entity_type,effective_to:null});}else{updateRate(editingRate.id,{...formData,currency:'EUR'});}}else{const existing=allRates.find(r=>r.entity_type===formData.entity_type&&r.entity_id===formData.entity_id&&r.mcc===formData.mcc&&r.mnc===formData.mnc&&r.is_active);if(existing){updateRate(existing.id,{is_active:false,effective_to:new Date().toISOString().split('T')[0]});}addRate({...formData,currency:'EUR',effective_to:formData.effective_to||null});}setShowModal(false); };
   const handleBulkAdd = () => { bulkText.trim().split('\n').forEach(line=>{const p=line.split(',').map(x=>x.trim());if(p.length>=7){const etype=p[0] as 'client'|'supplier',eid=p[1],mcc=p[2],mnc=p[3]||'*',country=p[4],operator=p[5]||'All',newRate=parseFloat(p[6])||0;const existing=allRates.find(r=>r.entity_type===etype&&r.entity_id===eid&&r.mcc===mcc&&r.mnc===mnc&&r.is_active);if(existing){updateRate(existing.id,{is_active:false,effective_to:new Date().toISOString().split('T')[0]});}addRate({entity_type:etype,entity_id:eid,mcc,mnc,country,operator,rate:newRate,currency:'EUR',effective_from:new Date().toISOString().split('T')[0],effective_to:null,is_active:true});}});setShowBulkModal(false);setBulkText(''); };
@@ -64,11 +87,11 @@ export const RateManagement: React.FC = () => {
     {key:'type',header:'Type',render:(r:Rate)=><Badge variant={r.entity_type==='client'?'info':'purple'}>{r.entity_type}</Badge>},
     {key:'entity',header:'Entity',render:(r:Rate)=><span className="text-sm font-medium">{getName(r.entity_type,r.entity_id)}</span>},
     {key:'dest',header:'Destination',render:(r:Rate)=><div><p className="font-medium">{r.country}</p><p className="text-xs text-gray-500">{r.operator}</p></div>},
-    {key:'rate',header:'Rate',align:'right' as const,render:(r:Rate)=><div className="text-right"><p className={`font-semibold ${r.is_active?'text-gray-800':'text-red-500 line-through'}`}>€{r.rate.toFixed(4)}</p></div>},
+    {key:'rate',header:'Rate',align:'right' as const,render:(r:Rate)=><div className="text-right"><p className={`font-semibold ${r.is_active?'text-gray-800':'text-red-500 line-through'}`}>€{Number(r.rate).toFixed(4)}</p></div>},
     {key:'status',header:'Status',render:(r:Rate)=><Badge variant={r.is_active?'success':'danger'} dot>{r.is_active?'Active':'Inactive'}</Badge>},
     {key:'actions',header:'',render:(r:Rate)=><div className="flex gap-1">{r.is_active&&<button onClick={e=>{e.stopPropagation();openModal(r);}} className="p-1.5 rounded hover:bg-gray-100"><Edit size={14} className="text-gray-500"/></button>}<button onClick={e=>{e.stopPropagation();deleteRate(r.id);}} className="p-1.5 rounded hover:bg-gray-100"><Trash2 size={14} className="text-red-500"/></button></div>},
   ];
-  return (<div className="space-y-6"><div className="flex items-center justify-between"><div><h1 className="text-2xl font-bold text-gray-800">Rate Management</h1><p className="text-gray-500 mt-1">All client & supplier rates with version control</p></div><div className="flex gap-2"><Button variant="secondary" icon={<Upload size={16}/>} onClick={()=>setShowBulkModal(true)}>Bulk Update</Button><Button variant="secondary" icon={<Download size={16}/>} onClick={()=>exportCSV('all_rates_export.csv',['type','entity','mcc','mnc','country','operator','rate','currency','effective_from','is_active'],filtered.map(r=>[r.entity_type,getName(r.entity_type,r.entity_id),r.mcc,r.mnc,r.country,r.operator,r.rate.toFixed(6),r.currency,r.effective_from,String(r.is_active)]))}>Export CSV</Button><Button icon={<Plus size={18}/>} onClick={()=>openModal()}>Add Rate</Button></div></div>
+  return (<div className="space-y-6"><div className="flex items-center justify-between"><div><h1 className="text-2xl font-bold text-gray-800">Rate Management</h1><p className="text-gray-500 mt-1">All client & supplier rates with version control</p></div><div className="flex gap-2"><Button variant="secondary" icon={<Upload size={16}/>} onClick={()=>setShowBulkModal(true)}>Bulk Update</Button><Button variant="secondary" icon={<Download size={16}/>} onClick={()=>exportCSV('all_rates_export.csv',['type','entity','mcc','mnc','country','operator','rate','currency','effective_from','is_active'],filtered.map(r=>[r.entity_type,getName(r.entity_type,r.entity_id),r.mcc,r.mnc,r.country,r.operator,Number(r.rate).toFixed(6),r.currency,r.effective_from,String(r.is_active)]))}>Export CSV</Button><Button icon={<Plus size={18}/>} onClick={()=>openModal()}>Add Rate</Button></div></div>
     {selectedRates.length>0&&<div className="bg-blue-50 border border-blue-200 rounded-lg p-3 flex items-center justify-between"><span className="text-blue-700 font-medium text-sm">{selectedRates.length} selected</span><Button size="sm" variant="danger" icon={<Trash2 size={14}/>} onClick={handleBulkDelete}>Delete Selected</Button></div>}
     <Card><div className="flex flex-col md:flex-row gap-3"><div className="flex-1 relative"><SearchIcon size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"/><input type="text" placeholder="Search all rates..." value={search} onChange={e=>setSearch(e.target.value)} className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"/></div><select value={typeFilter} onChange={e=>setTypeFilter(e.target.value)} className="px-4 py-2 border border-gray-300 rounded-lg text-sm"><option value="all">All Types</option><option value="client">Client</option><option value="supplier">Supplier</option></select></div></Card>
     <Card noPadding><Table columns={cols} data={paginated} keyExtractor={r=>r.id}/><Pagination currentPage={currentPage} totalPages={totalPages} onPageChange={setCurrentPage} totalItems={filtered.length} itemsPerPage={itemsPerPage}/></Card>
@@ -104,17 +127,27 @@ export const BillingOverview: React.FC = () => {
 
 // ==================== PAYMENTS ====================
 export const PaymentsPage: React.FC = () => {
-  const { payments, clients, suppliers } = useData();
-  const getName = (type:string, id:string) => type==='client'?(clients.find(c=>c.id===id)?.company_name||'Unknown'):(suppliers.find(s=>s.id===id)?.company_name||'Unknown');
+  const { payments, clients } = useData();    const getName = (type:string, id:string) => type==='client'?(clients.find(c=>c.id===id)?.company_name||'Unknown'):'Unknown';
   const cols = [{key:'number',header:'Payment #',render:(p:any)=><span className="font-mono text-xs">{p.payment_number||'N/A'}</span>},{key:'entity',header:'Entity',render:(p:any)=><div><p className="font-medium text-sm">{p.entity_name||getName(p.entity_type,p.entity_id)}</p><Badge variant={p.entity_type==='client'?'info':'purple'} size="sm">{p.entity_type}</Badge></div>},{key:'amount',header:'Amount',align:'right' as const,render:(p:any)=><span className="font-semibold">€{(p.amount||0).toLocaleString()}</span>},{key:'method',header:'Method',render:(p:any)=><span className="text-sm">{p.payment_method}</span>},{key:'ref',header:'Reference',render:(p:any)=><span className="font-mono text-[10px]">{p.reference||'-'}</span>},{key:'date',header:'Date',render:(p:any)=><span className="text-xs">{new Date(p.created_at).toLocaleDateString()}</span>},{key:'status',header:'Status',render:(p:any)=><Badge variant={p.status==='completed'?'success':'warning'} size="sm">{p.status}</Badge>}];
-  const [search, setSearch] = useState(''); const filtered = payments.filter((p:any)=>p.entity_name?.toLowerCase().includes(search.toLowerCase())||p.payment_number?.toLowerCase().includes(search.toLowerCase()));
-  return (<div className="space-y-6"><div className="flex items-center justify-between"><div><h1 className="text-2xl font-bold text-gray-800">Payments</h1><p className="text-gray-500 mt-1">{payments.length} transactions from database</p></div></div>
-    <Card title="Payment History" noPadding><div className="p-3"><div className="relative"><SearchIcon size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"/><input type="text" placeholder="Search payments..." value={search} onChange={e=>setSearch(e.target.value)} className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg text-sm"/></div></div><Table columns={cols} data={filtered} keyExtractor={(p:any)=>p.id}/></Card></div>);
+  const [search, setSearch] = useState(''); const [showDeleted, setShowDeleted] = useState(false); const [deletedPayments, setDeletedPayments] = useState<any[]>([]);
+  const allPayments = showDeleted && deletedPayments.length > 0 ? deletedPayments : payments;
+  const handleToggleDeleted = async (checked: boolean) => {
+    setShowDeleted(checked);
+    if (checked && deletedPayments.length === 0) {
+      try {
+        const res = await api.get<any[]>('/payments?include_deleted=true');
+        if (res.success && (res.data as any).data) { setDeletedPayments((res.data as any).data); }
+      } catch (e) { console.error('Failed to fetch deleted payments:', e); }
+    }
+  };
+  const filtered = allPayments.filter((p:any)=>p.entity_name?.toLowerCase().includes(search.toLowerCase())||p.payment_number?.toLowerCase().includes(search.toLowerCase()));
+  return (<div className="space-y-6"><div className="flex items-center justify-between"><div><h1 className="text-2xl font-bold text-gray-800">Payments</h1><p className="text-gray-500 mt-1">{allPayments.length} transactions from database</p></div></div>
+    <Card title="Payment History" noPadding><div className="p-3 flex items-center gap-3"><div className="relative flex-1"><SearchIcon size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"/><input type="text" placeholder="Search payments..." value={search} onChange={e=>setSearch(e.target.value)} className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg text-sm"/></div><label className="flex items-center gap-2 px-3 py-2 border rounded-lg text-sm cursor-pointer select-none"><input type="checkbox" checked={showDeleted} onChange={(e) => handleToggleDeleted(e.target.checked)} className="w-4 h-4 rounded border-gray-300 text-blue-600" /><span>Show Deleted</span></label></div><Table columns={cols} data={filtered} keyExtractor={(p:any)=>p.id}/></Card></div>);
 };
 
 // ==================== REPORTS - Real data only ====================
 export const RealtimeReport: React.FC = () => {
-  const { smsLogs, clients, suppliers } = useData();
+  const { smsLogs, clients } = useData();
   const total = smsLogs.length; const delivered = smsLogs.filter(l=>l.status==='delivered').length;
   const failed = smsLogs.filter(l=>l.status==='failed').length;
   const chartData = Array.from({length:60},(_,i)=>({time:`${String(Math.floor(i/60)).padStart(2,'0')}:${String(i%60).padStart(2,'0')}`,sms:smsLogs.filter(l=>{const d=new Date(l.submit_time);return d.getMinutes()===i%60&&d.getHours()===Math.floor(i/60);}).length||Math.floor(Math.random()*50+10)}));
@@ -147,7 +180,7 @@ export const MonthlyReport: React.FC = () => {
 
 // ==================== CAMPAIGNS ====================
 export const CampaignsPage: React.FC = () => {
-  const { campaigns, clients, routePlans } = useData();
+  const { campaigns, clients } = useData();
   const getClientName=(id:string)=>clients.find(c=>c.id===id)?.company_name||'Self';
   const cols=[
     {key:'name',header:'Campaign',render:(c:any)=><div><p className="font-medium">{c.campaign_name}</p><p className="text-xs text-gray-500">{getClientName(c.client_id)}</p></div>},
@@ -161,13 +194,13 @@ export const CampaignsPage: React.FC = () => {
 
 // ==================== ALERTS ====================
 export const AlertsPage: React.FC = () => {
-  const { smsLogs, clients, suppliers, invoices, payments, notifications } = useData();
+  const { smsLogs, clients, suppliers, invoices, payments } = useData();
   const allAlerts: {id:string;title:string;msg:string;type:'error'|'warning'|'info'|'success';time:string;read:boolean}[] = [];
   // Consecutive failures
   let cons=0; for(let i=smsLogs.length-1;i>=0;i--){if(smsLogs[i].status==='failed')cons++;else break;}
   if(cons>=15) allAlerts.push({id:'fail',title:'DLR Failure Alert',msg:`${cons} consecutive SMS failures`,type:'error',time:new Date().toLocaleTimeString(),read:false});
   // Low balance
-  clients.filter(c=>((c.balance||0)+(c.credit_limit||0))<100&&c.status==='active').forEach(c=>allAlerts.push({id:`lb${c.id}`,title:'Low Balance Alert',msg:`${c.company_name} (${c.client_code}) — €${(c.balance||0).toFixed(2)}`,type:'warning',time:new Date().toLocaleTimeString(),read:false}));
+  clients.filter(c=>((c.balance||0)+(c.credit_limit||0))<100&&c.status==='active').forEach(c=>allAlerts.push({id:`lb${c.id}`,title:'Low Balance Alert',msg:`${c.company_name} (${c.client_code}) — €${Number(c.balance||0).toFixed(2)}`,type:'warning',time:new Date().toLocaleTimeString(),read:false}));
   // Blocked suppliers
   suppliers.filter(s=>s.consecutive_failures>=20).forEach(s=>allAlerts.push({id:`bd${s.id}`,title:'Channel Disconnect',msg:`${s.company_name} (${s.supplier_code}) — ${s.consecutive_failures} failures`,type:'error',time:new Date().toLocaleTimeString(),read:false}));
   // Invoices
@@ -183,8 +216,7 @@ export const AlertsPage: React.FC = () => {
 
 // ==================== USER MANAGEMENT ====================
 export const UsersPage: React.FC = () => {
-  const { user: currentUser } = useAuth();
-  const isSuper = currentUser?.role==='super_admin';
+  const { user: _currentUser } = useAuth();
   const [users] = useState([{id:'1',username:'admin',email:'admin@net2app.com',role:'super_admin',active:true},{id:'2',username:'support',email:'support@net2app.com',role:'support',active:true},{id:'3',username:'billing',email:'billing@net2app.com',role:'billing',active:true}]);
   const cols=[{key:'user',header:'User',render:(u:any)=><div className="flex items-center gap-3"><div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center text-white text-xs font-bold">{u.username[0].toUpperCase()}</div><div><p className="font-medium">{u.username}</p><p className="text-xs text-gray-500">{u.email}</p></div></div>},{key:'role',header:'Role',render:(u:any)=><Badge variant="info">{roleLabels[u.role]||u.role}</Badge>},{key:'active',header:'Status',render:(u:any)=><Badge variant={u.active?'success':'danger'} dot>{u.active?'Active':'Inactive'}</Badge>}];
   return (<div className="space-y-6"><div className="flex items-center justify-between"><div><h1 className="text-2xl font-bold text-gray-800">User Management</h1><p className="text-gray-500 mt-1">Navigate to Users menu for full management</p></div></div><Card noPadding><Table columns={cols} data={users} keyExtractor={(u:any)=>u.id}/></Card></div>);
@@ -201,9 +233,8 @@ export const PlatformSettings: React.FC = () => {
   const { platformSettings, updatePlatformSetting, smtpConfig, updateSMTPConfig } = useData();
   const [smtp, setSMTP] = useState(smtpConfig||{host:'',port:587,encryption:'tls',username:'',password:'',from_email:'',from_name:''});
   const [bank, setBank] = useState({bank_name:'',bank_account:'',bank_iban:'',bank_bic:'',bank_swift:'',bank_address:'',beneficiary_name:''});
-  const [saving, setSaving] = useState(false);
-  const update=(k:string,v:any)=>updatePlatformSetting(k,v);
-  const handleSave = async () => { setSaving(true); await new Promise(r=>setTimeout(r,500)); updateSMTPConfig(smtp); setSaving(false); alert('Settings saved!'); };
+  const [saving, setSaving] = useState(false);    const update=(k:string,v:any)=>updatePlatformSetting(k,v);
+  const handleSave = async () => { setSaving(true); await new Promise((r:any)=>setTimeout(r,500)); updateSMTPConfig(smtp); setSaving(false); alert('Settings saved!'); };
   return (<div className="space-y-6"><div className="flex items-center justify-between"><div><h1 className="text-2xl font-bold text-gray-800">Platform Settings</h1><p className="text-gray-500 mt-1">Platform, Company, SMTP & Bank details for invoices</p></div><Button onClick={handleSave} loading={saving}>Save All Settings</Button></div>
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
       <Card title="Platform & Company Information"><div className="space-y-3">
@@ -217,17 +248,17 @@ export const PlatformSettings: React.FC = () => {
         <Input label="VAT Number" value={platformSettings.company_vat||''} onChange={e=>update('company_vat',e.target.value)}/>
       </div></Card>
       <Card title="SMTP Settings"><div className="space-y-3">
-        <div className="grid grid-cols-2 gap-3"><Input label="SMTP Host" value={smtp.host||''} onChange={e=>setSMTP(p=>({...p,host:e.target.value}))} placeholder="smtp.gmail.com"/><Input label="Port" type="number" value={smtp.port||587} onChange={e=>setSMTP(p=>({...p,port:parseInt(e.target.value)}))}/></div>
-        <div className="grid grid-cols-2 gap-3"><Input label="Username" value={smtp.username||''} onChange={e=>setSMTP(p=>({...p,username:e.target.value}))}/><Input label="Password" type="password" value={smtp.password||''} onChange={e=>setSMTP(p=>({...p,password:e.target.value}))}/></div>
-        <div className="grid grid-cols-2 gap-3"><Input label="From Email" value={smtp.from_email||''} onChange={e=>setSMTP(p=>({...p,from_email:e.target.value}))}/><Input label="From Name" value={smtp.from_name||''} onChange={e=>setSMTP(p=>({...p,from_name:e.target.value}))}/></div>
+        <div className="grid grid-cols-2 gap-3"><Input label="SMTP Host" value={smtp.host||''}  onChange={e=>setSMTP((p: any)=>({...p,host:e.target.value}))} placeholder="smtp.gmail.com"/><Input label="Port" type="number" value={smtp.port||587} onChange={e=>setSMTP((p: any)=>({...p,port:parseInt(e.target.value)}))}/></div>
+        <div className="grid grid-cols-2 gap-3"><Input label="Username" value={smtp.username||''} onChange={e=>setSMTP((p: any)=>({...p,username:e.target.value}))}/><Input label="Password" type="password" value={smtp.password||''} onChange={e=>setSMTP((p: any)=>({...p,password:e.target.value}))}/></div>
+        <div className="grid grid-cols-2 gap-3"><Input label="From Email" value={smtp.from_email||''} onChange={e=>setSMTP((p: any)=>({...p,from_email:e.target.value}))}/><Input label="From Name" value={smtp.from_name||''} onChange={e=>setSMTP((p: any)=>({...p,from_name:e.target.value}))}/></div>
         <div className="bg-blue-50 p-3 rounded-lg text-xs text-blue-700"><strong>Common SMTP:</strong> Gmail: smtp.gmail.com:587 (TLS) | Outlook: smtp.office365.com:587 | SendGrid: smtp.sendgrid.net:587 | Custom: any SMTP server</div>
       </div></Card>
       <Card title="Bank Details (For Invoices)" subtitle="These bank details appear at the bottom of every invoice PDF">
         <div className="space-y-3">
-          <div className="grid grid-cols-2 gap-3"><Input label="Bank Name" value={bank.bank_name} onChange={e=>setBank(p=>({...p,bank_name:e.target.value}))} placeholder="HSBC Bank"/><Input label="Account Number" value={bank.bank_account} onChange={e=>setBank(p=>({...p,bank_account:e.target.value}))}/></div>
-          <div className="grid grid-cols-2 gap-3"><Input label="IBAN" value={bank.bank_iban} onChange={e=>setBank(p=>({...p,bank_iban:e.target.value}))} placeholder="GB00XXXX00000000000000"/><Input label="BIC/SWIFT" value={bank.bank_bic} onChange={e=>setBank(p=>({...p,bank_bic:e.target.value}))} placeholder="HSBCGB2L"/></div>
-          <Input label="Beneficiary Name" value={bank.beneficiary_name} onChange={e=>setBank(p=>({...p,beneficiary_name:e.target.value}))} placeholder="NET2APP Technologies Ltd"/>
-          <Input label="Bank Address" value={bank.bank_address} onChange={e=>setBank(p=>({...p,bank_address:e.target.value}))}/>
+          <div className="grid grid-cols-2 gap-3"><Input label="Bank Name" value={bank.bank_name} onChange={e=>setBank((p: any)=>({...p,bank_name:e.target.value}))} placeholder="HSBC Bank"/><Input label="Account Number" value={bank.bank_account} onChange={e=>setBank((p: any)=>({...p,bank_account:e.target.value}))}/></div>
+          <div className="grid grid-cols-2 gap-3"><Input label="IBAN" value={bank.bank_iban} onChange={e=>setBank((p: any)=>({...p,bank_iban:e.target.value}))} placeholder="GB00XXXX00000000000000"/><Input label="BIC/SWIFT" value={bank.bank_bic} onChange={e=>setBank((p: any)=>({...p,bank_bic:e.target.value}))} placeholder="HSBCGB2L"/></div>
+          <Input label="Beneficiary Name" value={bank.beneficiary_name} onChange={e=>setBank((p: any)=>({...p,beneficiary_name:e.target.value}))} placeholder="NET2APP Technologies Ltd"/>
+          <Input label="Bank Address" value={bank.bank_address} onChange={e=>setBank((p: any)=>({...p,bank_address:e.target.value}))}/>
         </div>
       </Card>
       <Card title="Tax & Invoice Settings"><div className="space-y-3">
@@ -271,4 +302,133 @@ export const TestHTTPAPI: React.FC = () => {
   const [form, setForm] = useState({url:'https://api.example.com/sms/send',method:'POST',body:'{"to":"+1234567890","from":"NET2APP","text":"Test SMS"}'}); const [response, setResponse] = useState<string|null>(null);
   return (<div className="space-y-6"><div className="flex items-center justify-between"><div><h1 className="text-2xl font-bold text-gray-800">Test HTTP API</h1><p className="text-gray-500 mt-1">Test HTTP connections</p></div></div>
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-6"><Card title="Request"><div className="space-y-4"><Input label="URL" value={form.url} onChange={e=>setForm({...form,url:e.target.value})}/><Select label="Method" value={form.method} onChange={e=>setForm({...form,method:e.target.value})} options={[{value:'POST',label:'POST'},{value:'GET',label:'GET'}]}/><Textarea label="Body" value={form.body} onChange={e=>setForm({...form,body:e.target.value})} rows={8}/><Button onClick={async()=>{await new Promise(r=>setTimeout(r,1500));setResponse(JSON.stringify({status:'sent',message_id:'MSG'+Date.now(),timestamp:new Date().toISOString()},null,2));}} icon={<Send size={16}/>}>Send Request</Button></div></Card><Card title="Response">{response?<pre className="bg-gray-50 p-4 rounded-lg text-sm font-mono overflow-x-auto">{response}</pre>:<div className="text-center py-12 text-gray-500"><p>Send a request to see response</p></div>}</Card></div></div>);
+};
+
+
+// ============================================================
+// API DOCUMENTATION - Complete REST API Reference
+// ============================================================
+export const ApiDocs: React.FC = () => {
+  const { user } = useAuth();
+  const [search, setSearch] = useState('');
+  const [activeModule, setActiveModule] = useState<string | null>(null);
+
+  // Build flat endpoint list
+  const allEndpoints = useMemo(() => {
+    const result: { module: string; key: string; method: string; path: string; desc: string }[] = [];
+    for (const [module, endpoints] of Object.entries(API_ENDPOINTS)) {
+      for (const [key, ep] of Object.entries(endpoints as any)) {
+        result.push({ module, key, method: (ep as any).method, path: (ep as any).path, desc: (ep as any).desc });
+      }
+    }
+    return result;
+  }, []);
+
+  const filtered = useMemo(() => {
+    let items = allEndpoints;
+    if (activeModule) items = items.filter(e => e.module === activeModule);
+    if (search) {
+      const q = search.toLowerCase();
+      items = items.filter(e => e.path.toLowerCase().includes(q) || e.desc.toLowerCase().includes(q) || e.key.toLowerCase().includes(q));
+    }
+    return items;
+  }, [allEndpoints, activeModule, search]);
+
+  const modules = useMemo(() => [...new Set(allEndpoints.map(e => e.module))].sort(), [allEndpoints]);
+
+  const methodColor = (m: string) => {
+    switch (m) {
+      case 'GET': return 'bg-green-100 text-green-700';
+      case 'POST': return 'bg-blue-100 text-blue-700';
+      case 'PUT': return 'bg-yellow-100 text-yellow-700';
+      case 'DELETE': return 'bg-red-100 text-red-700';
+      default: return 'bg-gray-100 text-gray-700';
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-800">API Documentation</h1>
+          <p className="text-gray-500 mt-1">Complete REST API reference — {allEndpoints.length} endpoints across {modules.length} modules</p>
+        </div>
+      </div>
+
+      {/* Quick Info */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <div className="bg-white rounded-xl p-3 border text-center"><p className="text-xs text-gray-500">Base URL</p><p className="text-sm font-mono font-bold text-blue-600">/api</p></div>
+        <div className="bg-white rounded-xl p-3 border text-center"><p className="text-xs text-gray-500">Auth</p><p className="text-sm font-bold text-gray-800">Bearer Token (JWT)</p></div>
+        <div className="bg-white rounded-xl p-3 border text-center"><p className="text-xs text-gray-500">Content-Type</p><p className="text-sm font-mono text-gray-600">application/json</p></div>
+        <div className="bg-white rounded-xl p-3 border text-center"><p className="text-xs text-gray-500">Endpoints</p><p className="text-xl font-bold text-blue-600">{allEndpoints.length}</p></div>
+      </div>
+
+      {/* Auth Header Example */}
+      <Card title="Authentication">
+        <div className="bg-gray-900 rounded-lg p-4 font-mono text-sm text-green-400 overflow-x-auto">
+          <div><span className="text-yellow-400">POST</span> /api/auth/login</div>
+          <div className="text-gray-500 mt-1">Content-Type: application/json</div>
+          <div className="mt-2">{'{'}</div>
+          <div className="ml-4"><span className="text-blue-300">"username"</span>: <span className="text-orange-300">"admin"</span>,</div>
+          <div className="ml-4"><span className="text-blue-300">"password"</span>: <span className="text-orange-300">"admin123"</span></div>
+          <div>{'}'}</div>
+          <div className="text-gray-500 mt-2">→ Response: {'{'} "success": true, "token": "eyJ...", "user": {'{...}'} {'}'}</div>
+          <div className="mt-3"><span className="text-gray-500">// All other endpoints:</span></div>
+          <div>Authorization: Bearer &lt;token&gt;</div>
+        </div>
+      </Card>
+
+      {/* Module Filter */}
+      <div className="flex flex-wrap gap-2 items-center">
+        <button onClick={() => setActiveModule(null)} className={`px-3 py-1.5 rounded-lg text-xs font-medium transition ${!activeModule ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}>ALL</button>
+        {modules.map(m => (
+          <button key={m} onClick={() => setActiveModule(m === activeModule ? null : m)} className={`px-3 py-1.5 rounded-lg text-xs font-medium transition ${m === activeModule ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}>{m}</button>
+        ))}
+        <input type="text" placeholder="Search endpoints..." value={search} onChange={e => setSearch(e.target.value)} className="ml-auto px-3 py-1.5 border rounded-lg text-sm w-48" />
+      </div>
+
+      {/* Endpoints Table */}
+      <Card title={`${activeModule || 'All'} Endpoints (${filtered.length})`} noPadding>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-left text-xs text-gray-500 border-b bg-gray-50">
+                <th className="py-2 px-4 w-16">Method</th>
+                <th className="py-2 px-4">Path</th>
+                <th className="py-2 px-4">Description</th>
+                <th className="py-2 px-4 w-32">Module</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((ep, i) => (
+                <tr key={`${ep.module}-${ep.key}`} className="border-b border-gray-100 hover:bg-gray-50 transition-colors">
+                  <td className="py-2 px-4"><span className={`px-2 py-0.5 rounded text-xs font-mono font-bold ${methodColor(ep.method)}`}>{ep.method}</span></td>
+                  <td className="py-2 px-4 font-mono text-xs text-gray-700">{API_BASE}{ep.path}</td>
+                  <td className="py-2 px-4 text-gray-600">{ep.desc}</td>
+                  <td className="py-2 px-4"><Badge variant="default" size="sm">{ep.module}</Badge></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {filtered.length === 0 && <p className="text-gray-500 text-sm text-center py-8">No endpoints found matching your search.</p>}
+        </div>
+      </Card>
+
+      {/* SMS Send Example */}
+      <Card title="SMS Send — Full Example">
+        <div className="bg-gray-900 rounded-lg p-4 font-mono text-sm text-green-400 overflow-x-auto">
+          <div><span className="text-yellow-400">POST</span> /api/sms/send</div>
+          <div className="text-gray-500">Authorization: Bearer eyJhbGci...</div>
+          <div className="text-gray-500">Content-Type: application/json</div>
+          <div className="mt-2">{'{'}</div>
+          <div className="ml-4"><span className="text-blue-300">"client_id"</span>: <span className="text-orange-300">4</span>,</div>
+          <div className="ml-4"><span className="text-blue-300">"destination"</span>: <span className="text-orange-300">"8801615069178"</span>,</div>
+          <div className="ml-4"><span className="text-blue-300">"sender_id"</span>: <span className="text-orange-300">"Net2App"</span>,</div>
+          <div className="ml-4"><span className="text-blue-300">"message"</span>: <span className="text-orange-300">"হেয়ার কেয়ার কোড 12536"</span></div>
+          <div>{'}'}</div>
+          <div className="text-gray-500 mt-2">→ {'{'} "success": true, "data": {'{'} "message_id": "MSG...", "status": "queued" {'}'} {'}'}</div>
+        </div>
+      </Card>
+    </div>
+  );
 };

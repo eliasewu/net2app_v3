@@ -117,18 +117,7 @@ export const API_ENDPOINTS = {
     PLAN_UPDATE:         { method: 'PUT',    path: '/routing/plans/:id', desc: 'Update route plan' },
     PLAN_DELETE:         { method: 'DELETE', path: '/routing/plans/:id', desc: 'Delete route plan' },
     
-    // Route Maps
-    MAPS_LIST:           { method: 'GET',    path: '/routing/maps',      desc: 'List all route maps' },
-    MAPS_BY_CLIENT:      { method: 'GET',    path: '/routing/maps/client/:id', desc: 'Get route maps by client' },
-    MAP_CREATE:          { method: 'POST',   path: '/routing/maps',      desc: 'Create route map' },
-    MAP_UPDATE:          { method: 'PUT',    path: '/routing/maps/:id',  desc: 'Update route map' },
-    MAP_DELETE:          { method: 'DELETE', path: '/routing/maps/:id',  desc: 'Delete route map' },
-  },
-
-  // ============================================================
-  // RATES
-  // ============================================================
-  RATES: {
+    // Route Plans {
     LIST:                { method: 'GET',    path: '/rates',             desc: 'List all rates' },
     CLIENT_RATES:        { method: 'GET',    path: '/rates/client/:id',  desc: 'Get client rates' },
     SUPPLIER_RATES:      { method: 'GET',    path: '/rates/supplier/:id', desc: 'Get supplier rates' },

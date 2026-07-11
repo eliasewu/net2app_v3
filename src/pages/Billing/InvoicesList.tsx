@@ -8,27 +8,45 @@ import { Table, Pagination } from '../../components/UI/Table';
 import { Modal } from '../../components/UI/Modal';
 import { Input, Select } from '../../components/UI/Input';
 import { Invoice } from '../../types';
+import { api } from '../../services/api';
 
 export const InvoicesList: React.FC = () => {
-  const { invoices, clients, suppliers, addInvoice, updateInvoice } = useData();
+  const { invoices, clients, suppliers, updateInvoice } = useData();
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('all');
   const [typeFilter, setTypeFilter] = useState<string>('all');
   const [currentPage, setCurrentPage] = useState(1);
   const [showModal, setShowModal] = useState(false);
   const [viewModal, setViewModal] = useState<Invoice | null>(null);
+  const [showDeleted, setShowDeleted] = useState(false);
+  const [deletedInvoices, setDeletedInvoices] = useState<Invoice[]>([]);
+  const [generating, setGenerating] = useState(false);
 
   const [formData, setFormData] = useState({
     entity_type: 'client' as 'client' | 'supplier',
     entity_id: '',
-    period_start: '',
-    period_end: '',
+    period_start: new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().split('T')[0],
+    period_end: new Date().toISOString().split('T')[0],
     notes: '',
   });
 
   const itemsPerPage = 10;
 
-  const filteredInvoices = invoices.filter(invoice => {
+  const allInvoices = showDeleted && deletedInvoices.length > 0 ? deletedInvoices : invoices;
+
+  const handleToggleDeleted = async (checked: boolean) => {
+    setShowDeleted(checked);
+    if (checked && deletedInvoices.length === 0) {
+      try {
+        const res = await api.get<any[]>('/invoices?include_deleted=true');
+        if (res.success && (res.data as any).data) {
+          setDeletedInvoices((res.data as any).data);
+        }
+      } catch (e) { console.error('Failed to fetch deleted invoices:', e); }
+    }
+  };
+
+  const filteredInvoices = allInvoices.filter(invoice => {
     const matchesSearch = 
       invoice.invoice_number.toLowerCase().includes(search.toLowerCase()) ||
       invoice.entity_name.toLowerCase().includes(search.toLowerCase());
@@ -54,41 +72,47 @@ export const InvoicesList: React.FC = () => {
     return <Badge variant={statusMap[status] || 'default'}>{status}</Badge>;
   };
 
-  const handleCreateInvoice = () => {
-    const entity = formData.entity_type === 'client' 
-      ? clients.find(c => c.id === formData.entity_id)
-      : suppliers.find(s => s.id === formData.entity_id);
+  const handleCreateInvoice = async () => {
+    setGenerating(true);
+    try {
+      const entity = formData.entity_type === 'client' 
+        ? clients.find(c => c.id === formData.entity_id)
+        : suppliers.find(s => s.id === formData.entity_id);
+      if (!entity) { alert('Please select an entity'); setGenerating(false); return; }
 
-    if (!entity) return;
+      // Call real invoice generation endpoint (uses real SMS log data)
+      const res = await api.post<any>('/invoices/generate', {
+        entity_type: formData.entity_type,
+        entity_id: formData.entity_id,
+        period_start: formData.period_start,
+        period_end: formData.period_end,
+        notes: formData.notes || undefined,
+      });
 
-    const invoiceNumber = `INV-${new Date().getFullYear()}-${String(invoices.length + 1).padStart(3, '0')}`;
-    
-    addInvoice({
-      invoice_number: invoiceNumber,
-      entity_type: formData.entity_type,
-      entity_id: formData.entity_id,
-      entity_name: entity.company_name,
-      period_start: formData.period_start,
-      period_end: formData.period_end,
-      total_sms: Math.floor(Math.random() * 100000 + 10000),
-      total_amount: Math.floor(Math.random() * 5000 + 1000),
-      tax_amount: Math.floor(Math.random() * 1000),
-      grand_total: Math.floor(Math.random() * 6000 + 1500),
-      currency: 'EUR',
-      status: 'draft',
-      due_date: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
-      paid_date: null,
-      notes: formData.notes,
-    });
+      if (!res.success || !res.data?.data) {
+        alert(res.error || 'Failed to generate invoice. Check if SMS data exists for this period.');
+        setGenerating(false);
+        return;
+      }
 
-    setShowModal(false);
-    setFormData({
-      entity_type: 'client',
-      entity_id: '',
-      period_start: '',
-      period_end: '',
-      notes: '',
-    });
+      setShowModal(false);
+      setFormData({
+        entity_type: 'client',
+        entity_id: '',
+        period_start: new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().split('T')[0],
+        period_end: new Date().toISOString().split('T')[0],
+        notes: '',
+      });
+      // Refresh invoice list
+      const listRes = await api.get<any>('/invoices');
+      if (listRes.success && (listRes.data as any)?.data) {
+        // DataContext will refresh on next render; or we can set directly
+      }
+    } catch (e: any) {
+      alert('Error: ' + (e.message || 'Failed to generate invoice'));
+    } finally {
+      setGenerating(false);
+    }
   };
 
   const columns = [
@@ -203,10 +227,10 @@ export const InvoicesList: React.FC = () => {
   ];
 
   const stats = {
-    total: invoices.reduce((sum, i) => sum + i.grand_total, 0),
-    paid: invoices.filter(i => i.status === 'paid').reduce((sum, i) => sum + i.grand_total, 0),
-    pending: invoices.filter(i => ['draft', 'sent'].includes(i.status)).reduce((sum, i) => sum + i.grand_total, 0),
-    overdue: invoices.filter(i => i.status === 'overdue').reduce((sum, i) => sum + i.grand_total, 0),
+    total: allInvoices.reduce((sum, i) => sum + i.grand_total, 0),
+    paid: allInvoices.filter(i => i.status === 'paid').reduce((sum, i) => sum + i.grand_total, 0),
+    pending: allInvoices.filter(i => ['draft', 'sent'].includes(i.status)).reduce((sum, i) => sum + i.grand_total, 0),
+    overdue: allInvoices.filter(i => i.status === 'overdue').reduce((sum, i) => sum + i.grand_total, 0),
   };
 
   return (
@@ -217,7 +241,7 @@ export const InvoicesList: React.FC = () => {
           <h1 className="text-2xl font-bold text-gray-800">Invoices</h1>
           <p className="text-gray-500 mt-1">Generate and manage invoices for clients and suppliers</p>
         </div>
-        <Button icon={<Plus size={18} />} onClick={() => setShowModal(true)}>
+        <Button icon={<Plus size={18} />} onClick={() => setShowModal(true)} loading={generating}>
           Generate Invoice
         </Button>
       </div>
@@ -276,6 +300,7 @@ export const InvoicesList: React.FC = () => {
               <option value="paid">Paid</option>
               <option value="overdue">Overdue</option>
             </select>
+            <label className="flex items-center gap-2 px-3 py-2 border rounded-lg text-sm cursor-pointer select-none"><input type="checkbox" checked={showDeleted} onChange={(e) => handleToggleDeleted(e.target.checked)} className="w-4 h-4 rounded border-gray-300 text-blue-600" /><span>Show Deleted</span></label>
           </div>
         </div>
       </Card>
@@ -305,7 +330,7 @@ export const InvoicesList: React.FC = () => {
         footer={
           <div className="flex justify-end gap-3">
             <Button variant="secondary" onClick={() => setShowModal(false)}>Cancel</Button>
-            <Button onClick={handleCreateInvoice}>Generate Invoice</Button>
+            <Button onClick={handleCreateInvoice} loading={generating}>Generate Invoice</Button>
           </div>
         }
       >

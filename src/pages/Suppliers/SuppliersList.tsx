@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { Plus, Search, Download, MoreVertical, Edit, Trash2, Eye, Wifi, WifiOff } from 'lucide-react';
+import { Plus, Search, Download, Upload, MoreVertical, Edit, Trash2, Eye, Wifi, WifiOff, RotateCcw } from 'lucide-react';
 import { useData } from '../../store/DataContext';
 import { Card } from '../../components/UI/Card';
 import { Button } from '../../components/UI/Button';
@@ -11,9 +11,11 @@ import { Supplier } from '../../types';
 
 export const SuppliersList: React.FC = () => {
   const navigate = useNavigate();
-  const { suppliers, deleteSupplier } = useData();
+  const { suppliers, deleteSupplier, restoreSupplier } = useData();
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('all');
+  const [showDeleted, setShowDeleted] = useState(false);
   const [typeFilter, setTypeFilter] = useState<string>('all');
   const [currentPage, setCurrentPage] = useState(1);
   const [deleteModal, setDeleteModal] = useState<Supplier | null>(null);
@@ -22,6 +24,7 @@ export const SuppliersList: React.FC = () => {
   const itemsPerPage = 10;
 
   const filteredSuppliers = suppliers.filter(supplier => {
+    if (!showDeleted && supplier.is_deleted) return false;
     const matchesSearch = 
       supplier.company_name.toLowerCase().includes(search.toLowerCase()) ||
       supplier.supplier_code.toLowerCase().includes(search.toLowerCase()) ||
@@ -36,6 +39,51 @@ export const SuppliersList: React.FC = () => {
     (currentPage - 1) * itemsPerPage,
     currentPage * itemsPerPage
   );
+
+  const handleExport = () => {
+    const headers = ['id','supplier_code','company_name','contact_person','email','phone',
+      'connection_type','smpp_host','smpp_port','smpp_username','smpp_password','system_id',
+      'smpp_version','smpp_system_type','smpp_bind_type','smpp_addr_ton','smpp_addr_npi','smpp_addr_range',
+      'is_inbound','api_url','api_key','api_method','api_connector_id','voice_otp_config_id',
+      'whatsapp_device_ids','telegram_device_ids','balance','credit_limit','currency',
+      'bind_status','consecutive_failures','force_dlr','status'];
+    const csvRows = [headers.join(',')];
+    for (const s of filteredSuppliers) {
+      csvRows.push(headers.map(h => {
+        const val = (s as any)[h];
+        if (val === null || val === undefined) return '';
+        const str = String(val);
+        return str.includes(',') || str.includes('"') ? `"${str.replace(/"/g, '""')}"` : str;
+      }).join(','));
+    }
+    const blob = new Blob(['\ufeff' + csvRows.join('\n')], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `suppliers_export_${new Date().toISOString().split('T')[0]}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const text = await file.text();
+    try {
+      const { api } = await import('../../services/api');
+      const res: any = await api.post('/suppliers/bulk', { csv: text });
+      if (res.success) {
+        const created = res.data?.data?.created || 'success';
+        alert(`Import complete: ${created} suppliers imported. Page will refresh.`);
+        window.location.reload();
+      } else {
+        alert('Import failed: ' + (res.error || 'Unknown error'));
+      }
+    } catch (err: any) {
+      alert('Import failed: ' + (err?.message || 'Unknown error'));
+    }
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
 
   const handleDelete = () => {
     if (deleteModal) {
@@ -184,6 +232,25 @@ export const SuppliersList: React.FC = () => {
                 <Trash2 size={14} />
                 Delete
               </button>
+              {(supplier as any).is_deleted && (
+                <>
+                  <hr className="my-1" />
+                  <button
+                    onClick={async () => {
+                      try {
+                        await restoreSupplier(supplier.id);
+                        setActionMenu(null);
+                      } catch (e) {
+                        alert('Failed to restore supplier');
+                      }
+                    }}
+                    className="w-full flex items-center gap-2 px-4 py-2 text-sm text-green-600 hover:bg-green-50"
+                  >
+                    <RotateCcw size={14} />
+                    Restore
+                  </button>
+                </>
+              )}
             </div>
           )}
         </div>
@@ -208,7 +275,7 @@ export const SuppliersList: React.FC = () => {
       <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
         <div className="bg-white rounded-xl p-4 border border-gray-200">
           <p className="text-sm text-gray-500">Total Suppliers</p>
-          <p className="text-2xl font-bold text-gray-800 mt-1">{suppliers.length}</p>
+          <p className="text-2xl font-bold text-gray-800 mt-1">{suppliers.filter(s => !s.is_deleted).length}</p>
         </div>
         <div className="bg-white rounded-xl p-4 border border-gray-200">
           <p className="text-sm text-gray-500">Active</p>
@@ -272,7 +339,18 @@ export const SuppliersList: React.FC = () => {
               <option value="ott_telegram">Telegram</option>
               <option value="voice_otp">Voice OTP</option>
             </select>
-            <Button variant="secondary" icon={<Download size={16} />}>Export</Button>
+            <label className="flex items-center gap-2 px-3 py-2 border border-gray-300 rounded-lg text-sm cursor-pointer hover:bg-gray-50">
+              <input
+                type="checkbox"
+                checked={showDeleted}
+                onChange={(e) => setShowDeleted(e.target.checked)}
+                className="rounded"
+              />
+              <span className={showDeleted ? 'text-red-600 font-medium' : 'text-gray-600'}>Show Deleted</span>
+            </label>
+            <Button variant="secondary" icon={<Download size={16} />} onClick={handleExport}>Export</Button>
+            <Button variant="secondary" icon={<Upload size={16} />} onClick={() => fileInputRef.current?.click()}>Import</Button>
+            <input type="file" ref={fileInputRef} accept=".csv,.txt" onChange={handleImport} className="hidden" />
           </div>
         </div>
       </Card>
@@ -307,8 +385,11 @@ export const SuppliersList: React.FC = () => {
         }
       >
         <p className="text-gray-600">
-          Are you sure you want to delete <strong>{deleteModal?.company_name}</strong>? 
-          This action cannot be undone.
+          Are you sure you want to delete <strong>{deleteModal?.company_name}</strong>?
+          This will soft-delete the supplier, mark their SMPP session as unbound,
+          set bind_status to 'unbound', and remove them from the bind status page.
+          SMS logs, CDR, payments, and financial data are preserved.
+          You can restore this supplier later from the "Show Deleted" view.
         </p>
       </Modal>
     </div>

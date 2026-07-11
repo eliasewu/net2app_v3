@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeft, Save, RefreshCw, TestTube, MessageSquare, Phone, Bot, Smartphone, Flashlight, ExternalLink } from 'lucide-react';
 import { useData } from '../../store/DataContext';
@@ -7,14 +7,11 @@ import { Button } from '../../components/UI/Button';
 import { Badge } from '../../components/UI/Badge';
 import { Input, Select } from '../../components/UI/Input';
 import { ConnectionType, Currency } from '../../types';
+import api from '../../services/api';
 
-// Types for connectors loaded from other pages
-interface ApiConnector { id:string; name:string; provider:string; auth_type:string; status:string; is_active:boolean; }
+interface ApiConnector { id:string; name:string; provider:string; auth_type:string; status:string; is_active:boolean; base_url?:string; send_url?:string; api_key?:string; api_secret?:string; dlr_url?:string; http_method?:string; }
 interface OttDevice { id:string; name:string; phone:string; session_status:string; type?:string; }
-interface VoiceSip { id:string; client_name:string; sip_host:string; sip_port:number; is_active:boolean; }
-interface RcsAgent { id:string; name:string; bot_id:string; is_active:boolean; }
-interface FlashProvider { id:string; name:string; sender_id:string; ttl:number; is_active:boolean; }
-
+interface VoiceSip { id:string; client_name:string; is_active:boolean; }
 
 export const AddSupplier: React.FC = () => {
   const navigate = useNavigate();
@@ -23,12 +20,68 @@ export const AddSupplier: React.FC = () => {
   const existingSupplier = id ? getSupplierById(id) : undefined;
   const isEditing = !!existingSupplier;
 
-  // Load all available endpoints from other pages
-  const [apiConnectors] = useState<ApiConnector[]>([]);
-  const [ottDevices] = useState<OttDevice[]>([]);
-  const [voiceSips] = useState<VoiceSip[]>([]);
-  const [rcsAgents] = useState<RcsAgent[]>([]);
-  const [flashProviders] = useState<FlashProvider[]>([]);
+  const [apiConnectors, setApiConnectors] = useState<ApiConnector[]>([]);
+  const [ottDevices, setOttDevices] = useState<OttDevice[]>([]);
+  const [voiceSips, setVoiceSips] = useState<VoiceSip[]>([]);
+  const [endpointsLoading, setEndpointsLoading] = useState(false);
+
+  // Pre-populate selected endpoint when editing
+  const initSelectedEndpoint = () => {
+    if (existingSupplier) {
+      if (existingSupplier.api_connector_id) return String(existingSupplier.api_connector_id);
+      if (existingSupplier.voice_otp_config_id) return String(existingSupplier.voice_otp_config_id);
+      if (existingSupplier.whatsapp_device_ids?.length) return String(existingSupplier.whatsapp_device_ids[0]);
+      if (existingSupplier.telegram_device_ids?.length) return String(existingSupplier.telegram_device_ids[0]);
+    }
+    return '';
+  };
+  const [selectedEndpoint, setSelectedEndpoint] = useState(initSelectedEndpoint());
+
+  useEffect(() => {
+    const fetchEndpoints = async () => {
+      setEndpointsLoading(true);
+      try {
+        const [connRes, ottRes, voiceRes] = await Promise.allSettled([
+          api.get('/api-connectors'),
+          api.get('/ott-devices'),
+          api.get('/voice-otp/configs'),
+        ]);
+        if (connRes.status === 'fulfilled') {
+          const d = (connRes.value as any)?.data?.data || (connRes.value as any)?.data;
+          if (Array.isArray(d)) {
+            setApiConnectors(d.map((c: any) => ({
+              id: String(c.id), name: c.name, provider: c.provider || c.type,
+              auth_type: c.connector_type || c.type || 'http', status: c.is_active ? 'connected' : 'disconnected',
+              is_active: c.is_active, base_url: c.base_url, send_url: c.send_url,
+              api_key: c.api_key, api_secret: c.api_secret, dlr_url: c.dlr_url,
+              http_method: c.http_method || 'POST',
+            })));
+          }
+        }
+        if (ottRes.status === 'fulfilled') {
+          const d = (ottRes.value as any)?.data?.data || (ottRes.value as any)?.data;
+          if (Array.isArray(d)) {
+            setOttDevices(d.map((dev: any) => ({
+              id: String(dev.id), name: dev.device_name || dev.name,
+              phone: dev.phone_number || dev.phone || '',
+              session_status: dev.session_status || 'disconnected', type: dev.device_type || 'whatsapp',
+            })));
+          }
+        }
+        if (voiceRes.status === 'fulfilled') {
+          const d = (voiceRes.value as any)?.data?.data || (voiceRes.value as any)?.data;
+          if (Array.isArray(d)) {
+            setVoiceSips(d.map((v: any) => ({
+              id: String(v.id), client_name: v.name || v.client_name || 'Voice Config ' + v.id,
+              is_active: v.is_active !== false,
+            })));
+          }
+        }
+      } catch (e) { /* non-critical */ }
+      setEndpointsLoading(false);
+    };
+    fetchEndpoints();
+  }, []);
 
   const [formData, setFormData] = useState({
     supplier_code: existingSupplier?.supplier_code || '',
@@ -59,7 +112,8 @@ export const AddSupplier: React.FC = () => {
     status: existingSupplier?.status || 'active',
     bind_status: existingSupplier?.bind_status || 'unbound',
     consecutive_failures: existingSupplier?.consecutive_failures || 0,
-    selected_endpoint: '',
+    api_connector_id: existingSupplier?.api_connector_id ? parseInt(String(existingSupplier.api_connector_id)) || null : null,
+    voice_otp_config_id: existingSupplier?.voice_otp_config_id || null,
   });
 
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -96,13 +150,55 @@ export const AddSupplier: React.FC = () => {
     setTestResult({ success: Math.random() > 0.3, message: Math.random() > 0.3 ? 'Connection successful!' : 'Connection failed' });
   };
 
+  const updateField = (field: string, value: any) => {
+    if (field === 'connection_type') {
+      setSelectedEndpoint('');
+      setFormData(prev => ({ ...prev, [field]: value, api_url: '', api_key: '' }));
+    } else {
+      setFormData(prev => ({ ...prev, [field]: value }));
+    }
+    if (errors[field]) setErrors(prev => ({ ...prev, [field]: '' }));
+  };
+
+  // Endpoint selection helpers
+  const selectConnector = (c: ApiConnector) => {
+    setSelectedEndpoint(c.id);
+    updateField('api_url', c.send_url || c.base_url || '');
+    updateField('api_key', c.api_key || '');
+    updateField('api_method', c.http_method || 'POST');
+  };
+
+  const selectOtt = (d: OttDevice) => {
+    setSelectedEndpoint(d.id);
+  };
+
+  const selectSip = (s: VoiceSip) => {
+    setSelectedEndpoint(s.id);
+    updateField('smpp_host', '');
+    updateField('smpp_port', 5060);
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!validate()) return;
     setLoading(true);
     try {
-      if (isEditing && existingSupplier) await updateSupplier(existingSupplier.id, formData);
-      else await addSupplier(formData as any);
+      const payload: any = { ...formData };
+      if (selectedEndpoint) {
+        const epId = parseInt(selectedEndpoint) || null;
+        const type = payload.connection_type;
+        if (type === 'http' || type === 'rcs' || type === 'flash_sms') {
+          payload.api_connector_id = epId;
+        } else if (type === 'voice_otp') {
+          payload.voice_otp_config_id = epId;
+        } else if (type === 'ott_whatsapp') {
+          payload.whatsapp_device_ids = epId ? [epId] : null;
+        } else if (type === 'ott_telegram') {
+          payload.telegram_device_ids = epId ? [epId] : null;
+        }
+      }
+      if (isEditing && existingSupplier) await updateSupplier(existingSupplier.id, payload);
+      else await addSupplier(payload as any);
       navigate('/suppliers');
     } catch (err: any) {
       setErrors(prev => ({ ...prev, submit: err?.message || 'Failed to save supplier' }));
@@ -111,81 +207,64 @@ export const AddSupplier: React.FC = () => {
     }
   };
 
-  const updateField = (field: string, value: any) => {
-    setFormData(prev => ({ ...prev, [field]: value }));
-    if (errors[field]) setErrors(prev => ({ ...prev, [field]: '' }));
-  };
-
   const renderEndpointList = () => {
     const type = formData.connection_type;
-    
-    if (type === 'http') {
-      return apiConnectors.length === 0 ? <p className="text-sm text-gray-400">No API connectors configured. Add them in API Connectors page first.</p> : (
+    if (endpointsLoading) return <p className="text-sm text-gray-400 py-4">Loading available endpoints...</p>;
+
+    if (type === 'http' || type === 'rcs' || type === 'flash_sms') {
+      const list = apiConnectors.filter(c => c.is_active);
+      const Icon = type === 'rcs' ? Smartphone : (type === 'flash_sms' ? Flashlight : undefined);
+      return list.length === 0 ? <p className="text-sm text-gray-400">No API connectors configured. Add them in Settings → API Connectors first.</p> : (
         <div className="space-y-2 max-h-60 overflow-y-auto">
-          {apiConnectors.filter(c=>c.is_active).map(c => (
-            <div key={c.id} className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer ${formData.selected_endpoint===c.id?'border-blue-500 bg-blue-50':'border-gray-200 hover:border-gray-300'}`} onClick={()=>updateField('selected_endpoint',c.id)}>
-              <input type="radio" checked={formData.selected_endpoint===c.id} onChange={()=>updateField('selected_endpoint',c.id)} className="w-4 h-4"/>
-              <div className="flex-1"><p className="text-sm font-medium">{c.name}</p><p className="text-xs text-gray-500">{c.provider} • {c.auth_type}</p></div>
+          {list.map(c => (
+            <div key={c.id} className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer ${selectedEndpoint===c.id?'border-blue-500 bg-blue-50':'border-gray-200 hover:border-gray-300'}`} onClick={()=> selectConnector(c)}>
+              <input type="radio" checked={selectedEndpoint===c.id} onChange={()=> selectConnector(c)} className="w-4 h-4"/>
+              {Icon && <Icon size={18} className={type==='rcs'?'text-orange-500':'text-yellow-500'}/>}
+              <div className="flex-1"><p className="text-sm font-medium">{c.name}</p><p className="text-xs text-gray-500 font-mono">{c.base_url ? c.base_url.substring(0, 45) : c.provider}{c.base_url&&c.base_url.length>45?'...':''}</p></div>
               <Badge variant={c.status==='connected'?'success':'default'} size="sm">{c.status}</Badge>
             </div>
           ))}
         </div>
       );
     }
+
     if (type === 'ott_whatsapp') {
-      const wa = ottDevices.filter(d=>d.type==='whatsapp');
-      return wa.length === 0 ? <p className="text-sm text-gray-400">No WhatsApp devices paired. Add them in OTT Devices page first.</p> : (
+      const wa = ottDevices.filter(d => d.type === 'whatsapp');
+      return wa.length === 0 ? <p className="text-sm text-gray-400">No WhatsApp devices paired. Add them in Settings → OTT Devices first.</p> : (
         <div className="space-y-2 max-h-60 overflow-y-auto">{wa.map(d => (
-          <div key={d.id} className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer ${formData.selected_endpoint===d.id?'border-blue-500 bg-blue-50':'border-gray-200 hover:border-gray-300'}`} onClick={()=>updateField('selected_endpoint',d.id)}>
-            <input type="radio" checked={formData.selected_endpoint===d.id} onChange={()=>updateField('selected_endpoint',d.id)} className="w-4 h-4"/>
+          <div key={d.id} className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer ${selectedEndpoint===d.id?'border-blue-500 bg-blue-50':'border-gray-200'}`} onClick={()=> selectOtt(d)}>
+            <input type="radio" checked={selectedEndpoint===d.id} onChange={()=> selectOtt(d)} className="w-4 h-4"/>
             <MessageSquare size={18} className="text-green-500"/><div className="flex-1"><p className="text-sm font-medium">{d.name}</p><p className="text-xs text-gray-500">{d.phone}</p></div>
             <Badge variant={d.session_status==='connected'?'success':'warning'} dot size="sm">{d.session_status}</Badge>
           </div>
         ))}</div>
       );
     }
+
     if (type === 'ott_telegram') {
-      const tg = ottDevices.filter(d=>d.type==='telegram');
-      return tg.length === 0 ? <p className="text-sm text-gray-400">No Telegram bots configured.</p> : (
+      const tg = ottDevices.filter(d => d.type === 'telegram');
+      return tg.length === 0 ? <p className="text-sm text-gray-400">No Telegram bots configured. Add them in Settings → OTT Devices first.</p> : (
         <div className="space-y-2 max-h-60 overflow-y-auto">{tg.map(d => (
-          <div key={d.id} className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer ${formData.selected_endpoint===d.id?'border-blue-500 bg-blue-50':'border-gray-200'}`} onClick={()=>updateField('selected_endpoint',d.id)}>
-            <input type="radio" checked={formData.selected_endpoint===d.id} onChange={()=>updateField('selected_endpoint',d.id)} className="w-4 h-4"/><Bot size={18} className="text-blue-500"/>
-            <div className="flex-1"><p className="text-sm font-medium">{d.name}</p></div>
+          <div key={d.id} className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer ${selectedEndpoint===d.id?'border-blue-500 bg-blue-50':'border-gray-200'}`} onClick={()=> selectOtt(d)}>
+            <input type="radio" checked={selectedEndpoint===d.id} onChange={()=> selectOtt(d)} className="w-4 h-4"/>
+            <Bot size={18} className="text-blue-500"/><div className="flex-1"><p className="text-sm font-medium">{d.name}</p></div>
             <Badge variant={d.session_status==='connected'?'success':'warning'} dot size="sm">{d.session_status}</Badge>
           </div>
         ))}</div>
       );
     }
+
     if (type === 'voice_otp') {
-      return voiceSips.length === 0 ? <p className="text-sm text-gray-400">No Voice OTP SIP endpoints configured. Add them in Voice OTP page first.</p> : (
+      return voiceSips.length === 0 ? <p className="text-sm text-gray-400">No Voice OTP SIP endpoints configured. Add them in Settings → Voice OTP first.</p> : (
         <div className="space-y-2 max-h-60 overflow-y-auto">{voiceSips.filter(s=>s.is_active).map(s => (
-          <div key={s.id} className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer ${formData.selected_endpoint===s.id?'border-blue-500 bg-blue-50':'border-gray-200'}`} onClick={()=>updateField('selected_endpoint',s.id)}>
-            <input type="radio" checked={formData.selected_endpoint===s.id} onChange={()=>updateField('selected_endpoint',s.id)} className="w-4 h-4"/><Phone size={18} className="text-purple-500"/>
-            <div className="flex-1"><p className="text-sm font-medium">{s.client_name}</p><p className="text-xs text-gray-500 font-mono">{s.sip_host}:{s.sip_port}</p></div>
+          <div key={s.id} className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer ${selectedEndpoint===s.id?'border-blue-500 bg-blue-50':'border-gray-200'}`} onClick={()=> selectSip(s)}>
+            <input type="radio" checked={selectedEndpoint===s.id} onChange={()=> selectSip(s)} className="w-4 h-4"/>
+            <Phone size={18} className="text-purple-500"/><div className="flex-1"><p className="text-sm font-medium">{s.client_name}</p><p className="text-xs text-gray-500 font-mono">{s.client_name}</p></div>
           </div>
         ))}</div>
       );
     }
-    if (type === 'rcs') {
-      return rcsAgents.length === 0 ? <p className="text-sm text-gray-400">No RCS agents configured. Add them in API Connectors page first.</p> : (
-        <div className="space-y-2 max-h-60 overflow-y-auto">{rcsAgents.filter(r=>r.is_active).map(r => (
-          <div key={r.id} className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer ${formData.selected_endpoint===r.id?'border-blue-500 bg-blue-50':'border-gray-200'}`} onClick={()=>updateField('selected_endpoint',r.id)}>
-            <input type="radio" checked={formData.selected_endpoint===r.id} onChange={()=>updateField('selected_endpoint',r.id)} className="w-4 h-4"/><Smartphone size={18} className="text-orange-500"/>
-            <div className="flex-1"><p className="text-sm font-medium">{r.name}</p><p className="text-xs text-gray-500">{r.bot_id}</p></div>
-          </div>
-        ))}</div>
-      );
-    }
-    if (type === 'flash_sms') {
-      return flashProviders.length === 0 ? <p className="text-sm text-gray-400">No Flash SMS providers configured.</p> : (
-        <div className="space-y-2 max-h-60 overflow-y-auto">{flashProviders.filter(f=>f.is_active).map(f => (
-          <div key={f.id} className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer ${formData.selected_endpoint===f.id?'border-blue-500 bg-blue-50':'border-gray-200'}`} onClick={()=>updateField('selected_endpoint',f.id)}>
-            <input type="radio" checked={formData.selected_endpoint===f.id} onChange={()=>updateField('selected_endpoint',f.id)} className="w-4 h-4"/><Flashlight size={18} className="text-yellow-500"/>
-            <div className="flex-1"><p className="text-sm font-medium">{f.name}</p><p className="text-xs text-gray-500">Sender: {f.sender_id}</p></div>
-          </div>
-        ))}</div>
-      );
-    }
+
     return null;
   };
 
@@ -219,46 +298,34 @@ export const AddSupplier: React.FC = () => {
           </div>
         </Card>
 
-        {/* SMPP settings */}
         {formData.connection_type === 'smpp' && (
-          <>
-          <Card title="SMPP Connection Settings">
-            <div className="grid grid-cols-2 gap-6">
-              <Input label="SMPP Host" value={formData.smpp_host} onChange={e => updateField('smpp_host', e.target.value)} error={errors.smpp_host} placeholder={formData.is_inbound ? 'Auto (inbound mode)' : 'smpp.provider.com'} disabled={formData.is_inbound} required={!formData.is_inbound} />
-              <Input label="SMPP Port" type="number" value={formData.smpp_port} onChange={e => updateField('smpp_port', parseInt(e.target.value))} disabled={formData.is_inbound} />
-              <Input label="Username" value={formData.smpp_username} onChange={e => updateField('smpp_username', e.target.value)} error={errors.smpp_username} required />
-              <div className="flex gap-2"><div className="flex-1"><Input label="Password" value={formData.smpp_password} onChange={e => updateField('smpp_password', e.target.value)} /></div><button type="button" onClick={generatePassword} className="mt-7 p-2.5 bg-gray-100 rounded-lg hover:bg-gray-200"><RefreshCw size={18} className="text-gray-600" /></button></div>
-              <Input label="System ID" value={formData.system_id} onChange={e => updateField('system_id', e.target.value)} />
-              <div className="col-span-2 flex items-center gap-3 p-4 bg-yellow-50 rounded-lg border border-yellow-200">
-                <label className="flex items-center gap-3 cursor-pointer">
-                  <div className="relative">
-                    <input type="checkbox" checked={formData.is_inbound} onChange={e => updateField('is_inbound', e.target.checked)} className="sr-only peer" />
-                    <div className="w-10 h-5 bg-gray-300 rounded-full peer-checked:bg-yellow-500 transition-colors" />
-                    <div className="absolute left-0.5 top-0.5 w-4 h-4 bg-white rounded-full shadow peer-checked:translate-x-5 transition-transform" />
-                  </div>
-                  <div><p className="text-sm font-medium text-gray-800">Inbound Supplier Mode</p><p className="text-xs text-gray-500">Supplier connects TO us (no public IP needed). For GSM gateways behind NAT.</p></div>
-                </label>
-              </div>
+          <><Card title="SMPP Connection Settings"><div className="grid grid-cols-2 gap-6">
+            <Input label="SMPP Host" value={formData.smpp_host} onChange={e => updateField('smpp_host', e.target.value)} error={errors.smpp_host} placeholder={formData.is_inbound ? 'Auto (inbound mode)' : 'smpp.provider.com'} disabled={formData.is_inbound} required={!formData.is_inbound} />
+            <Input label="SMPP Port" type="number" value={formData.smpp_port} onChange={e => updateField('smpp_port', parseInt(e.target.value))} disabled={formData.is_inbound} />
+            <Input label="Username" value={formData.smpp_username} onChange={e => updateField('smpp_username', e.target.value)} error={errors.smpp_username} required />
+            <div className="flex gap-2"><div className="flex-1"><Input label="Password" value={formData.smpp_password} onChange={e => updateField('smpp_password', e.target.value)} /></div><button type="button" onClick={generatePassword} className="mt-7 p-2.5 bg-gray-100 rounded-lg hover:bg-gray-200"><RefreshCw size={18} className="text-gray-600" /></button></div>
+            <Input label="System ID" value={formData.system_id} onChange={e => updateField('system_id', e.target.value)} />
+            <div className="col-span-2 flex items-center gap-3 p-4 bg-yellow-50 rounded-lg border border-yellow-200">
+              <label className="flex items-center gap-3 cursor-pointer">
+                <div className="relative"><input type="checkbox" checked={formData.is_inbound} onChange={e => updateField('is_inbound', e.target.checked)} className="sr-only peer" /><div className="w-10 h-5 bg-gray-300 rounded-full peer-checked:bg-yellow-500 transition-colors" /><div className="absolute left-0.5 top-0.5 w-4 h-4 bg-white rounded-full shadow peer-checked:translate-x-5 transition-transform" /></div>
+                <div><p className="text-sm font-medium text-gray-800">Inbound Supplier Mode</p><p className="text-xs text-gray-500">Supplier connects TO us (no public IP needed). For GSM gateways behind NAT.</p></div>
+              </label>
             </div>
-          </Card>
-          <Card title="SMPP Advanced Configuration">
-            <div className="grid grid-cols-2 gap-6">
-              <Select label="SMPP Version" value={formData.smpp_version} onChange={e => updateField('smpp_version', e.target.value)} options={[{value:'auto',label:'Auto-Detect'},{value:'3.4',label:'v3.4'},{value:'5.0',label:'v5.0'}]} />
-              <Input label="System Type" value={formData.smpp_system_type} onChange={e => updateField('smpp_system_type', e.target.value)} placeholder="(empty)" />
-              <Select label="Bind Type" value={formData.smpp_bind_type} onChange={e => updateField('smpp_bind_type', e.target.value)} options={[{value:'trx',label:'TRX (Transceiver)'},{value:'tx',label:'TX (Transmitter)'},{value:'rx',label:'RX (Receiver)'}]} />
-              <Input label="Address TON" type="number" value={formData.smpp_addr_ton} onChange={e => updateField('smpp_addr_ton', parseInt(e.target.value)||0)} />
-              <Input label="Address NPI" type="number" value={formData.smpp_addr_npi} onChange={e => updateField('smpp_addr_npi', parseInt(e.target.value)||0)} />
-              <Input label="Address Range" value={formData.smpp_addr_range} onChange={e => updateField('smpp_addr_range', e.target.value)} placeholder="system_id" />
-            </div>
-          </Card>
-          </>
+          </div></Card>
+          <Card title="SMPP Advanced Configuration"><div className="grid grid-cols-2 gap-6">
+            <Select label="SMPP Version" value={formData.smpp_version} onChange={e => updateField('smpp_version', e.target.value)} options={[{value:'auto',label:'Auto-Detect'},{value:'3.4',label:'v3.4'},{value:'5.0',label:'v5.0'}]} />
+            <Input label="System Type" value={formData.smpp_system_type} onChange={e => updateField('smpp_system_type', e.target.value)} placeholder="(empty)" />
+            <Select label="Bind Type" value={formData.smpp_bind_type} onChange={e => updateField('smpp_bind_type', e.target.value)} options={[{value:'trx',label:'TRX (Transceiver)'},{value:'tx',label:'TX (Transmitter)'},{value:'rx',label:'RX (Receiver)'}]} />
+            <Input label="Address TON" type="number" value={formData.smpp_addr_ton} onChange={e => updateField('smpp_addr_ton', parseInt(e.target.value)||0)} />
+            <Input label="Address NPI" type="number" value={formData.smpp_addr_npi} onChange={e => updateField('smpp_addr_npi', parseInt(e.target.value)||0)} />
+            <Input label="Address Range" value={formData.smpp_addr_range} onChange={e => updateField('smpp_addr_range', e.target.value)} placeholder="system_id" />
+          </div></Card></>
         )}
 
-        {/* Non-SMPP: Show available endpoints from other pages */}
         {(formData.connection_type !== 'smpp') && (
           <Card title={`Available ${connectionTypes.find(ct=>ct.value===formData.connection_type)?.label||''} Endpoints`} subtitle="Select from configured endpoints below" action={<Button size="sm" variant="secondary" icon={<ExternalLink size={14}/>} onClick={()=>{
             const paths: Record<string,string> = {http:'/suppliers/api-connectors',ott_whatsapp:'/suppliers/ott-devices',ott_telegram:'/suppliers/ott-devices',voice_otp:'/suppliers/voice-otp',rcs:'/suppliers/api-connectors',flash_sms:'/suppliers/api-connectors'};
-            if(paths[formData.connection_type]) window.location.href=paths[formData.connection_type];
+            if(paths[formData.connection_type]) navigate(paths[formData.connection_type]);
           }}>Manage in Settings</Button>}>
             {renderEndpointList() || (
               <div className="p-4 bg-gray-50 rounded-lg">
@@ -269,13 +336,11 @@ export const AddSupplier: React.FC = () => {
           </Card>
         )}
 
-        <Card title="Billing Settings">
-          <div className="grid grid-cols-3 gap-6">
-            <Select label="Currency" value={formData.currency} onChange={e => updateField('currency', e.target.value)} options={[{value:'EUR',label:'EUR'},{value:'USD',label:'USD'},{value:'GBP',label:'GBP'}]} />
-            <Input label="Balance" type="number" value={formData.balance} onChange={e => updateField('balance', parseFloat(e.target.value))} />
-            <Input label="Credit Limit" type="number" value={formData.credit_limit} onChange={e => updateField('credit_limit', parseFloat(e.target.value))} />
-          </div>
-        </Card>
+        <Card title="Billing Settings"><div className="grid grid-cols-3 gap-6">
+          <Select label="Currency" value={formData.currency} onChange={e => updateField('currency', e.target.value)} options={[{value:'EUR',label:'EUR'},{value:'USD',label:'USD'},{value:'GBP',label:'GBP'}]} />
+          <Input label="Balance" type="number" value={formData.balance} onChange={e => updateField('balance', parseFloat(e.target.value))} />
+          <Input label="Credit Limit" type="number" value={formData.credit_limit} onChange={e => updateField('credit_limit', parseFloat(e.target.value))} />
+        </div></Card>
 
         {formData.connection_type === 'smpp' && (
           <Card title="Test Connection"><div className="flex items-center gap-4"><Button type="button" variant="secondary" icon={<TestTube size={18} />} onClick={handleTest}>Test SMPP</Button>{testResult && <Badge variant={testResult.success ? 'success' : 'danger'}>{testResult.message}</Badge>}</div></Card>

@@ -1,0 +1,5 @@
+/home/ubuntu/net2app-v3/java-sms-gateway/src/main/java/com/net2app/gateway/SmpGatewayMain.java
+/home/ubuntu/net2app-v3/java-sms-gateway/src/main/java/com/net2app/gateway/db/Database.java
+/home/ubuntu/net2app-v3/java-sms-gateway/src/main/java/com/net2app/gateway/rest/RestBridge.java
+/home/ubuntu/net2app-v3/java-sms-gateway/src/main/java/com/net2app/gateway/smpp/SmppClientManager.java
+/home/ubuntu/net2app-v3/java-sms-gateway/src/main/java/com/net2app/gateway/smpp/SmppServer.java
