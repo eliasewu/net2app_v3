@@ -111,10 +111,12 @@ async function originateCall(opts) {
     sipPassword,
     callerId,
     greetingAudio,
-    digitAudio,
+    digitAudio,       // key-value map: {"0":url, ..., "_sequence":[...], "_language":"en"}
+    audioFiles,       // NEW: flat array [greeting.wav, 0.wav, 1.wav, ..., 9.wav]
     otpCode,
+    language,         // NEW: language code (e.g. "en-US", "bn-BD")
   timeout = 30000,
-  // Multi-language fields
+  // Multi-language fields (backward compat — now handled by per-attempt originate)
   playCount = 1,
   useSecondary = false,
   secondaryGreeting = null,
@@ -122,9 +124,12 @@ async function originateCall(opts) {
 } = opts;
 
   // Build SIP channel string
-  // Format: SIP/<user>@<host>:<port>/<destination> or SIP/<destination>@<host>:<port>
-  const sipUser = sipUsername || callerId || destination;
-  const channel = `SIP/${sipUser}@${sipHost}:${sipPort}/${destination}`;
+  // chan_sip does NOT support inline credentials (user:pass@) in the dial string.
+  // Use SIP/<destination>@<host>:<port> for direct IP dialing.
+  // The remote SIP server at sipHost:sipPort must accept calls without auth
+  // (or use IP-based authentication). For authenticated calls, configure a
+  // sip.conf peer and use SIP/<peer>/<destination>.
+  const channel = `SIP/${destination}@${sipHost}:${sipPort}`;
 
   const startedAt = Date.now();
   activeCalls.set(callId, {
@@ -136,16 +141,43 @@ async function originateCall(opts) {
     otpCode,
   });
 
+  // Build channel variables for Asterisk dialplan (context: voice-otp)
+  //
+  // Audio format: we pass digit files as a JSON-encoded array so the
+  // Asterisk dialplan can play them sequentially with Playback().
+  //
+  // greetingAudio is passed separately. To avoid double-playing the greeting,
+  // we strip it from the digits sequence if it appears at position 0.
+  let digitFilesJson = '';
+  if (audioFiles && Array.isArray(audioFiles) && audioFiles.length > 1) {
+    // New format: flat array [greeting, 0, 1, ..., 9]
+    // Skip index 0 (greeting) — it's already passed as greetingAudio
+    digitFilesJson = JSON.stringify(audioFiles.slice(1));
+  } else if (digitAudio && typeof digitAudio === 'object') {
+    // Old format: key-value map with optional _sequence field
+    if (digitAudio._sequence && Array.isArray(digitAudio._sequence) && digitAudio._sequence.length > 1) {
+      // Strip greeting from _sequence to avoid double-play
+      digitFilesJson = JSON.stringify(digitAudio._sequence.slice(1));
+    } else {
+      // Build sequence from map keys 0-9
+      const seq = [];
+      for (let d = 0; d <= 9; d++) {
+        if (digitAudio[String(d)]) seq.push(digitAudio[String(d)]);
+      }
+      if (seq.length > 0) digitFilesJson = JSON.stringify(seq);
+    }
+  }
+
   // Build originate action
   const actionId = `votp_${nextActionId()}`;
   const variables = [];
   if (callerId) variables.push(`CALLERID(num)=${callerId}`);
   variables.push(`__VOICE_OTP_ID=${callId}`);
-  // Multi-language channel variables for Asterisk dialplan
   variables.push(`__OTP_CODE=${otpCode}`);
   if (greetingAudio) variables.push(`__PRIMARY_GREETING=${greetingAudio}`);
-  if (digitAudio) variables.push(`__PRIMARY_DIGITS=${encodeURIComponent(typeof digitAudio === 'string' ? digitAudio : JSON.stringify(digitAudio))}`);
+  if (digitFilesJson) variables.push(`__PRIMARY_DIGITS=${encodeURIComponent(digitFilesJson)}`);
   if (playCount > 1) variables.push(`__PLAY_COUNT=${playCount}`);
+  if (language) variables.push(`__LANGUAGE=${language}`);
   variables.push(`__USE_SECONDARY=${useSecondary ? '1' : '0'}`);
   if (useSecondary && secondaryGreeting) variables.push(`__SECONDARY_GREETING=${secondaryGreeting}`);
   if (useSecondary && secondaryDigits) variables.push(`__SECONDARY_DIGITS=${encodeURIComponent(typeof secondaryDigits === 'string' ? secondaryDigits : JSON.stringify(secondaryDigits))}`);
@@ -157,6 +189,7 @@ async function originateCall(opts) {
   originate += `Context: voice-otp\r\n`;
   originate += `Exten: ${destination}\r\n`;
   originate += `Priority: 1\r\n`;
+  originate += `Async: true\r\n`;
   if (variables.length) originate += `Variable: ${variables.join(',')}\r\n`;
   originate += `ActionID: ${actionId}\r\n\r\n`;
 
@@ -204,10 +237,12 @@ function onDlr(callback) {
 let globalSipConfig = null;
 
 function setGlobalSipConfig(config) {
+  // Store SIP info for channel construction in originateCall().
+  // Does NOT reconnect AMI — AMI connection is separate (call connect() directly).
   globalSipConfig = config;
-  // Reconnect with new config
-  if (config && config.host) {
-    connect(config);
+  if (config) {
+    console.log('[asterisk-bridge] SIP config updated: %s:%s (not reconnecting AMI)',
+      config.host || '?', config.sipPort || config.port || '?');
   }
 }
 
@@ -220,11 +255,11 @@ function getGlobalSipConfig() {
 // =================================================================
 
 function sendRaw(data) {
-  if (amiSocket && connected) {
+  if (amiSocket) {
     amiSocket.write(data);
   } else {
-    // Queue or log — AMI not connected
-    // Fallback: simulate success for testing without Asterisk
+    // No socket at all — AMI is completely unavailable. Simulate success
+    // for pending originate actions so tests don't hang forever.
     for (const [actionId, pending] of pendingActions) {
       clearTimeout(pending.timeout);
       pending.resolve({ status: 'completed', dlr: 'DELIVRD', duration: 5000, simulated: true });
@@ -264,10 +299,10 @@ function handleAmiResponse(raw) {
     return;
   }
 
-  // Originate response
+  // Originate accepted — Asterisk will now try to place the call.
+  // Don't resolve here. Wait for DialEnd (success/fail) or timeout.
   if (event.Response === 'Success' && event.ActionID && pendingActions.has(event.ActionID)) {
-    // Originate accepted — now we wait for DialBegin/DialEnd/Hangup events
-    // For now, resolve as success; real tracking comes from events
+    // Store Uniqueid for DialEnd correlation if available
     return;
   }
 

@@ -12,7 +12,9 @@ const crypto = require('crypto');
 
 // Lazy-loaded: asterisk bridge module
 let asteriskBridge = null;
-try { asteriskBridge = require('../../asterisk-bridge.cjs'); } catch (e) { /* no bridge available */ }
+try { asteriskBridge = require('../../asterisk-bridge.cjs'); } catch (e) {
+    console.error('[VoiceOTP] Asterisk bridge not available — all calls will be simulated:', e.message);
+}
 
 // ============================================================================
 // 1. OTP DIGIT EXTRACTION
@@ -354,62 +356,77 @@ async function resolveVoiceOtpConfig(pool, destination, defaultLanguageCode) {
  * Returns an array of audio paths/descriptions in playback order.
  * 
  * Sequence:
- *   [primary_greeting] + [primary digits 0..9] + [primary_retry] + 
- *   [secondary_greeting] + [secondary digits 0..9] + [secondary_retry]
+ *   [greeting] + [digits 0..9] + [retry]
  * 
- * Repeated play_count times (uniform per-client).
+ * When useSecondaryLanguage=false → primary language audio
+ * When useSecondaryLanguage=true  → secondary language audio (falls back to primary if none)
  * 
  * @param {object} config - voice_otp_configs row
  * @param {string} otpCode - OTP digits to speak
  * @param {number} playCount - repeat count (1-3)
- * @returns {{ primary: string[], secondary: string[], repeat: number }}
+ * @param {boolean} useSecondaryLanguage - whether to use secondary language audio
+ * @returns {{ audio: string[], repeat: number, language: string, usedSecondary: boolean }}
  */
-function buildAudioSequence(config, otpCode, playCount) {
+function buildAudioSequence(config, otpCode, playCount, useSecondaryLanguage) {
     const digits = otpCode.split('');
-    const primaryAudio = [];
-    const secondaryAudio = [];
+    const audio = [];
     const audioDir = path.join(__dirname, '..', '..', 'data', 'uploads', 'audio');
     
     const primaryLang = config.primary_language_code || config.language_code || 'en-US';
-    const secondaryLang = config.secondary_language_code || 'en-US';
+    const secondaryLang = config.secondary_language_code || primaryLang;
+    const hasSecondaryConfig = !!(config.secondary_greeting_audio_url || (config.audio_0_9_secondary && Object.keys(typeof config.audio_0_9_secondary === 'string' ? JSON.parse(config.audio_0_9_secondary) : (config.audio_0_9_secondary || {})).length > 0));
     
-    // --- Primary language ---
-    // Greeting
-    const primaryGreeting = config.greeting_audio_url || path.join(audioDir, primaryLang, 'greeting.wav');
-    primaryAudio.push(primaryGreeting);
+    // Determine which language to use
+    const useSecondary = useSecondaryLanguage && (secondaryLang !== primaryLang || hasSecondaryConfig);
+    const lang = useSecondary ? secondaryLang : primaryLang;
     
-    // Digits 0-9
+    // Greeting — pick the right one
+    const greeting = useSecondary
+        ? (config.secondary_greeting_audio_url || config.greeting_audio_url || path.join(audioDir, lang, 'greeting.wav'))
+        : (config.greeting_audio_url || path.join(audioDir, lang, 'greeting.wav'));
+    audio.push(greeting);
+    
+    // Helper: parse JSONB safely
+    const parseJson = (raw) => {
+        if (!raw) return {};
+        return typeof raw === 'string' ? JSON.parse(raw) : raw;
+    };
+    
+    // Digits 0-9 — MERGE primary/secondary layer with legacy audio_0_9
+    // Uploaded data URLs take priority over legacy disk paths for same digit
+    const legacyMap = parseJson(config.audio_0_9);
+    const primaryUploadMap = parseJson(config.audio_0_9_primary);
+    const secondaryUploadMap = parseJson(config.audio_0_9_secondary);
+    
+    // Build effective map: legacy < primary-upload < secondary-upload
+    let effectiveDigitMap;
+    if (useSecondary) {
+        // Secondary: merge legacy + primary + secondary, with secondary on top
+        effectiveDigitMap = { ...legacyMap, ...primaryUploadMap, ...secondaryUploadMap };
+    } else {
+        // Primary: merge legacy + primary
+        effectiveDigitMap = { ...legacyMap, ...primaryUploadMap };
+    }
+    
     for (const digit of digits) {
-        const digitFile = path.join(audioDir, primaryLang, `${digit}.wav`);
-        primaryAudio.push(digitFile);
+        if (effectiveDigitMap[digit]) {
+            audio.push(effectiveDigitMap[digit]);
+        } else {
+            audio.push(path.join(audioDir, lang, `${digit}.wav`));
+        }
     }
     
-    // Retry text (if configured)
-    if (config.primary_retry_text || config.retry_text) {
-        // Use greeting again as retry if no separate audio
-        primaryAudio.push(primaryGreeting);
-    }
-    
-    // --- Secondary language (fallback) ---
-    if (secondaryLang !== primaryLang || config.secondary_greeting_audio_url) {
-        const secGreeting = config.secondary_greeting_audio_url || path.join(audioDir, secondaryLang, 'greeting.wav');
-        secondaryAudio.push(secGreeting);
-        
-        for (const digit of digits) {
-            const digitFile = path.join(audioDir, secondaryLang, `${digit}.wav`);
-            secondaryAudio.push(digitFile);
-        }
-        
-        if (config.secondary_retry_text) {
-            secondaryAudio.push(secGreeting);
-        }
+    // Retry text
+    const retryText = useSecondary ? (config.secondary_retry_text || config.retry_text) : (config.primary_retry_text || config.retry_text);
+    if (retryText) {
+        audio.push(greeting);
     }
     
     return {
-        primary: primaryAudio,
-        secondary: secondaryAudio,
+        audio,
         repeat: playCount || 1,
-        totalFiles: (primaryAudio.length + secondaryAudio.length) * (playCount || 1),
+        language: lang,
+        usedSecondary: useSecondary,
     };
 }
 
@@ -487,20 +504,24 @@ function concatenateWavFiles(filePaths) {
  * @returns {Promise<{status:string, dlr:string, duration:number, error?:string}>}
  */
 async function originateCall(pool, options) {
-    const { callId, destination, otpCode, supplier, config, playCount, timeout = 45000 } = options;
+    const { callId, destination, otpCode, supplier, config, playCount, timeout = 45000, useSecondaryLanguage = false } = options;
+    
+    // Build audio sequence FIRST — so language info is available even in error paths
+    const audioSeq = buildAudioSequence(config, otpCode, playCount, useSecondaryLanguage);
     
     // Parse supplier SIP address
     const sipAddr = parseSipAddress(supplier.dst_sip_address || '');
     if (!sipAddr) {
-        return { status: 'failed', dlr: 'FAILED', duration: 0, error: 'No SIP address configured for supplier' };
+        return { status: 'failed', dlr: 'FAILED', duration: 0,
+                 error: 'No SIP address configured for supplier',
+                 language: audioSeq.language,
+                 usedSecondary: audioSeq.usedSecondary };
     }
-    
-    // Build audio sequence
-    const audioSeq = buildAudioSequence(config, otpCode, playCount);
     
     // If asterisk bridge is available, use it
     if (asteriskBridge && typeof asteriskBridge.originateCall === 'function') {
         try {
+            const digitMap = buildDigitAudioMap(audioSeq);
             const result = await asteriskBridge.originateCall({
                 callId,
                 destination,
@@ -509,9 +530,11 @@ async function originateCall(pool, options) {
                 sipUsername: supplier.smpp_username || '',
                 sipPassword: supplier.smpp_password || '',
                 callerId: config.caller_id || otpCode,
-                greetingAudio: audioSeq.primary[0] || null,
-                digitAudio: buildDigitAudioMap(audioSeq),
+                greetingAudio: audioSeq.audio[0] || null,
+                digitAudio: digitMap,       // key-value map for backward compat
+                audioFiles: audioSeq.audio, // flat array for sequential playback
                 otpCode,
+                language: audioSeq.language,
                 timeout,
             });
             
@@ -519,14 +542,20 @@ async function originateCall(pool, options) {
                 status: result.status || 'completed',
                 dlr: result.dlr || 'DELIVRD',
                 duration: result.duration || 0,
+                language: audioSeq.language,
+                usedSecondary: audioSeq.usedSecondary,
             };
         } catch (e) {
-            return { status: 'failed', dlr: 'FAILED', duration: 0, error: e.message };
+            return { status: 'failed', dlr: 'FAILED', duration: 0,
+                     error: e.message,
+                     language: audioSeq.language,
+                     usedSecondary: audioSeq.usedSecondary };
         }
     }
     
     // Fallback: simulate call (for testing without Asterisk)
-    return simulateCall(callId, destination, otpCode, playCount);
+    const simResult = simulateCall(callId, destination, otpCode, playCount);
+    return { ...simResult, language: audioSeq.language, usedSecondary: audioSeq.usedSecondary };
 }
 
 function parseSipAddress(addr) {
@@ -539,11 +568,20 @@ function parseSipAddress(addr) {
 }
 
 function buildDigitAudioMap(audioSeq) {
+    // audioSeq.audio is a flat array: [greeting, digit0, digit1, ..., digit9]
+    // Build a key-value map for codec-agnostic playback
     const map = {};
-    // Use primary audio files — Asterisk plays them in sequence
+    if (!audioSeq || !audioSeq.audio || !Array.isArray(audioSeq.audio)) return map;
+    // First element is greeting, skip it (already passed separately)
     for (let i = 0; i < 10; i++) {
-        map[String(i)] = audioSeq.primary[i + 1] || null; // +1 because [0] is greeting
+        const idx = i + 1; // +1 to skip greeting
+        if (idx < audioSeq.audio.length) {
+            map[String(i)] = audioSeq.audio[idx];
+        }
     }
+    // Also provide the full sequence for sequential playback
+    map['_sequence'] = audioSeq.audio;
+    map['_language'] = audioSeq.language || 'unknown';
     return map;
 }
 
@@ -581,7 +619,9 @@ function parseReconnectSchedule(schedule, maxRetries) {
     
     try {
         const delays = schedule.split(',').map(s => parseInt(s.trim()) * 60000);
-        return delays.filter(d => !isNaN(d) && d >= 0).slice(0, maxRetries || delays.length);
+        const filtered = delays.filter(d => !isNaN(d) && d >= 0);
+        if (filtered.length === 0) return [0, 60000, 120000].slice(0, maxRetries || 3);
+        return filtered.slice(0, maxRetries || filtered.length);
     } catch (e) {
         return [0, 60000, 120000].slice(0, maxRetries || 3);
     }
@@ -596,11 +636,23 @@ function parseReconnectSchedule(schedule, maxRetries) {
  * @returns {Promise<{finalStatus:string, finalDlr:string, attempts:number, totalDuration:number}>}
  */
 async function executeWithRetry(pool, options) {
-    const { supplier } = options;
-    const maxRetries = supplier.max_retries || 3;
-    const schedule = parseReconnectSchedule(supplier.reconnect_schedule, maxRetries);
+    const { supplier, config } = options;
+    // max_retries: supplier > config.retry_count > default 3
+    const maxRetries = supplier.max_retries
+        ?? (config?.retry_count)
+        ?? 3;
+    // reconnect_schedule: supplier > config > default '0,1,2'
+    const reconnectSchedule = supplier.reconnect_schedule
+        ?? (config?.reconnect_schedule)
+        ?? '0,1,2';
+    const schedule = parseReconnectSchedule(reconnectSchedule, maxRetries);
     const reconnectTrace = [];
     let totalDuration = 0;
+    
+    // Determine if secondary language is available
+    const secondaryLang = (config && config.secondary_language_code) || '';
+    const primaryLang = (config && config.primary_language_code) || (config && config.language_code) || 'en-US';
+    const hasSecondary = secondaryLang && secondaryLang !== primaryLang;
     
     for (let attempt = 0; attempt < schedule.length; attempt++) {
         // Wait for the scheduled delay before this attempt
@@ -608,29 +660,41 @@ async function executeWithRetry(pool, options) {
             await new Promise(resolve => setTimeout(resolve, schedule[attempt]));
         }
         
-        // Update log: retrying
+        // --- Language switching on retry ---
+        // Attempt 0 → primary language
+        // Attempt 1 → secondary language (if available)
+        // Attempt 2 → primary language again
+        // Attempt 3 → secondary language again
+        const useSecondaryLanguage = hasSecondary && (attempt % 2 === 1);
+        
+        // Update log: retrying with language info
         if (attempt > 0) {
+            const langLabel = useSecondaryLanguage ? `secondary(${secondaryLang})` : `primary(${primaryLang})`;
             await pool.query(
                 `UPDATE voice_otp_logs SET status = 'retrying', retry_count = $1, 
-                 reconnect_trace = array_append(reconnect_trace, $2)
-                 WHERE call_id = $3`,
-                [attempt, `${new Date().toISOString()}:retry_${attempt}`, options.callId]
+                 language = $2, reconnect_trace = array_append(reconnect_trace, $3)
+                 WHERE call_id = $4`,
+                [attempt, langLabel, `${new Date().toISOString()}:retry_${attempt}:lang=${langLabel}`, options.callId]
             ).catch(() => {});
         }
         
-        // Attempt the call
-        const result = await originateCall(pool, options);
+        // Attempt the call with the selected language
+        const callOpts = { ...options, useSecondaryLanguage };
+        const result = await originateCall(pool, callOpts);
         totalDuration += result.duration || 0;
-        reconnectTrace.push(`${new Date().toISOString()}:attempt_${attempt + 1}:${result.dlr}`);
+        const langTag = useSecondaryLanguage ? 'sec' : 'pri';
+        reconnectTrace.push(`${new Date().toISOString()}:attempt_${attempt + 1}:${langTag}:${result.dlr}`);
         
         if (result.dlr === 'DELIVRD' || result.status === 'answered' || result.status === 'completed') {
-            // Success!
+            // Success! Return the language that worked
             return {
                 finalStatus: 'completed',
                 finalDlr: 'DELIVRD',
                 attempts: attempt + 1,
                 totalDuration,
                 reconnectTrace,
+                language: result.language || (useSecondaryLanguage ? secondaryLang : primaryLang),
+                usedSecondary: result.usedSecondary || useSecondaryLanguage,
             };
         }
         
@@ -642,12 +706,15 @@ async function executeWithRetry(pool, options) {
     }
     
     // All retries exhausted
+    const lastUsedSecondary = hasSecondary && ((schedule.length - 1) % 2 === 1);
     return {
         finalStatus: 'failed',
         finalDlr: 'FAILED',
         attempts: schedule.length,
         totalDuration,
         reconnectTrace,
+        language: lastUsedSecondary ? secondaryLang : primaryLang,
+        usedSecondary: lastUsedSecondary,
     };
 }
 
@@ -706,22 +773,56 @@ async function applyForceDlr(pool, log, forceDlrOverride, realDlr) {
  * @returns {Promise<{callId:string, otpCode:string, dlr:string, duration:number}>}
  */
 async function executeVoiceOtpPipeline(pool, ctx) {
-    const { client, supplier, destination, message, messageId } = ctx;
+    const { client, supplier, destination, message, messageId, configId } = ctx;
     
     // 1. Extract OTP digits
     const { otp, method } = extractOtpDigits(message, client.otp_extraction_pattern);
     
-    // 2. Resolve language
-    const { languageCode } = resolveCountryLanguage(destination);
-    const config = await resolveVoiceOtpConfig(pool, destination, languageCode);
+    // 2. Resolve language and config
+    // Priority: explicit configId (manual override) > auto-resolution by prefix/language
+    let config = null;
+    if (configId) {
+        const cfgResult = await pool.query(
+            'SELECT * FROM voice_otp_configs WHERE id = $1 AND is_active = true LIMIT 1',
+            [configId]
+        );
+        config = cfgResult.rows[0] || null;
+        if (config) {
+            console.log(`[VoiceOTP] Using explicit config #${configId}: ${config.language}`);
+        }
+    }
     
-    // 3. Determine play count (client-level overrides config-level)
+    if (!config) {
+        const { languageCode } = resolveCountryLanguage(destination);
+        config = await resolveVoiceOtpConfig(pool, destination, languageCode);
+    }
+    
+    // 2b. Apply voice_otp_mode overrides (supplier-level dynamic behavior)
+    // One config per country — the mode dynamically adjusts play_count and language switching.
+    // This avoids needing 3+ duplicate config rows per country.
+    const voiceOtpMode = supplier.voice_otp_mode || null;
+    if (config && voiceOtpMode) {
+        if (voiceOtpMode === 'local_1x') {
+            config = { ...config, play_count: 1, secondary_language_code: config.primary_language_code };
+        } else if (voiceOtpMode === 'local_2x') {
+            config = { ...config, play_count: 2, secondary_language_code: config.primary_language_code };
+        } else if (voiceOtpMode === 'local_international') {
+            config = { ...config, play_count: config.play_count || 1, secondary_language_code: 'en-US' };
+        }
+        console.log(`[VoiceOTP] Mode '${voiceOtpMode}' applied: play_count=${config.play_count}, secondary=${config.secondary_language_code}`);
+    }
+    
+    // 3. Determine play count (client-level > mode-override > config-level > default 1)
     const playCount = client.play_count || (config ? config.play_count : 1) || 1;
     
     // 4. Build call ID
     const callId = `VOICE_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
     
     // 5. Insert voice_otp_logs entry (status=sent as soon as handed to engine)
+    // max_retries: supplier > config.retry_count > default 3
+    const effectiveMaxRetries = supplier.max_retries
+        ?? (config?.retry_count)
+        ?? 3;
     await pool.query(
         `INSERT INTO voice_otp_logs 
          (call_id, destination, otp_code, extracted_otp, language, status, dlr_status,
@@ -729,7 +830,7 @@ async function executeVoiceOtpPipeline(pool, ctx) {
           reconnect_trace, created_at)
          VALUES ($1,$2,$3,$4,$5,'sent','SENT',0,$6,$7,$8,'voice_otp','{}',NOW())`,
         [callId, destination, otp, otp, config ? config.language_code : languageCode,
-         supplier.max_retries || 3, client.id, supplier.id]
+         effectiveMaxRetries, client.id, supplier.id]
     );
     
     // 6. Update sms_logs: mark as sent via voice_otp

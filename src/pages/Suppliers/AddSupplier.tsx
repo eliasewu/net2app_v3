@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { ArrowLeft, Save, RefreshCw, TestTube, MessageSquare, Phone, Bot, Smartphone, Flashlight, ExternalLink } from 'lucide-react';
+import { ArrowLeft, Save, RefreshCw, TestTube, MessageSquare, Bot, Smartphone, Flashlight, ExternalLink } from 'lucide-react';
 import { useData } from '../../store/DataContext';
 import { Card } from '../../components/UI/Card';
 import { Button } from '../../components/UI/Button';
@@ -11,7 +11,6 @@ import api from '../../services/api';
 
 interface ApiConnector { id:string; name:string; provider:string; auth_type:string; status:string; is_active:boolean; base_url?:string; send_url?:string; api_key?:string; api_secret?:string; dlr_url?:string; http_method?:string; }
 interface OttDevice { id:string; name:string; phone:string; session_status:string; type?:string; }
-interface VoiceSip { id:string; client_name:string; is_active:boolean; }
 
 export const AddSupplier: React.FC = () => {
   const navigate = useNavigate();
@@ -22,7 +21,6 @@ export const AddSupplier: React.FC = () => {
 
   const [apiConnectors, setApiConnectors] = useState<ApiConnector[]>([]);
   const [ottDevices, setOttDevices] = useState<OttDevice[]>([]);
-  const [voiceSips, setVoiceSips] = useState<VoiceSip[]>([]);
   const [endpointsLoading, setEndpointsLoading] = useState(false);
 
   // Pre-populate selected endpoint when editing
@@ -36,15 +34,22 @@ export const AddSupplier: React.FC = () => {
     return '';
   };
   const [selectedEndpoint, setSelectedEndpoint] = useState(initSelectedEndpoint());
+  const [voiceOtpPlayMode, setVoiceOtpPlayMode] = useState(existingSupplier?.voice_otp_mode || '');
+
+  // Play mode → runtime config resolution (no hardcoded IDs)
+  const voiceOtpPlayModes = [
+    { value: 'local_1x', label: 'Local (Single)', desc: 'Match by prefix → single language, played once. E.g. +880 finds Bangla config, plays greeting + digits × 1' },
+    { value: 'local_2x', label: 'Local (Double)', desc: 'Match by prefix → single language, played twice. E.g. +880 finds Bangla config, plays greeting + digits × 2' },
+    { value: 'local_international', label: 'Local + International', desc: 'Match by prefix → local first, international fallback. E.g. +880 finds Bangla config → retry in English' },
+  ];
 
   useEffect(() => {
     const fetchEndpoints = async () => {
       setEndpointsLoading(true);
       try {
-        const [connRes, ottRes, voiceRes] = await Promise.allSettled([
+        const [connRes, ottRes] = await Promise.allSettled([
           api.get('/api-connectors'),
           api.get('/ott-devices'),
-          api.get('/voice-otp/configs'),
         ]);
         if (connRes.status === 'fulfilled') {
           const d = (connRes.value as any)?.data?.data || (connRes.value as any)?.data;
@@ -65,15 +70,6 @@ export const AddSupplier: React.FC = () => {
               id: String(dev.id), name: dev.device_name || dev.name,
               phone: dev.phone_number || dev.phone || '',
               session_status: dev.session_status || 'disconnected', type: dev.device_type || 'whatsapp',
-            })));
-          }
-        }
-        if (voiceRes.status === 'fulfilled') {
-          const d = (voiceRes.value as any)?.data?.data || (voiceRes.value as any)?.data;
-          if (Array.isArray(d)) {
-            setVoiceSips(d.map((v: any) => ({
-              id: String(v.id), client_name: v.name || v.client_name || 'Voice Config ' + v.id,
-              is_active: v.is_active !== false,
             })));
           }
         }
@@ -114,6 +110,9 @@ export const AddSupplier: React.FC = () => {
     consecutive_failures: existingSupplier?.consecutive_failures || 0,
     api_connector_id: existingSupplier?.api_connector_id ? parseInt(String(existingSupplier.api_connector_id)) || null : null,
     voice_otp_config_id: existingSupplier?.voice_otp_config_id || null,
+    voice_otp_mode: existingSupplier?.voice_otp_mode || null,
+    dst_sip_address: existingSupplier?.dst_sip_address || '',
+    reconnect_schedule: existingSupplier?.reconnect_schedule || '0,1,2',
   });
 
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -125,7 +124,7 @@ export const AddSupplier: React.FC = () => {
     { value: 'http', label: 'HTTP API', desc: 'REST API messaging (shows API connectors)' },
     { value: 'ott_whatsapp', label: 'WhatsApp OTT', desc: 'WhatsApp Business/Personal (shows paired devices)' },
     { value: 'ott_telegram', label: 'Telegram OTT', desc: 'Telegram Bot messaging (shows bots)' },
-    { value: 'voice_otp', label: 'Voice OTP', desc: 'Voice call OTP delivery (shows SIP endpoints)' },
+    { value: 'voice_otp', label: 'Voice OTP', desc: 'Voice call OTP delivery (language selection)' },
     { value: 'rcs', label: 'RCS', desc: 'Rich Communication Services (shows RCS agents)' },
     { value: 'flash_sms', label: 'Flash SMS', desc: 'Class 0 flash messages (shows flash providers)' },
   ];
@@ -153,6 +152,7 @@ export const AddSupplier: React.FC = () => {
   const updateField = (field: string, value: any) => {
     if (field === 'connection_type') {
       setSelectedEndpoint('');
+      setVoiceOtpPlayMode('');
       setFormData(prev => ({ ...prev, [field]: value, api_url: '', api_key: '' }));
     } else {
       setFormData(prev => ({ ...prev, [field]: value }));
@@ -172,10 +172,12 @@ export const AddSupplier: React.FC = () => {
     setSelectedEndpoint(d.id);
   };
 
-  const selectSip = (s: VoiceSip) => {
-    setSelectedEndpoint(s.id);
-    updateField('smpp_host', '');
-    updateField('smpp_port', 5060);
+  // Voice OTP play mode selection — stores mode on supplier, engine resolves config at runtime
+  const selectPlayMode = (mode: string) => {
+    setVoiceOtpPlayMode(mode);
+    setSelectedEndpoint('');
+    updateField('voice_otp_mode', mode);
+    updateField('voice_otp_config_id', null);
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -255,13 +257,33 @@ export const AddSupplier: React.FC = () => {
     }
 
     if (type === 'voice_otp') {
-      return voiceSips.length === 0 ? <p className="text-sm text-gray-400">No Voice OTP SIP endpoints configured. Add them in Settings → Voice OTP first.</p> : (
-        <div className="space-y-2 max-h-60 overflow-y-auto">{voiceSips.filter(s=>s.is_active).map(s => (
-          <div key={s.id} className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer ${selectedEndpoint===s.id?'border-blue-500 bg-blue-50':'border-gray-200'}`} onClick={()=> selectSip(s)}>
-            <input type="radio" checked={selectedEndpoint===s.id} onChange={()=> selectSip(s)} className="w-4 h-4"/>
-            <Phone size={18} className="text-purple-500"/><div className="flex-1"><p className="text-sm font-medium">{s.client_name}</p><p className="text-xs text-gray-500 font-mono">{s.client_name}</p></div>
+      return (
+        <div className="space-y-4">
+          {/* Play Mode selector — quick way to pick the language config */}
+          <div>
+            <p className="text-sm font-medium text-gray-700 mb-3">Play Mode (Language Configuration)</p>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              {voiceOtpPlayModes.map(pm => (
+                <label key={pm.value} className={`flex flex-col p-4 rounded-xl border-2 cursor-pointer transition-all ${voiceOtpPlayMode === pm.value ? 'border-purple-500 bg-purple-50' : 'border-gray-200 hover:border-gray-300'}`}>
+                  <input type="radio" name="voiceOtpPlayMode" value={pm.value} checked={voiceOtpPlayMode === pm.value} onChange={() => selectPlayMode(pm.value)} className="sr-only" />
+                  <span className="font-medium text-gray-800 text-sm">{pm.label}</span>
+                  <span className="text-xs text-gray-500 mt-1">{pm.desc}</span>
+                </label>
+              ))}
+            </div>
           </div>
-        ))}</div>
+
+          {/* SIP server settings */}
+          <div className="border-t pt-4">
+            <p className="text-sm font-medium text-gray-700 mb-3">SIP Server Settings</p>
+            <div className="grid grid-cols-2 gap-4">
+              <Input label="SIP Address" value={formData.dst_sip_address} onChange={e => updateField('dst_sip_address', e.target.value)} placeholder="198.27.80.229:5060" />
+              <Input label="SIP Username" value={formData.smpp_username} onChange={e => updateField('smpp_username', e.target.value)} placeholder="net2app" />
+              <Input label="SIP Password" value={formData.smpp_password} onChange={e => updateField('smpp_password', e.target.value)} placeholder="(SIP auth password)" />
+              <Select label="Reconnect Schedule" value={formData.reconnect_schedule || '0,1,2'} onChange={e => updateField('reconnect_schedule', e.target.value)} options={[{value:'0,1,2',label:'Default (0s, 60s, 120s)'},{value:'0,1',label:'Quick (0s, 60s)'},{value:'0,1,2,5',label:'Extended (0s, 60s, 120s, 300s)'}]} />
+            </div>
+          </div>
+        </div>
       );
     }
 
@@ -323,8 +345,8 @@ export const AddSupplier: React.FC = () => {
         )}
 
         {(formData.connection_type !== 'smpp') && (
-          <Card title={`Available ${connectionTypes.find(ct=>ct.value===formData.connection_type)?.label||''} Endpoints`} subtitle="Select from configured endpoints below" action={<Button size="sm" variant="secondary" icon={<ExternalLink size={14}/>} onClick={()=>{
-            const paths: Record<string,string> = {http:'/suppliers/api-connectors',ott_whatsapp:'/suppliers/ott-devices',ott_telegram:'/suppliers/ott-devices',voice_otp:'/suppliers/voice-otp',rcs:'/suppliers/api-connectors',flash_sms:'/suppliers/api-connectors'};
+          <Card title={formData.connection_type === 'voice_otp' ? 'Voice OTP Configuration' : `Available ${connectionTypes.find(ct=>ct.value===formData.connection_type)?.label||''} Endpoints`} subtitle={formData.connection_type === 'voice_otp' ? 'Select language play mode and SIP server' : 'Select from configured endpoints below'} action={formData.connection_type === 'voice_otp' ? undefined : <Button size="sm" variant="secondary" icon={<ExternalLink size={14}/>} onClick={()=>{
+            const paths: Record<string,string> = {http:'/suppliers/api-connectors',ott_whatsapp:'/suppliers/ott-devices',ott_telegram:'/suppliers/ott-devices',rcs:'/suppliers/api-connectors',flash_sms:'/suppliers/api-connectors'};
             if(paths[formData.connection_type]) navigate(paths[formData.connection_type]);
           }}>Manage in Settings</Button>}>
             {renderEndpointList() || (

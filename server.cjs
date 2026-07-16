@@ -44,6 +44,8 @@ app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
 app.use(cookieParser());
 
+const { applyRules } = require('./src/services/translationEngine.cjs');
+
 const voiceOtpUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 // PRODUCTION-TUNED POOL: 50 connections for 1000+ clients/suppliers
@@ -184,9 +186,9 @@ let connectionPoolMgr = null;
             } catch (e) {
                 console.error('[DLR-POLL] Error in DLR polling cycle:', e.message);
             }
-        }, 5000);
+        }, 4000);
 
-        console.error('[INIT] DLR polling started — Voice OTP delivery status checked every 30s');
+        console.error('[INIT] DLR polling started — Voice OTP delivery status checked every 4s');
 
         // ======== DLR POLLING: HTTP connector SMS deliveries ========
         // Polls sms_outbox for delivered jobs with connector_transaction_id.
@@ -308,6 +310,55 @@ let connectionPoolMgr = null;
 
         console.error('[INIT] Production queue system READY — 8 workers, 100 batch, token-bucket rate limiting');
 
+
+        // ======== HTTP SUPPLIER HEALTH CHECK ========
+        // Pings all active HTTP suppliers' api_url every 60s.
+        // Updates bind_status (bound/unbound) and consecutive_failures
+        // so BindStatus, APIConnectors, and SMS routing all see real status.
+        setInterval(async () => {
+            try {
+                const httpSuppliers = await pool.query(
+                    `SELECT id, supplier_code, api_url, bind_status, consecutive_failures
+                     FROM suppliers
+                     WHERE connection_type = 'http'
+                       AND status = 'active'
+                       AND (is_deleted IS NULL OR is_deleted = false)
+                       AND api_url IS NOT NULL`
+                );
+                for (const s of httpSuppliers.rows) {
+                    try {
+                        const ctrl = new AbortController();
+                        const timer = setTimeout(() => ctrl.abort(), 5000);
+                        const resp = await fetch(s.api_url, {
+                            method: 'GET',
+                            signal: ctrl.signal,
+                            headers: { 'User-Agent': 'NET2APP-HealthCheck/1.0' }
+                        });
+                        clearTimeout(timer);
+                        // Always keep suppliers bound — never mark as unbound.
+                        // Health check is informational only: logs reachability
+                        // and resets failure counters on success.
+                        if (resp.ok || resp.status < 500) {
+                            // Reachable — reset failures, ensure bound (only if needed)
+                            await pool.query(
+                                `UPDATE suppliers SET bind_status = 'bound', consecutive_failures = 0, updated_at = NOW()
+                                 WHERE id = $1 AND (bind_status != 'bound' OR consecutive_failures != 0)`,
+                                [s.id]
+                            );
+                        } else {
+                            console.error(`[HTTP-HEALTH] ⚠ ${s.supplier_code} returned HTTP ${resp.status} — supplier stays bound`);
+                        }
+                    } catch (err) {
+                        console.error(`[HTTP-HEALTH] ⚠ ${s.supplier_code} unreachable: ${err.message} — supplier stays bound`);
+                    }
+                }
+            } catch (e) {
+                // Silently skip cycle on error, retry next interval
+            }
+        }, 60000);
+
+        console.error('[INIT] HTTP supplier health check started — pings api_url every 60s, updates bind_status');
+
         // ============================================================
         // SMPP ESME SERVER — handled by Java 21 SMPP Gateway
         // The Java gateway (java-sms-gateway) starts as a separate
@@ -315,6 +366,35 @@ let connectionPoolMgr = null;
         // Node.js only handles REST API + Web UI + HTTP/Voice OTP connectors.
         // ============================================================
         console.error('[INIT] ℹ SMPP handled by Java Gateway (net2app-smpg service on :2775)');
+
+        // ============================================================
+        // ASTERISK AMI CONNECTION — for Voice OTP real SIP origination
+        // Connects to Asterisk Manager Interface using credentials from
+        // the asterisk_settings DB table. Without this, voice_otp calls
+        // fall back to simulated delivery (fake DELIVRD, no real call).
+        // ============================================================
+        try {
+            const amiR = await pool.query(
+                `SELECT ami_host, ami_port, ami_username, ami_secret, dialplan_context
+                 FROM asterisk_settings ORDER BY id LIMIT 1`
+            );
+            if (amiR.rows.length > 0) {
+                const ami = amiR.rows[0];
+                const bridge = require('./asterisk-bridge.cjs');
+                bridge.connect({
+                    host: ami.ami_host || '127.0.0.1',
+                    port: parseInt(ami.ami_port) || 5038,
+                    username: ami.ami_username || 'net2app',
+                    password: ami.ami_secret || 'net2app_secret',
+                });
+                console.error('[INIT] Asterisk AMI connecting to %s:%s (user: %s)',
+                    ami.ami_host, ami.ami_port, ami.ami_username);
+            } else {
+                console.error('[INIT] ⚠ No asterisk_settings found — voice OTP calls will be simulated');
+            }
+        } catch (e) {
+            console.error('[INIT] Asterisk AMI connect failed (non-fatal):', e.message);
+        }
     } catch (e) {
         console.error('[INIT] Queue system init failed (non-fatal):', e.message);
     }
@@ -669,8 +749,9 @@ app.post('/api/suppliers', auth, async (req, res) => {
                 system_id, smpp_version, smpp_system_type, smpp_bind_type,
                 smpp_addr_ton, smpp_addr_npi, smpp_addr_range,
                 is_inbound, api_url, api_key, api_method,
-                api_connector_id, voice_otp_config_id,
+                api_connector_id, voice_otp_config_id, voice_otp_mode,
                 whatsapp_device_ids, telegram_device_ids,
+                dst_sip_address, reconnect_schedule, rate_per_second, audio_codec, capacity,
                 balance, credit_limit, currency,
                 bind_status, consecutive_failures, force_dlr, status,
                 created_at, updated_at
@@ -680,10 +761,11 @@ app.post('/api/suppliers', auth, async (req, res) => {
                 $11,$12,$13,$14,
                 $15,$16,$17,
                 $18,$19,$20,$21,
-                $22,$23,
-                $24,$25,
-                $26,$27,$28,
-                $29,$30,$31,$32,
+                $22,$23,$24,
+                $25,$26,
+                $27,$28,$29,$30,$31,
+                $32,$33,$34,
+                $35,$36,$37,$38,
                 NOW(), NOW()
             ) RETURNING *`,
             [
@@ -710,8 +792,14 @@ app.post('/api/suppliers', auth, async (req, res) => {
                 b.api_method || 'POST',
                 b.api_connector_id || null,
                 b.voice_otp_config_id || null,
+                b.voice_otp_mode || null,
                 b.whatsapp_device_ids || null,
                 b.telegram_device_ids || null,
+                b.dst_sip_address || '',
+                b.reconnect_schedule || '0,1,2',
+                b.rate_per_second || 0,
+                b.audio_codec || 'g729',
+                b.capacity || 10,
                 b.balance || 0,
                 b.credit_limit || 0,
                 b.currency || 'EUR',
@@ -732,7 +820,7 @@ app.put('/api/suppliers/:id', auth, async (req, res) => {
         const { id } = req.params;
         const fields = req.body;
         // Build dynamic SET clause for any field passed
-        const allowed = ['supplier_code','company_name','contact_person','email','phone','connection_type','smpp_host','smpp_port','smpp_username','smpp_password','system_id','smpp_version','smpp_system_type','smpp_bind_type','smpp_addr_ton','smpp_addr_npi','smpp_addr_range','is_inbound','api_url','api_key','api_method','api_connector_id','voice_otp_config_id','whatsapp_device_ids','telegram_device_ids','balance','credit_limit','currency','bind_status','consecutive_failures','force_dlr','status'];
+        const allowed = ['supplier_code','company_name','contact_person','email','phone','connection_type','smpp_host','smpp_port','smpp_username','smpp_password','system_id','smpp_version','smpp_system_type','smpp_bind_type','smpp_addr_ton','smpp_addr_npi','smpp_addr_range','is_inbound','api_url','api_key','api_method','api_connector_id','voice_otp_config_id','voice_otp_mode','whatsapp_device_ids','telegram_device_ids','dst_sip_address','reconnect_schedule','rate_per_second','audio_codec','capacity','balance','credit_limit','currency','bind_status','consecutive_failures','force_dlr','status'];
         const setParts = [];
         const values = [];
         let idx = 1;
@@ -981,23 +1069,57 @@ app.post('/api/suppliers/:id/cdr', auth, async (req, res) => {
     }
 });
 
-// Bind supplier (mark as bound)
+// Bind supplier — for inbound suppliers, update smpp_sessions status;
+// for outbound suppliers, update suppliers.bind_status and active_smpp_sessions
 app.post('/api/suppliers/:id/bind', auth, async (req, res) => {
     try {
         const { id } = req.params;
-        const result = await pool.query(
-            `UPDATE suppliers SET bind_status = 'bound', consecutive_failures = 0, updated_at = NOW() WHERE id = $1 AND (is_deleted IS NULL OR is_deleted = false) RETURNING id, supplier_code, bind_status, smpp_username, smpp_host, smpp_port`,
+        // Look up supplier first
+        const supR = await pool.query(
+            `SELECT * FROM suppliers WHERE id = $1 AND (is_deleted IS NULL OR is_deleted = false)`,
             [id]
         );
-        if (result.rows.length === 0) return res.status(404).json({ error: 'Supplier not found' });
+        if (supR.rows.length === 0) return res.status(404).json({ error: 'Supplier not found' });
+        const s = supR.rows[0];
+
+        if (s.is_inbound) {
+            // Inbound supplier: session state is managed by the Java SMPP gateway.
+            // We do NOT modify smpp_sessions — the gateway owns the real connection state.
+            // Just return current state for the frontend to display.
+            const sessR = await pool.query(
+                `SELECT status FROM smpp_sessions WHERE entity_type = 'supplier' AND entity_id = $1`,
+                [id]
+            );
+            const realStatus = sessR.rows.length > 0 ? sessR.rows[0].status : 'unbound';
+            return res.json({
+                success: true,
+                data: { id: Number(id), supplier_code: s.supplier_code, bind_status: realStatus },
+                message: 'Inbound supplier — session state managed by SMPP gateway. Current: ' + realStatus
+            });
+        } else {
+            // Outbound supplier: update static bind_status + active_smpp_sessions
+            await pool.query(
+                `UPDATE suppliers SET bind_status = 'bound', consecutive_failures = 0, updated_at = NOW() WHERE id = $1`,
+                [id]
+            );
+            // Upsert active_smpp_sessions for outbound tracking
+            await pool.query(
+                `INSERT INTO active_smpp_sessions (entity_type, entity_id, system_id, status, connected_at, ip_address, bind_mode)
+                 VALUES ('supplier', $1, $2, 'bound', NOW(), $3, 'transceiver')
+                 ON CONFLICT (entity_type, entity_id)
+                 DO UPDATE SET status = 'bound', connected_at = NOW(),
+                               ip_address = EXCLUDED.ip_address, bind_mode = 'transceiver'`,
+                [id, s.smpp_username || 'unknown', s.smpp_host || null]
+            );
+        }
+
         // Audit trail
-        const s = result.rows[0];
         await pool.query(
             `INSERT INTO bind_history (entity_type, entity_id, system_id, ip_address, port, bind_mode, status, created_at)
              VALUES ('supplier', $1, $2, $3, $4, 'transceiver', 'bound', NOW())`,
             [id, s.smpp_username || 'unknown', s.smpp_host || null, s.smpp_port || 2775]
         );
-        res.json({ success: true, data: { id: s.id, supplier_code: s.supplier_code, bind_status: s.bind_status }, message: 'Supplier bound' });
+        res.json({ success: true, data: { id: Number(id), supplier_code: s.supplier_code, bind_status: 'bound' }, message: 'Supplier bound' });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -1272,11 +1394,11 @@ app.get('/api/trunks/:id', auth, async (req, res) => {
 
 app.post('/api/trunks', auth, async (req, res) => {
     try {
-        const { trunk_name, supplier_id, trunk_type, priority, percentage, is_active, mccmnc_allowed, mccmnc_denied } = req.body;
+        const { trunk_name, supplier_id, trunk_type, priority, percentage, is_active, mccmnc_allowed, mccmnc_denied, voice_otp_config_id } = req.body;
         const result = await pool.query(
-            `INSERT INTO trunks (trunk_name, supplier_id, trunk_type, priority, percentage, is_active, mccmnc_allowed, mccmnc_denied, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) RETURNING *`,
-            [trunk_name, supplier_id, trunk_type || 'sim_otp', priority || 0, percentage || 100, is_active !== false, mccmnc_allowed || null, mccmnc_denied || null]
+            `INSERT INTO trunks (trunk_name, supplier_id, trunk_type, priority, percentage, is_active, mccmnc_allowed, mccmnc_denied, voice_otp_config_id, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW()) RETURNING *`,
+            [trunk_name, supplier_id, trunk_type || 'sim_otp', priority || 0, percentage || 100, is_active !== false, mccmnc_allowed || null, mccmnc_denied || null, voice_otp_config_id || null]
         );
         res.json({ success: true, data: result.rows[0] });
     } catch (error) {
@@ -1288,7 +1410,7 @@ app.put('/api/trunks/:id', auth, async (req, res) => {
     try {
         const { id } = req.params;
         const fields = req.body;
-        const allowed = ['trunk_name','supplier_id','trunk_type','priority','percentage','is_active','mccmnc_allowed','mccmnc_denied'];
+        const allowed = ['trunk_name','supplier_id','trunk_type','priority','percentage','is_active','mccmnc_allowed','mccmnc_denied','voice_otp_config_id'];
         const setParts = []; const values = []; let idx = 1;
         for (const key of allowed) {
             if (fields[key] !== undefined) { setParts.push(`${key} = $${idx++}`); values.push(fields[key]); }
@@ -1340,11 +1462,11 @@ app.get('/api/routes/:id', auth, async (req, res) => {
 
 app.post('/api/routes', auth, async (req, res) => {
     try {
-        const { route_name, trunk_ids, route_method, is_active, preferred_channel, mccmnc_allowed, mccmnc_denied } = req.body;
+        const { route_name, trunk_ids, route_method, is_active, preferred_channel, mccmnc_allowed, mccmnc_denied, voice_otp_config_id } = req.body;
         const result = await pool.query(
-            `INSERT INTO routes (route_name, trunk_ids, route_method, is_active, preferred_channel, mccmnc_allowed, mccmnc_denied, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) RETURNING *`,
-            [route_name, trunk_ids || null, route_method || 'priority', is_active !== false, preferred_channel || null, mccmnc_allowed || null, mccmnc_denied || null]
+            `INSERT INTO routes (route_name, trunk_ids, route_method, is_active, preferred_channel, mccmnc_allowed, mccmnc_denied, voice_otp_config_id, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) RETURNING *`,
+            [route_name, trunk_ids || null, route_method || 'priority', is_active !== false, preferred_channel || null, mccmnc_allowed || null, mccmnc_denied || null, voice_otp_config_id || null]
         );
         res.json({ success: true, data: result.rows[0] });
     } catch (error) {
@@ -1356,7 +1478,7 @@ app.put('/api/routes/:id', auth, async (req, res) => {
     try {
         const { id } = req.params;
         const fields = req.body;
-        const allowed = ['route_name','trunk_ids','route_method','is_active','preferred_channel','mccmnc_allowed','mccmnc_denied'];
+        const allowed = ['route_name','trunk_ids','route_method','is_active','preferred_channel','mccmnc_allowed','mccmnc_denied','voice_otp_config_id'];
         const setParts = []; const values = []; let idx = 1;
         for (const key of allowed) {
             if (fields[key] !== undefined) { setParts.push(`${key} = $${idx++}`); values.push(fields[key]); }
@@ -1564,6 +1686,7 @@ app.post('/api/rates/notify', auth, async (req, res) => {
 async function resolveRoute(client, destination) {
     let supplier_id = null, supplier_code = null, supplier_rate = null;
     let route_name = null, trunk_name = null, mcc = '', mnc = '', operator = '', country = '';
+    let voice_otp_config_id = null;  // resolved from route > trunk > supplier
 
     // Try to find MCC/MNC and operator/country
     try {
@@ -1600,7 +1723,15 @@ async function resolveRoute(client, destination) {
                                 trunk_name = trunk.trunk_name;
                                 supplier_id = supR.rows[0].id;
                                 supplier_code = supR.rows[0].supplier_code;
-                                const supRateR = await pool.query("SELECT rate FROM rates WHERE entity_type='supplier' AND entity_id=$1 AND is_active=true ORDER BY rate ASC LIMIT 1", [supplier_id]);
+                                // Voice OTP config priority: route > trunk > supplier
+                                voice_otp_config_id = route.voice_otp_config_id
+                                    || trunk.voice_otp_config_id
+                                    || supR.rows[0].voice_otp_config_id
+                                    || null;
+                                const supRateR = await pool.query(
+                                    "SELECT rate FROM rates WHERE entity_type='supplier' AND entity_id=$1 AND (mcc = $2 OR mcc = '*') AND is_active=true ORDER BY CASE WHEN mnc = '*' THEN 0 ELSE 1 END, rate ASC LIMIT 1",
+                                    [supplier_id, mcc || null]
+                                );
                                 if (supRateR.rows.length) supplier_rate = parseFloat(supRateR.rows[0].rate);
                                 break;
                             }
@@ -1614,16 +1745,26 @@ async function resolveRoute(client, destination) {
 
     // Fallback
     if (!supplier_id) {
-        const fallbackR = await pool.query('SELECT * FROM suppliers WHERE status = $1 AND (is_deleted IS NULL OR is_deleted = false) ORDER BY id LIMIT 1', ['active']);
+        const fallbackR = await pool.query(
+            `SELECT * FROM suppliers WHERE status = $1 AND (is_deleted IS NULL OR is_deleted = false)
+             ORDER BY id LIMIT 1`,
+            ['active']
+        );
         if (fallbackR.rows.length) {
             supplier_id = fallbackR.rows[0].id;
             supplier_code = fallbackR.rows[0].supplier_code;
             route_name = 'fallback';
             trunk_name = 'fallback';
+            // Query supplier rate for fallback path too
+            const supRateR = await pool.query(
+                "SELECT rate FROM rates WHERE entity_type='supplier' AND entity_id=$1 AND (mcc = $2 OR mcc = '*') AND is_active=true ORDER BY rate ASC LIMIT 1",
+                [supplier_id, mcc || null]
+            );
+            if (supRateR.rows.length) supplier_rate = parseFloat(supRateR.rows[0].rate);
         }
     }
 
-    return { supplier_id, supplier_code, supplier_rate, route_name, trunk_name, mcc, mnc, operator, country, billing_mode: client.billing_mode || 'dlr' };
+    return { supplier_id, supplier_code, supplier_rate, route_name, trunk_name, mcc, mnc, operator, country, voice_otp_config_id, billing_mode: client.billing_mode || 'dlr' };
 }
 
 app.post('/api/sms/send', auth, async (req, res) => {
@@ -1636,38 +1777,43 @@ app.post('/api/sms/send', auth, async (req, res) => {
         if (!clientR.rows.length) return res.status(400).json({ error: 'Client not found or inactive' });
         const c = clientR.rows[0];
 
-        // 2. Get and validate client rate
-        const clientRateR = await pool.query("SELECT rate FROM rates WHERE entity_type='client' AND entity_id=$1 AND is_active=true ORDER BY rate DESC LIMIT 1", [client_id]);
-        const clientRate = clientRateR.rows.length ? parseFloat(clientRateR.rows[0].rate) : null;
-        if (!clientRate || clientRate <= 0) {
-            const rejId = 'REJ' + Date.now() + Math.random().toString(36).substr(2, 6);
-            await pool.query(
-                `INSERT INTO sms_logs (message_id, client_id, client_code, destination, sender_id, message, status, error_code, error_message, source, submit_time)
-                 VALUES ($1,$2,$3,$4,$5,$6,'failed',$7,$8,$9,NOW())`,
-                [rejId, client_id, c.client_code, destination, sender_id || '', message, 'NO_RATE', 'Client rate not found', customSource || 'external_api']
-            ).catch(() => {});
-            return res.status(400).json({ success: false, error: 'Client rate not found', code: 'NO_RATE' });
-        }
-
-        // 3. Fast route resolution
+        // 2. Fast route resolution (must come BEFORE rate lookup — route.mcc/route.mnc needed)
         const route = await resolveRoute(c, destination);
         if (!route.supplier_id) {
             const rejId = 'REJ' + Date.now() + Math.random().toString(36).substr(2, 6);
             await pool.query(
-                `INSERT INTO sms_logs (message_id, client_id, client_code, destination, sender_id, message, status, error_code, error_message, source, submit_time)
-                 VALUES ($1,$2,$3,$4,$5,$6,'failed',$7,$8,$9,NOW())`,
-                [rejId, client_id, c.client_code, destination, sender_id || '', message, 'NO_SUPPLIER', 'No active supplier found', customSource || 'external_api']
+                `INSERT INTO sms_logs (message_id, client_id, client_code, destination, sender_id, message, status, error_code, error_message, source, submit_time, original_sender_id, original_message, original_destination)
+                 VALUES ($1,$2,$3,$4,$5,$6,'failed',$7,$8,$9,NOW(),$10,$11,$12)`,
+                [rejId, client_id, c.client_code, destination, sender_id || '', message, 'NO_SUPPLIER', 'No active supplier found', customSource || 'external_api', sender_id || '', message, destination]
             ).catch(() => {});
             return res.status(400).json({ success: false, error: 'No active supplier found', code: 'NO_SUPPLIER' });
+        }
+
+        // 3. Get and validate client rate — MNC-aware: exact MNC > wildcard > MCC-only, lowest first
+        const clientRateR = await pool.query(
+            `SELECT rate FROM rates WHERE entity_type='client' AND entity_id=$1
+             AND (mcc = $2 OR mcc = '*') AND is_active=true
+             ORDER BY CASE WHEN mnc = $3 THEN 0 WHEN mnc = '*' THEN 1 ELSE 2 END, rate ASC LIMIT 1`,
+            [client_id, route.mcc || null, route.mnc || null]
+        );
+        const clientRate = clientRateR.rows.length ? parseFloat(clientRateR.rows[0].rate) : null;
+        if (!clientRate || clientRate <= 0) {
+            const rejId = 'REJ' + Date.now() + Math.random().toString(36).substr(2, 6);
+            await pool.query(
+                `INSERT INTO sms_logs (message_id, client_id, client_code, destination, sender_id, message, status, error_code, error_message, source, submit_time, original_sender_id, original_message, original_destination)
+                 VALUES ($1,$2,$3,$4,$5,$6,'failed',$7,$8,$9,NOW(),$10,$11,$12)`,
+                [rejId, client_id, c.client_code, destination, sender_id || '', message, 'NO_RATE', 'Client rate not found', customSource || 'external_api', sender_id || '', message, destination]
+            ).catch(() => {});
+            return res.status(400).json({ success: false, error: 'Client rate not found', code: 'NO_RATE' });
         }
 
         // 4. Validate supplier rate
         if (!(route.supplier_rate > 0)) {
             const rejId = 'REJ' + Date.now() + Math.random().toString(36).substr(2, 6);
             await pool.query(
-                `INSERT INTO sms_logs (message_id, client_id, client_code, supplier_id, supplier_code, destination, sender_id, message, status, error_code, error_message, source, submit_time)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'failed',$9,$10,$11,NOW())`,
-                [rejId, client_id, c.client_code, route.supplier_id, route.supplier_code, destination, sender_id || '', message, 'NO_SUPPLIER_RATE', 'Supplier rate not found', customSource || 'external_api']
+                `INSERT INTO sms_logs (message_id, client_id, client_code, supplier_id, supplier_code, destination, sender_id, message, status, error_code, error_message, source, submit_time, original_sender_id, original_message, original_destination)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'failed',$9,$10,$11,NOW(),$12,$13,$14)`,
+                [rejId, client_id, c.client_code, route.supplier_id, route.supplier_code, destination, sender_id || '', message, 'NO_SUPPLIER_RATE', 'Supplier rate not found', customSource || 'external_api', sender_id || '', message, destination]
             ).catch(() => {});
             return res.status(400).json({ success: false, error: 'Supplier rate not found', code: 'NO_SUPPLIER_RATE' });
         }
@@ -1678,9 +1824,9 @@ app.post('/api/sms/send', auth, async (req, res) => {
         if (profit <= 0) {
             const rejId = 'REJ' + Date.now() + Math.random().toString(36).substr(2, 6);
             await pool.query(
-                `INSERT INTO sms_logs (message_id, client_id, client_code, supplier_id, supplier_code, destination, sender_id, message, status, error_code, error_message, client_rate, supplier_rate, source, submit_time)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'failed',$9,$10,$11,$12,$13,NOW())`,
-                [rejId, client_id, c.client_code, route.supplier_id, route.supplier_code, destination, sender_id || '', message, 'ROUTE_BLOCKED', 'No profit margin', clientRate, route.supplier_rate, customSource || 'external_api']
+                `INSERT INTO sms_logs (message_id, client_id, client_code, supplier_id, supplier_code, destination, sender_id, message, status, error_code, error_message, client_rate, supplier_rate, source, submit_time, original_sender_id, original_message, original_destination)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'failed',$9,$10,$11,$12,$13,NOW(),$14,$15,$16)`,
+                [rejId, client_id, c.client_code, route.supplier_id, route.supplier_code, destination, sender_id || '', message, 'ROUTE_BLOCKED', 'No profit margin', clientRate, route.supplier_rate, customSource || 'external_api', sender_id || '', message, destination]
             ).catch(() => {});
             return res.status(400).json({
                 success: false,
@@ -1699,8 +1845,8 @@ app.post('/api/sms/send', auth, async (req, res) => {
         if (available <= 0 || available < cost) {
             const rejId = 'REJ' + Date.now() + Math.random().toString(36).substr(2, 6);
             await pool.query(
-                `INSERT INTO sms_logs (message_id, client_id, client_code, supplier_id, supplier_code, destination, sender_id, message, status, error_code, error_message, client_rate, supplier_rate, source, submit_time)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'failed',$9,$10,$11,$12,$13,NOW())`,
+                `INSERT INTO sms_logs (message_id, client_id, client_code, supplier_id, supplier_code, destination, sender_id, message, status, error_code, error_message, client_rate, supplier_rate, source, submit_time, original_sender_id, original_message, original_destination)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'failed',$9,$10,$11,$12,$13,NOW(),$14,$15,$16)`,
                 [rejId, client_id, c.client_code, route.supplier_id, route.supplier_code, destination, sender_id || '', message, 'LOW_BALANCE', `Low balance: available=${Number(available)} needed=${Number(cost)}`, clientRate, route.supplier_rate, customSource || 'external_api']
             ).catch(() => {});
             return res.status(402).json({
@@ -1734,6 +1880,12 @@ app.post('/api/sms/send', auth, async (req, res) => {
             rateLimited = !check.allowed;
         }
 
+        // Apply translations before enqueue (number prefix, content replace, SID random, etc.)
+        const origSenderId = sender_id || c.smpp_username || '';
+        const origDestination = destination;
+        const origMessage = message;
+        const translated = await applyTranslations(client_id, route.supplier_id, destination, origSenderId, message);
+
         // Enqueue to async queue manager
         if (queueManager) {
             await queueManager.enqueue({
@@ -1742,9 +1894,12 @@ app.post('/api/sms/send', auth, async (req, res) => {
                 client_code: c.client_code,
                 supplier_id: route.supplier_id,
                 supplier_code: route.supplier_code,
-                sender_id: sender_id || c.smpp_username,
-                destination,
-                message,
+                sender_id: translated.sender_id,
+                destination: translated.destination,
+                message: translated.message,
+                original_sender_id: origSenderId,
+                original_message: origMessage,
+                original_destination: origDestination,
                 message_parts: parts,
                 client_rate: clientRate,
                 supplier_rate: route.supplier_rate,
@@ -1756,6 +1911,7 @@ app.post('/api/sms/send', auth, async (req, res) => {
                 trunk_name: route.trunk_name,
                 operator: route.operator || '',
                 country: route.country || '',
+                voice_otp_config_id: route.voice_otp_config_id || null,
                 billing_mode: c.billing_mode || 'dlr',
                 webhook_url: c.webhook_url || '',
                 idempotency_key: idempotency_key || null,
@@ -1768,8 +1924,8 @@ app.post('/api/sms/send', auth, async (req, res) => {
                  client_rate, supplier_rate, profit, currency, status, submit_time,
                  supplier_id, supplier_code, route_name, trunk_name, mcc, mnc, billing_mode_snapshot)
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'submitted',NOW(),$12,$13,$14,$15,$16,$17,$18)`,
-                [msgId, client_id, c.client_code, sender_id || c.smpp_username, destination, message, parts,
-                 clientRate, route.supplierRate, profit, c.currency || 'EUR',
+                [msgId, client_id, c.client_code, translated.sender_id, translated.destination, translated.message, parts,
+                 clientRate, route.supplier_rate, profit, c.currency || 'EUR',
                  route.supplier_id, route.supplier_code, route.route_name, route.trunk_name, route.mcc, route.mnc,
                  c.billing_mode || 'dlr']
             );
@@ -1920,12 +2076,32 @@ app.post('/api/sms/test', auth, async (req, res) => {
                 if (sr.rows.length > 0) supplierRate = parseFloat(sr.rows[0].rate);
             }
         } catch { /* rate lookup failures are non-critical */ }
+        // Capture original values before translation
+        const origSid = sender_id || 'TEST';
+        const origMsg = message;
+        const origDest = destination;
+
+        // Apply translations (OTP extract, number prefix, SID random, etc.)
+        let transSid = origSid;
+        let transMsg = origMsg;
+        let transDest = origDest;
+        try {
+            const translated = await applyTranslations(
+                client_id || null, supplier_id || null, destination, origSid, origMsg
+            );
+            if (translated) {
+                transSid = translated.sender_id || origSid;
+                transMsg = translated.message || origMsg;
+                transDest = translated.destination || origDest;
+            }
+        } catch (_) { /* best-effort */ }
+
         const profit = parseFloat((clientRate - supplierRate).toFixed(6));
 
         const result = await pool.query(
-            `INSERT INTO sms_logs (message_id, destination, sender_id, message, status, client_id, supplier_id, supplier_code, client_rate, supplier_rate, profit, currency, source, submit_time)
-             VALUES ($1,$2,$3,$4,'sent',$5,$6,$7,$8,$9,$10,'EUR','test_sms',NOW()) RETURNING *`,
-            [messageId, destination, sender_id || 'TEST', message, client_id || null, supplier_id || null, supplierCode, clientRate, supplierRate, profit]
+            `INSERT INTO sms_logs (message_id, destination, sender_id, message, status, client_id, supplier_id, supplier_code, client_rate, supplier_rate, profit, currency, source, submit_time, original_sender_id, original_message, original_destination)
+             VALUES ($1,$2,$3,$4,'sent',$5,$6,$7,$8,$9,$10,'EUR','test_sms',NOW(),$11,$12,$13) RETURNING *`,
+            [messageId, transDest, transSid, transMsg, client_id || null, supplier_id || null, supplierCode, clientRate, supplierRate, profit, origSid, origMsg, origDest]
         );
         // No fake DLR — real DLR is handled by the HTTP DLR poll or SMPP DLR handler
         res.json({ success: true, data: result.rows[0], supplier: supplierName, message: 'Test SMS sent successfully' });
@@ -1953,6 +2129,90 @@ app.get('/api/sms/stats', auth, async (req, res) => {
         res.status(500).json({ error: error.message });
     }
 });
+// ==================== INBOUND SMS TRAFFIC STATS ====================
+app.get('/api/sms/stats/inbound', auth, async (req, res) => {
+    try {
+        // Total inbound (MO) messages today by supplier
+        const supplierStats = await pool.query(`
+            SELECT
+                sl.supplier_id,
+                sl.supplier_code,
+                s.company_name,
+                COALESCE(s.is_inbound, false) as is_inbound,
+                s.smpp_host,
+                COUNT(*) as total_mo_today,
+                COUNT(*) FILTER (WHERE sl.status = 'delivered') as delivered,
+                COUNT(*) FILTER (WHERE sl.status = 'failed') as failed,
+                COUNT(*) FILTER (WHERE sl.status = 'submitted') as pending,
+                MAX(sl.submit_time) as last_mo_at
+            FROM sms_logs sl
+            LEFT JOIN suppliers s ON s.id = sl.supplier_id
+            WHERE sl.source = 'smpp_mo'
+              AND sl.submit_time >= CURRENT_DATE
+              AND (sl.is_deleted IS NULL OR sl.is_deleted = false)
+            GROUP BY sl.supplier_id, sl.supplier_code, s.company_name, s.is_inbound, s.smpp_host
+            ORDER BY total_mo_today DESC
+        `);
+
+        // Per-supplier throughput: messages in last 60 seconds
+        const throughputResult = await pool.query(`
+            SELECT
+                sl.supplier_id,
+                sl.supplier_code,
+                COUNT(*) as messages_60s,
+                ROUND(COUNT(*)::numeric / 60.0, 2) as throughput_per_sec
+            FROM sms_logs sl
+            WHERE sl.source = 'smpp_mo'
+              AND sl.submit_time >= NOW() - INTERVAL '60 seconds'
+              AND sl.supplier_id IS NOT NULL
+              AND (sl.is_deleted IS NULL OR sl.is_deleted = false)
+            GROUP BY sl.supplier_id, sl.supplier_code
+        `);
+
+        // Build throughput lookup
+        const throughputMap = {};
+        for (const row of throughputResult.rows) {
+            throughputMap[row.supplier_id] = {
+                messages_60s: parseInt(row.messages_60s),
+                throughput_per_sec: parseFloat(row.throughput_per_sec)
+            };
+        }
+
+        // Overall totals
+        const totalsResult = await pool.query(`
+            SELECT
+                COUNT(*) as total_mo_today,
+                COUNT(*) FILTER (WHERE status = 'delivered') as delivered,
+                COUNT(*) FILTER (WHERE status = 'failed') as failed,
+                COUNT(*) FILTER (WHERE status = 'submitted') as pending
+            FROM sms_logs
+            WHERE source = 'smpp_mo'
+              AND submit_time >= CURRENT_DATE
+              AND (is_deleted IS NULL OR is_deleted = false)
+        `);
+
+        const suppliers = supplierStats.rows.map(s => ({
+            ...s,
+            throughput_60s: throughputMap[s.supplier_id]?.messages_60s || 0,
+            throughput_per_sec: throughputMap[s.supplier_id]?.throughput_per_sec || 0,
+            delivery_rate: s.total_mo_today > 0
+                ? Math.round((parseInt(s.delivered) / parseInt(s.total_mo_today)) * 100)
+                : 0
+        }));
+
+        res.json({
+            success: true,
+            data: {
+                totals: totalsResult.rows[0] || { total_mo_today: 0, delivered: 0, failed: 0, pending: 0 },
+                suppliers,
+                has_inbound_traffic: supplierStats.rows.length > 0
+            }
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 
 // Resend SMS
 app.post('/api/sms/:id/resend', auth, async (req, res) => {
@@ -1963,9 +2223,9 @@ app.post('/api/sms/:id/resend', auth, async (req, res) => {
         const orig = result.rows[0];
         const newMessageId = `RETRY_${Date.now()}_${Math.random().toString(36).substr(2, 8)}`;
         const ins = await pool.query(
-            `INSERT INTO sms_logs (message_id, destination, sender_id, message, status, client_id, supplier_code, submit_time)
-             VALUES ($1,$2,$3,$4,'pending',$5,$6,NOW()) RETURNING *`,
-            [newMessageId, orig.destination, orig.sender_id, orig.message, orig.client_id, orig.supplier_code]
+            `INSERT INTO sms_logs (original_sender_id, original_message, original_destination, message_id, destination, sender_id, message, status, client_id, supplier_code, submit_time)
+             VALUES ($1,$2,$3,$4,'pending',$5,$6,NOW(),$7,$8,$9) RETURNING *`,
+            [newMessageId, orig.destination, orig.sender_id, orig.message, orig.client_id, orig.supplier_code, orig.original_sender_id || orig.sender_id, orig.original_message || orig.message, orig.original_destination || orig.destination]
         );
         res.json({ success: true, data: ins.rows[0], message: 'SMS queued for resend' });
     } catch (error) {
@@ -2404,70 +2664,346 @@ app.delete('/api/campaigns/:id', auth, async (req, res) => {
 });
 
 // ==================== TRANSLATIONS ====================
+// ==================== TRANSLATIONS V4 — 6-Type Engine ====================
+
+// Translation Engine: applies active translations to SMS message fields
+// Translation Engine: applies active translations to SMS message fields
+// Delegates rule-application logic to the pure applyRules() function in translationEngine.cjs
+async function applyTranslations(clientId, supplierId, destination, senderId, message) {
+    const input = { destination, sender_id: senderId, message };
+    try {
+        const transR = await pool.query(
+            `SELECT * FROM translations WHERE is_active = true 
+             AND (apply_to = 'both' OR (apply_to = 'client' AND apply_entity_id = $1) OR (apply_to = 'supplier' AND apply_entity_id = $2) OR apply_entity_id = 'all')
+             ORDER BY priority ASC`,
+            [String(clientId || ''), String(supplierId || '')]
+        );
+        if (!transR.rows.length) return input;
+        return applyRules(transR.rows, input);
+    } catch (e) {
+        console.error('[Translations] Engine error:', e.message);
+    }
+    return input;
+}
+
+// GET all translations
 app.get('/api/translations', auth, async (req, res) => {
     try {
-        const result = await pool.query('SELECT * FROM translations WHERE (is_active IS NULL OR is_active = true) ORDER BY id DESC LIMIT 500');
+        const { type } = req.query;
+        let q = 'SELECT * FROM translations WHERE 1=1';
+        const p = []; let i = 1;
+        if (type && type !== 'all') { q += ` AND translation_type = $${i++}`; p.push(type); }
+        q += ' ORDER BY priority ASC, id DESC LIMIT 2000';
+        const result = await pool.query(q, p);
         res.json({ success: true, data: result.rows });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// CREATE translation
 app.post('/api/translations', auth, async (req, res) => {
     try {
         const b = req.body || {};
         if (!b.translation_type) return res.status(400).json({ error: 'translation_type is required' });
-        if (!b.source_pattern) return res.status(400).json({ error: 'source_pattern is required' });
-        if (b.target_value === undefined || b.target_value === null) return res.status(400).json({ error: 'target_value is required' });
         const result = await pool.query(
             `INSERT INTO translations (translation_type, source_pattern, target_value,
              client_id, supplier_id, route_id, mcc, mnc,
-             name, description, subtype, priority, apply_to, apply_entity_id, is_active, created_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NOW()) RETURNING *`,
-            [b.translation_type, b.source_pattern, b.target_value || '',
+             name, description, subtype, priority, apply_to, apply_entity_id, is_active,
+             strip_prefix_digits, add_prefix_text, match_content, replace_content,
+             is_otp_extract, otp_length_min, otp_length_max,
+             template_data, sid_match_type, mccmnc_list, created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
+                     $16,$17,$18,$19,$20,$21,$22,$23,$24,$25,NOW()) RETURNING *`,
+            [b.translation_type, b.source_pattern || '', b.target_value || '',
              b.client_id || null, b.supplier_id || null, b.route_id || null, b.mcc || null, b.mnc || null,
-             b.name || '', b.description || '', b.subtype || '', b.priority || 1, b.apply_to || 'client', b.apply_entity_id || 'all', b.is_active !== false]
+             b.name || '', b.description || '', b.subtype || '', b.priority || 1, b.apply_to || 'client', b.apply_entity_id || 'all', b.is_active !== false,
+             b.strip_prefix_digits || 0, b.add_prefix_text || '', b.match_content || '', b.replace_content || '',
+             b.is_otp_extract || false, b.otp_length_min || 4, b.otp_length_max || 8,
+             b.template_data ? JSON.stringify(b.template_data) : '[]', b.sid_match_type || 'exact', b.mccmnc_list || null]
         );
         res.json({ success: true, data: result.rows[0] });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// UPDATE translation
 app.put('/api/translations/:id', auth, async (req, res) => {
     try {
         const { id } = req.params;
         const fields = req.body;
         const allowed = ['translation_type','source_pattern','target_value',
             'client_id','supplier_id','route_id','mcc','mnc',
-            'name','description','subtype','priority','apply_to','apply_entity_id','is_active'];
+            'name','description','subtype','priority','apply_to','apply_entity_id','is_active',
+            'strip_prefix_digits','add_prefix_text','match_content','replace_content',
+            'is_otp_extract','otp_length_min','otp_length_max',
+            'template_data','sid_match_type','mccmnc_list'];
         const setParts = []; const values = []; let idx = 1;
         for (const key of allowed) {
-            if (fields[key] !== undefined) { setParts.push(`${key} = $${idx++}`); values.push(fields[key]); }
+            if (fields[key] !== undefined) {
+                const val = (key === 'template_data' && typeof fields[key] !== 'string')
+                    ? JSON.stringify(fields[key]) : fields[key];
+                setParts.push(`${key} = $${idx++}`);
+                values.push(val);
+            }
         }
         if (setParts.length === 0) return res.status(400).json({ error: 'No fields to update' });
         values.push(id);
         const result = await pool.query(
-            `UPDATE translations SET ${setParts.join(', ')} WHERE id = $${values.length} RETURNING *`,
-            values
-        );
+            `UPDATE translations SET ${setParts.join(', ')} WHERE id = $${values.length} RETURNING *`, values);
         if (result.rows.length === 0) return res.status(404).json({ error: 'Translation not found' });
         res.json({ success: true, data: result.rows[0] });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// DELETE translation (hard delete)
 app.delete('/api/translations/:id', auth, async (req, res) => {
     try {
         const { id } = req.params;
-        const result = await pool.query('UPDATE translations SET is_active = false WHERE id = $1 RETURNING id', [id]);
+        const result = await pool.query('DELETE FROM translations WHERE id = $1 RETURNING id', [id]);
         if (result.rows.length === 0) return res.status(404).json({ error: 'Translation not found' });
-        res.json({ success: true, message: 'Translation deactivated (soft delete)' });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
+        res.json({ success: true, message: 'Translation deleted' });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// BULK DELETE translations of a type
+app.post('/api/translations/bulk-delete', auth, async (req, res) => {
+    try {
+        const { type, ids } = req.body || {};
+        if (ids && Array.isArray(ids)) {
+            await pool.query('DELETE FROM translations WHERE id = ANY($1::int[])', [ids]);
+            res.json({ success: true, message: `${ids.length} translations deleted` });
+        } else if (type) {
+            const result = await pool.query('DELETE FROM translations WHERE translation_type = $1 RETURNING id', [type]);
+            res.json({ success: true, message: `${result.rows.length} translations of type "${type}" deleted` });
+        } else {
+            res.status(400).json({ error: 'type or ids array required' });
+        }
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// TEST translation
+app.post('/api/translations/test', auth, async (req, res) => {
+    try {
+        const { translation_type, source_pattern, target_value, match_content, replace_content,
+            strip_prefix_digits, add_prefix_text, is_otp_extract, otp_length_min, otp_length_max,
+            template_data, test_input, test_sender_id, test_destination } = req.body || {};
+        
+        let output = test_input || '';
+        let sidOutput = test_sender_id || '';
+        let destOutput = test_destination || '';
+        
+        switch (translation_type) {
+            case 'number_prefix': {
+                let num = (test_destination || test_input || '').replace(/^\+/, '');
+                if (strip_prefix_digits > 0) num = num.substring(strip_prefix_digits);
+                if (add_prefix_text) num = add_prefix_text + num;
+                destOutput = num;
+                output = num;
+                break;
+            }
+            case 'content_replace': {
+                if (match_content && test_input) {
+                    if (is_otp_extract) {
+                        const min = otp_length_min || 4, max = otp_length_max || 8;
+                        const re = new RegExp(`\\b(\\d{${min},${max}})\\b`, 'g');
+                        const matches = test_input.match(re);
+                        output = matches ? (replace_content ? replace_content.replace(/\{\{OTP\}\}/g, matches[0]) : matches[0]) : test_input;
+                    } else {
+                        output = test_input.replace(new RegExp(match_content.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), replace_content || '');
+                    }
+                }
+                break;
+            }
+            case 'otp_extract': {
+                if (test_input) {
+                    let matches = null;
+                    // Prefer custom regex pattern from otp_pattern field
+                    const otpPattern = req.body.otp_pattern || null;
+                    if (otpPattern) {
+                        try {
+                            const re = new RegExp(otpPattern, 'g');
+                            const execResult = re.exec(test_input);
+                            if (execResult) {
+                                matches = [execResult[1] || execResult[0]];
+                            }
+                        } catch (_) { /* invalid regex — fall through */ }
+                    }
+                    if (!matches) {
+                        const min = otp_length_min || 4, max = otp_length_max || 8;
+                        const re = new RegExp(`\\b(\\d{${min},${max}})\\b`, 'g');
+                        matches = test_input.match(re);
+                    }
+                    output = matches ? (replace_content ? replace_content.replace(/\{\{OTP\}\}/g, matches[0]) : matches[0]) : test_input;
+                }
+                break;
+            }
+            case 'sid_alias': {
+                if (source_pattern && test_sender_id) {
+                    const pat = source_pattern.replace(/\*/g, '.*');
+                    sidOutput = new RegExp('^' + pat + '$', 'i').test(test_sender_id) ? (target_value || test_sender_id) : test_sender_id;
+                }
+                output = sidOutput;
+                break;
+            }
+            case 'sid_random': {
+                let templates = [];
+                if (template_data && Array.isArray(template_data)) templates = template_data;
+                else if (target_value) templates = target_value.split('|').map(s => s.trim()).filter(Boolean);
+                if (templates.length > 0) {
+                    sidOutput = templates[Math.floor(Math.random() * templates.length)];
+                    output = sidOutput;
+                }
+                break;
+            }
+            case 'random_content': {
+                let templates = [];
+                if (template_data && Array.isArray(template_data)) templates = template_data;
+                else if (target_value) templates = target_value.split('|').map(s => s.trim()).filter(Boolean);
+                if (templates.length > 0) {
+                    const pick = templates[Math.floor(Math.random() * templates.length)];
+                    if (test_input) {
+                        const min = otp_length_min || 4, max = otp_length_max || 8;
+                        const re = new RegExp(`\\b(\\d{${min},${max}})\\b`, 'g');
+                        const matches = test_input.match(re);
+                        output = pick.replace(/\{\{OTP\}\}/g, matches ? matches[0] : '');
+                    } else {
+                        output = pick;
+                    }
+                }
+                break;
+            }
+        }
+        res.json({ success: true, data: { input: test_input, output, sender_id: sidOutput, destination: destOutput } });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// IMPORT CSV translations (replaces all of a type)
+app.post('/api/translations/import', auth, async (req, res) => {
+    try {
+        const { csv, type } = req.body || {};
+        if (!csv || !type) return res.status(400).json({ error: 'csv and type are required' });
+        const lines = csv.split(/[\n\r]+/).filter(Boolean);
+        if (lines.length < 2) return res.status(400).json({ error: 'CSV needs header + data rows' });
+        const header = lines[0];
+        let delim = ',';
+        const counts = { ',': (header.match(/,/g) || []).length, '\t': (header.match(/\t/g) || []).length, ';': (header.match(/;/g) || []).length, '|': (header.match(/\|/g) || []).length };
+        for (const [d, c] of Object.entries(counts)) { if (c > counts[delim]) delim = d; }
+        const headers = header.split(delim).map(h => h.trim().toLowerCase().replace(/[^a-z0-9_]/g, '_'));
+        
+        await pool.query('DELETE FROM translations WHERE translation_type = $1', [type]);
+        
+        const created = []; let errors = [];
+        for (let li = 1; li < lines.length; li++) {
+            const fields = lines[li].split(delim).map(f => f.trim());
+            if (fields.length < headers.length) continue;
+            const row = {};
+            headers.forEach((h, i) => { row[h] = fields[i] || ''; });
+            // OTP Extract: auto-set engine defaults for no-code experience
+            if (type === 'otp_extract') {
+                row.is_otp_extract = 'true';
+                if (!row.replace_content) row.replace_content = '{{OTP}}';
+                if (!row.otp_length_min) row.otp_length_min = '4';
+                if (!row.otp_length_max) row.otp_length_max = '8';
+            }
+            try {
+                const ins = await pool.query(
+                    `INSERT INTO translations (translation_type, name, source_pattern, target_value,
+                     match_content, replace_content, priority, is_active,
+                     strip_prefix_digits, add_prefix_text, is_otp_extract,
+                     otp_length_min, otp_length_max, template_data, sid_match_type,
+                     apply_to, apply_entity_id, created_at)
+                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW()) RETURNING *`,
+                    [type, row.name || `Rule ${li}`, row.source_pattern || row.pattern || '', row.target_value || row.replace || row.templates || '',
+                     row.match_content || row.search || '', row.replace_content || row.replace_with || '',
+                     parseInt(row.priority) || li, row.is_active !== 'false' && row.is_active !== false,
+                     parseInt(row.strip_prefix_digits) || 0, row.add_prefix_text || row.add_prefix || '',
+                     row.is_otp_extract === 'true' || row.otp === 'true',
+                     parseInt(row.otp_length_min) || 4, parseInt(row.otp_length_max) || 8,
+                     row.template_data || row.templates || '[]', row.sid_match_type || 'exact',
+                     row.apply_to || 'both', row.apply_entity_id || 'all']
+                );
+                created.push(ins.rows[0]);
+            } catch (e) { errors.push({ line: li + 1, error: e.message }); }
+        }
+        res.json({ success: true, data: { created: created.length, errors: errors.length ? errors : undefined, replaced: true, type } });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// EXPORT translations CSV
+app.get('/api/translations/export', auth, async (req, res) => {
+    try {
+        const { type } = req.query;
+        let q = 'SELECT * FROM translations WHERE is_active = true';
+        const p = [];
+        if (type && type !== 'all') { q += ' AND translation_type = $1'; p.push(type); }
+        q += ' ORDER BY priority ASC, id ASC';
+        const result = await pool.query(q, p);
+        const cols = ['id','translation_type','name','source_pattern','target_value','match_content','replace_content','priority','is_active','strip_prefix_digits','add_prefix_text','is_otp_extract','otp_length_min','otp_length_max','apply_to','apply_entity_id','created_at'];
+        const rows = result.rows.map(r => cols.map(c => {
+            const v = r[c]; if (v === null || v === undefined) return '';
+            if (typeof v === 'object') return JSON.stringify(v).replace(/"/g, '""');
+            return String(v).replace(/"/g, '""');
+        }).join(','));
+        const csv = cols.join(',') + '\n' + rows.join('\n');
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', `attachment; filename=translations_${type || 'all'}_${new Date().toISOString().split('T')[0]}.csv`);
+        res.send(csv);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// SAMPLE CSV template per type
+app.get('/api/translations/sample/:type', auth, async (req, res) => {
+    const samples = {
+        number_prefix: 'name,source_pattern,target_value,strip_prefix_digits,add_prefix_text,priority,is_active,apply_to,apply_entity_id\nBD Strip 00880,,,2,,1,true,both,all\nBD Add 77,,,0,77,2,true,both,all',
+        content_replace: 'name,match_content,replace_content,is_otp_extract,otp_length_min,otp_length_max,priority,is_active,apply_to,apply_entity_id\nOTP Forward,your code is,Your OTP: {{OTP}},true,4,8,1,true,both,all',
+        otp_extract: 'name,source_pattern,replace_content,otp_length_min,otp_length_max,priority,is_active,apply_to,apply_entity_id\nExtract OTP Only,,{{OTP}},4,8,1,true,both,all',
+        sid_alias: 'name,source_pattern,target_value,sid_match_type,priority,is_active,apply_to,apply_entity_id\nMask TC*,TECHCORP,TC-MSG,wildcard,1,true,both,all',
+        sid_random: 'name,target_value,priority,is_active,apply_to,apply_entity_id\nRandom SID Pool,SID1|SID2|SID3|SID4|SID5,1,true,both,all',
+        random_content: 'name,target_value,is_otp_extract,otp_length_min,otp_length_max,priority,is_active,apply_to,apply_entity_id\nRandom OTP 1,Your OTP code is {{OTP}}. Valid for 5 min.,true,4,8,1,true,both,all',
+    };
+    const type = req.params.type;
+    if (!samples[type]) return res.status(404).json({ error: `Unknown type: ${type}` });
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename=sample_${type}.csv`);
+    res.send(samples[type]);
+});
+
+
+// Replay: re-run an SMS log's original message through current active translation rules
+app.post('/api/translations/replay', auth, async (req, res) => {
+    try {
+        const { original_destination, original_sender_id, original_message, client_id, supplier_id } = req.body || {};
+        if (!original_message || !original_destination) {
+            return res.status(400).json({ error: 'original_message and original_destination are required' });
+        }
+        const input = {
+            destination: original_destination,
+            sender_id: original_sender_id || '',
+            message: original_message,
+        };
+        const translated = await applyTranslations(
+            client_id || null, supplier_id || null,
+            original_destination, original_sender_id || '', original_message
+        );
+        res.json({
+            success: true,
+            data: {
+                original: input,
+                current: {
+                    destination: translated.destination,
+                    sender_id: translated.sender_id,
+                    message: translated.message,
+                },
+                changed: {
+                    destination: translated.destination !== input.destination,
+                    sender_id: translated.sender_id !== input.sender_id,
+                    message: translated.message !== input.message,
+                },
+            },
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
     }
 });
+
 
 // ==================== MCCMNC ====================
 app.get('/api/mccmnc', auth, async (req, res) => {
@@ -2659,17 +3195,84 @@ app.delete('/api/voice-otp/configs/:id', auth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Audio upload for language configs
+// Audio upload for language configs (greetings + digit audio)
+// Supports MP3 auto-conversion to WAV via ffmpeg if available
 app.post('/api/voice-otp/configs/:id/audio', auth, voiceOtpUpload.single('audio'), async (req, res) => {
     try {
         const { id } = req.params;
         if (!req.file) return res.status(400).json({ error: 'No audio file provided' });
-        const b64 = req.file.buffer.toString('base64');
-        const mime = req.file.mimetype || 'audio/wav';
-        const dataUrl = `data:${mime};base64,${b64}`;
+        
         const field = req.body.field || 'greeting_audio_url';
-        const allowedFields = ['greeting_audio_url','secondary_greeting_audio_url'];
-        if (!allowedFields.includes(field)) return res.status(400).json({ error: 'Invalid audio field' });
+        const digit = req.body.digit || null;       // '0'-'9' for digit uploads
+        const layer = req.body.layer || 'primary';  // 'primary' or 'secondary'
+        
+        // --- MP3 → WAV conversion via ffmpeg (if available) ---
+        let audioBuffer = req.file.buffer;
+        let mime = req.file.mimetype || 'audio/wav';
+        const isMp3 = mime.includes('mpeg') || mime.includes('mp3') || req.file.originalname?.toLowerCase().endsWith('.mp3');
+        
+        if (isMp3) {
+            try {
+                const { exec } = require('child_process');
+                const fs = require('fs');
+                const tmpIn = `/tmp/voice_otp_upload_${Date.now()}_in.mp3`;
+                const tmpOut = `/tmp/voice_otp_upload_${Date.now()}_out.wav`;
+                fs.writeFileSync(tmpIn, req.file.buffer);
+                // Convert: 8kHz mono 16-bit PCM WAV (telecom standard)
+                await new Promise((resolve, reject) => {
+                    exec(`ffmpeg -y -i ${tmpIn} -ar 8000 -ac 1 -sample_fmt s16 ${tmpOut} 2>/dev/null`, { timeout: 15000 }, (err) => {
+                        if (err) reject(err); else resolve();
+                    });
+                });
+                audioBuffer = fs.readFileSync(tmpOut);
+                mime = 'audio/wav';
+                // Cleanup temp files
+                try { fs.unlinkSync(tmpIn); fs.unlinkSync(tmpOut); } catch (_) {}
+                console.log(`[VoiceOTP-Audio] MP3→WAV converted: ${req.file.originalname} (${req.file.size}→${audioBuffer.length} bytes)`);
+            } catch (convErr) {
+                console.warn(`[VoiceOTP-Audio] ffmpeg conversion failed, storing as-is: ${convErr.message}`);
+                // Store original MP3 as-is (Asterisk can handle MP3 if configured)
+            }
+        }
+        
+        const b64 = audioBuffer.toString('base64');
+        const dataUrl = `data:${mime};base64,${b64}`;
+        
+        // --- Digit audio upload (store in JSONB) ---
+        if (digit !== null && digit !== undefined && /^[0-9]$/.test(String(digit))) {
+            const jsonbCol = layer === 'secondary' ? 'audio_0_9_secondary' : 'audio_0_9_primary';
+            
+            // Fetch existing JSONB, update the digit key, store back
+            const existing = await pool.query(
+                `SELECT ${jsonbCol} FROM voice_otp_configs WHERE id = $1`,
+                [id]
+            );
+            if (existing.rows.length === 0) return res.status(404).json({ error: 'Config not found' });
+            
+            let audioMap = {};
+            try {
+                const raw = existing.rows[0][jsonbCol];
+                if (raw && typeof raw === 'string') audioMap = JSON.parse(raw);
+                else if (raw && typeof raw === 'object') audioMap = raw;
+            } catch (_) { audioMap = {}; }
+            
+            audioMap[String(digit)] = dataUrl;
+            
+            await pool.query(
+                `UPDATE voice_otp_configs SET ${jsonbCol} = $1 WHERE id = $2`,
+                [JSON.stringify(audioMap), id]
+            );
+            
+            res.json({ success: true, message: `Digit ${digit} audio uploaded (${layer})`, digit: String(digit), layer });
+            return;
+        }
+        
+        // --- Greeting audio upload (store in text column) ---
+        const allowedFields = ['greeting_audio_url', 'secondary_greeting_audio_url'];
+        if (!allowedFields.includes(field)) {
+            return res.status(400).json({ error: 'Invalid audio field. Use field=greeting_audio_url, field=secondary_greeting_audio_url, or digit=0-9 with layer=primary|secondary' });
+        }
+        
         const result = await pool.query(
             `UPDATE voice_otp_configs SET ${field} = $1 WHERE id = $2 RETURNING *`,
             [dataUrl, id]
@@ -3587,13 +4190,19 @@ app.get('/api/bind/status', auth, async (req, res) => {
         const showDeleted = req.query.show_deleted === 'true';
         const result = await pool.query(
             `SELECT s.id, s.supplier_code, s.company_name, s.bind_status, s.consecutive_failures,
-                    s.smpp_host, s.smpp_port, s.smpp_username, s.connection_type, s.status as supplier_status,
+                    s.smpp_host, s.smpp_port, s.smpp_username, s.connection_type, s.status as supplier_status, s.is_inbound, s.smpp_bind_type,
+       CASE WHEN s.is_inbound = true THEN 'smsc_server' ELSE 'esme_client' END as smpp_mode,
                     COALESCE(sess.system_id, client_sess.system_id) as session_system_id,
                     COALESCE(sess.connected_at, client_sess.connected_at) as connected_at,
                     COALESCE(sess.ip_address, client_sess.ip_address) as ip_address,
                     COALESCE(sess.status, client_sess.status) as session_status,
                     COALESCE(sess.bind_mode, client_sess.bind_mode) as bind_mode,
-                    CASE WHEN sess.id IS NOT NULL OR client_sess.id IS NOT NULL THEN 'connected' ELSE 'disconnected' END as session_state
+                    CASE 
+         WHEN client_sess.id IS NOT NULL AND client_sess.status = 'bound' THEN 'connected'
+         WHEN sess.id IS NOT NULL AND sess.status = 'bound' THEN 'connected'
+         WHEN s.bind_status = 'bound' THEN 'connected'
+         ELSE 'disconnected' 
+       END as session_state
              FROM suppliers s
              LEFT JOIN active_smpp_sessions sess ON s.id = sess.entity_id AND sess.entity_type = 'supplier'
              LEFT JOIN smpp_sessions client_sess ON client_sess.entity_type = 'client'

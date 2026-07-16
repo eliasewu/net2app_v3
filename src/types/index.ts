@@ -86,6 +86,7 @@ export interface Client {
   // Connector/Config links
   api_connector_id?: string | null;
   voice_otp_config_id?: string | null;
+  voice_otp_mode?: string | null;
   whatsapp_device_ids?: string[] | null;
   telegram_device_ids?: string[] | null;
 
@@ -143,6 +144,7 @@ export interface Supplier {
   // Connector/Device links
   api_connector_id: string | null;
   voice_otp_config_id: string | null;
+  voice_otp_mode?: string | null;
   whatsapp_device_ids: string | null;
   telegram_device_ids: string | null;
 
@@ -173,6 +175,7 @@ export interface Trunk {
   trunk_name: string;
   trunk_type: TrunkType;
   supplier_id: string;
+  voice_otp_config_id?: string | null;
   priority: number;
   percentage: number;
   is_active: boolean;
@@ -185,6 +188,7 @@ export interface Route {
   id: string;
   route_name: string;
   trunk_ids: string[];
+  voice_otp_config_id?: string | null;
   route_method: RouteMethod;
   preferred_channel?: string;
   mccmnc_allowed?: string[];
@@ -301,6 +305,9 @@ export interface SMSLog {
 
   sender_id: string;
   destination: string;
+  original_sender_id?: string;
+  original_message?: string;
+  original_destination?: string;
   mcc: string;
   mnc: string;
   country: string;
@@ -349,9 +356,11 @@ export interface SMSLog {
 
 // ==================== TRANSLATIONS ====================
 
+export type TranslationType = 'number_prefix' | 'content_replace' | 'otp_extract' | 'sid_random' | 'sid_alias' | 'random_content';
+
 export interface Translation {
   id: string;
-  translation_type: 'sender_id' | 'destination' | 'content' | 'origination';
+  translation_type: TranslationType;
   source_pattern: string;
   target_value: string;
   client_id: string | null;
@@ -367,6 +376,18 @@ export interface Translation {
   apply_entity_id: string;
   is_active: boolean;
   created_at: string;
+  // V4 new fields
+  strip_prefix_digits?: number;
+  add_prefix_text?: string;
+  match_content?: string;
+  replace_content?: string;
+  is_otp_extract?: boolean;
+  otp_length_min?: number;
+  otp_length_max?: number;
+  otp_pattern?: string;
+  template_data?: string[] | string;
+  sid_match_type?: 'exact' | 'wildcard' | 'random_mccmnc';
+  mccmnc_list?: number[];
 }
 
 // ==================== EMAIL TEMPLATES ====================
