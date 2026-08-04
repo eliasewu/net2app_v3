@@ -470,14 +470,38 @@ function directSipOriginate(opts, startedAt) {
   }
   if (allFiles.length === 0 && greetingAudio) allFiles.push(greetingAudio);
 
+  // Trim trailing silence from PCM: finds last sample above threshold and cuts the rest
+  function trimTrailingSilence(pcm) {
+    if (!pcm || pcm.length < 2) return pcm;
+    const SILENCE_THRESHOLD = 200;
+    let lastSig = pcm.length - 2;
+    while (lastSig >= 0 && Math.abs(pcm.readInt16LE(lastSig)) < SILENCE_THRESHOLD) {
+      lastSig -= 2;
+    }
+    if (lastSig < 0) return pcm; // all silence, keep as-is
+    return pcm.subarray(0, lastSig + 2);
+  }
+
+  // Inter-digit gap: 200ms of silence at 8kHz 16-bit mono = 3200 bytes
+  const DIGIT_GAP_SAMPLES = 1600; // 200ms * 8000Hz
+  const DIGIT_GAP_BYTES = DIGIT_GAP_SAMPLES * 2; // 3200 bytes
+  const gapBuffer = Buffer.alloc(DIGIT_GAP_BYTES); // zeros = silence
+
   // Pre-load all audio PCM (handles base64 data URLs + disk files)
   let allPcm = Buffer.alloc(0);
   let loadedCount = 0;
   const missing = [];
-  for (const fp of allFiles) {
+  for (let fi = 0; fi < allFiles.length; fi++) {
+    const fp = allFiles[fi];
     const pcm = readAudioFile(fp);
     if (pcm) {
-      allPcm = Buffer.concat([allPcm, pcm]);
+      // Trim trailing silence, add gap between digit files (skip gap after greeting)
+      const trimmed = trimTrailingSilence(pcm);
+      allPcm = Buffer.concat([allPcm, trimmed]);
+      // Insert gap after greeting and between digits (not after last file)
+      if (fi < allFiles.length - 1) {
+        allPcm = Buffer.concat([allPcm, gapBuffer]);
+      }
       loadedCount++;
     } else {
       missing.push(String(fp).slice(0, 60));
