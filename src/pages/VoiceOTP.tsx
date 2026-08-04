@@ -11,8 +11,10 @@ interface VoiceCall {
   dlr_status: string;
   retry_count: number;
   max_retries: number;
+  language: string;
+  duration: number;
+  total_cost: number;
   created_at: string;
-  answered_at: string;
   completed_at: string;
 }
 
@@ -109,11 +111,23 @@ export const VoiceOTP: React.FC = () => {
   };
 
   const getStatusBadge = (status: string, dlrStatus: string) => {
+    // Success states
     if (dlrStatus === 'DELIVRD') {
       return <span className="px-2 py-1 bg-green-100 text-green-800 rounded-full text-xs flex items-center gap-1"><CheckCircle className="w-3 h-3" /> Delivered</span>;
     }
-    if (dlrStatus === 'UNDELIV') {
+    if (status === 'completed') {
+      return <span className="px-2 py-1 bg-green-100 text-green-800 rounded-full text-xs flex items-center gap-1"><CheckCircle className="w-3 h-3" /> Completed</span>;
+    }
+    // Failure states
+    if (dlrStatus === 'UNDELIV' || dlrStatus === 'FAILED') {
       return <span className="px-2 py-1 bg-red-100 text-red-800 rounded-full text-xs flex items-center gap-1"><XCircle className="w-3 h-3" /> Failed</span>;
+    }
+    if (status === 'failed') {
+      return <span className="px-2 py-1 bg-red-100 text-red-800 rounded-full text-xs flex items-center gap-1"><XCircle className="w-3 h-3" /> Failed</span>;
+    }
+    // In-progress states
+    if (status === 'sent') {
+      return <span className="px-2 py-1 bg-blue-100 text-blue-800 rounded-full text-xs flex items-center gap-1"><Phone className="w-3 h-3" /> Dialing</span>;
     }
     if (status === 'ringing') {
       return <span className="px-2 py-1 bg-yellow-100 text-yellow-800 rounded-full text-xs flex items-center gap-1"><Clock className="w-3 h-3" /> Ringing</span>;
@@ -122,12 +136,13 @@ export const VoiceOTP: React.FC = () => {
       return <span className="px-2 py-1 bg-blue-100 text-blue-800 rounded-full text-xs flex items-center gap-1"><RotateCcw className="w-3 h-3" /> Retry Scheduled</span>;
     }
     if (status === 'retrying') {
-      return <span className="px-2 py-1 bg-purple-100 text-purple-800 rounded-full text-xs flex items-center gap-1"><RefreshCw className="w-3 h-3" /> Retrying...</span>;
+      return <span className="px-2 py-1 bg-purple-100 text-purple-800 rounded-full text-xs flex items-center gap-1"><RefreshCw className="w-3 h-3" /> Retrying</span>;
     }
     if (status === 'initiated') {
       return <span className="px-2 py-1 bg-gray-100 text-gray-800 rounded-full text-xs flex items-center gap-1"><Phone className="w-3 h-3" /> Initiating</span>;
     }
-    return <span className="px-2 py-1 bg-gray-100 text-gray-800 rounded-full text-xs">{status}</span>;
+    // Fallback: show raw status
+    return <span className="px-2 py-1 bg-gray-100 text-gray-800 rounded-full text-xs">{status || 'unknown'}</span>;
   };
 
   if (loading) {
@@ -211,9 +226,11 @@ export const VoiceOTP: React.FC = () => {
               <tr>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Call ID</th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Destination</th>
+                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Language</th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">OTP</th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Retries</th>
+                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Duration</th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Created</th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Actions</th>
               </tr>
@@ -223,9 +240,11 @@ export const VoiceOTP: React.FC = () => {
                 <tr key={call.id} className="hover:bg-gray-50">
                   <td className="px-6 py-4 text-sm font-mono">{call.call_id}</td>
                   <td className="px-6 py-4 text-sm">{call.destination}</td>
+                  <td className="px-6 py-4 text-sm">{call.language || '—'}</td>
                   <td className="px-6 py-4 text-sm font-mono font-bold">{call.otp_code}</td>
                   <td className="px-6 py-4">{getStatusBadge(call.status, call.dlr_status)}</td>
                   <td className="px-6 py-4 text-sm">{call.retry_count}/{call.max_retries}</td>
+                  <td className="px-6 py-4 text-sm">{call.duration ? `${(call.duration / 1000).toFixed(1)}s` : '—'}</td>
                   <td className="px-6 py-4 text-sm">{new Date(call.created_at).toLocaleString()}</td>
                   <td className="px-6 py-4">
                     {call.status !== 'completed' && call.status !== 'failed' && (
@@ -242,7 +261,7 @@ export const VoiceOTP: React.FC = () => {
               ))}
               {calls.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="px-6 py-8 text-center text-gray-500">
+                  <td colSpan={9} className="px-6 py-8 text-center text-gray-500">
                     No voice OTP calls yet
                   </td>
                 </tr>

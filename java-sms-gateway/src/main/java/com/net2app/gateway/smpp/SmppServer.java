@@ -28,6 +28,15 @@ public class SmppServer {
     private DefaultSmppServer server;
     private final Map<String, SmppSession> sessions = new ConcurrentHashMap<>();
 
+    /**
+     * Tracks authenticated systemId for each session.
+     * ch-smpp auto-handles bind PDUs internally and may not forward them
+     * to firePduRequestReceived(). This map bridges the gap:
+     * sessionBindRequested() authenticates → stores systemId here →
+     * the EsmeSessionHandler checks this map before processing PDUs.
+     */
+    private final Map<Long, String> authBySessionId = new ConcurrentHashMap<>();
+
     public SmppServer(int port) {
         this.port = port;
     }
@@ -42,19 +51,95 @@ public class SmppServer {
             @Override
             public void sessionBindRequested(Long sessionId, SmppSessionConfiguration sessionConfig,
                                              BaseBind bindRequest) throws SmppProcessingException {
-                // Optional: pre-bind validation
+                // Authenticate the bind BEFORE ch-smpp accepts it.
+                // This is the only reliable place to validate ESME credentials
+                // because ch-smpp handles bind PDUs internally and may not
+                // forward them to firePduRequestReceived().
+                String systemId = bindRequest.getSystemId();
+                String password = bindRequest.getPassword();
+
+                boolean valid = Database.authenticateClient(systemId, password);
+                if (!valid) {
+                    valid = Database.authenticateSupplier(systemId, password);
+                }
+
+                if (valid) {
+                    authBySessionId.put(sessionId, systemId);
+                    log.info("SMPP bind accepted: {} (session {})", systemId, sessionId);
+                } else {
+                    log.warn("SMPP bind rejected: {} (session {}) — invalid credentials", systemId, sessionId);
+                    throw new SmppProcessingException(0x0000000D, "Invalid credentials");
+                }
             }
 
             @Override
             public void sessionCreated(Long sessionId, SmppServerSession session,
                                        BaseBindResp preparedBindResponse) throws SmppProcessingException {
-                log.info("New SMPP session {} from {}", sessionId, session.getConfiguration().getHost());
-                session.serverReady(new EsmeSessionHandler(session));
+                String systemId = authBySessionId.get(sessionId);
+                String ipAddress = session.getConfiguration().getHost();
+                int port = session.getConfiguration().getPort();
+                String negotiatedVersion = String.format("%02X", session.getConfiguration().getInterfaceVersion());
+
+                log.info("SMPP session {} established: {} from {}:{}",
+                    sessionId, systemId != null ? systemId : "unknown", ipAddress, port);
+
+                // Look up the entity (supplier or client) and record the bind in smpp_sessions + bind_history
+                int cachedEntityId = 0;
+                String entityType = null;
+
+                if (systemId != null) {
+                    // Check if this is an inbound supplier (GSM gateway)
+                    Database.SupplierLookup supplier = Database.lookupInboundSupplier(systemId);
+                    if (supplier != null) {
+                        Database.recordInboundSupplierBind(supplier.id, systemId, ipAddress, port, negotiatedVersion);
+                        cachedEntityId = supplier.id;
+                        entityType = "supplier";
+                        log.info("Inbound supplier {} (#{}) bind recorded in smpp_sessions (v{})",
+                            supplier.supplierCode, supplier.id, negotiatedVersion);
+                    } else {
+                        // Check if this is a client (ESME)
+                        Database.ClientLookup client = Database.lookupClient(systemId);
+                        if (client != null) {
+                            Database.recordClientBind(client.id, systemId, ipAddress, port, negotiatedVersion);
+                            cachedEntityId = client.id;
+                            entityType = "client";
+                            log.info("Client {} (#{}) bind recorded in smpp_sessions (v{})",
+                                client.clientCode, client.id, negotiatedVersion);
+                        }
+                    }
+                }
+
+                // Pass entity ID info to the handler so it can refresh last_activity
+                // on every enquire_link / submit_sm without re-querying the DB.
+                final int finalEntityId = cachedEntityId;
+                final String finalEntityType = entityType;
+                session.serverReady(new EsmeSessionHandler(session, systemId, finalEntityId, finalEntityType));
             }
 
             @Override
             public void sessionDestroyed(Long sessionId, SmppServerSession session) {
-                log.info("SMPP session {} destroyed", sessionId);
+                String systemId = authBySessionId.remove(sessionId);
+                if (systemId != null) {
+                    sessions.remove(systemId);
+                    String ipAddress = session.getConfiguration().getHost();
+                    int port = session.getConfiguration().getPort();
+
+                    // Record unbind for whichever entity type (supplier or client)
+                    Database.SupplierLookup supplier = Database.lookupInboundSupplier(systemId);
+                    if (supplier != null) {
+                        Database.recordInboundSupplierUnbind(supplier.id, systemId, ipAddress, port);
+                        log.info("Inbound supplier {} (#{}) unbind recorded",
+                            supplier.supplierCode, supplier.id);
+                    } else {
+                        Database.ClientLookup client = Database.lookupClient(systemId);
+                        if (client != null) {
+                            Database.recordClientUnbind(client.id, systemId, ipAddress, port);
+                            log.info("Client {} (#{}) unbind recorded",
+                                client.clientCode, client.id);
+                        }
+                    }
+                }
+                log.info("SMPP session {} destroyed ({})", sessionId, systemId != null ? systemId : "anonymous");
             }
         });
 
@@ -73,51 +158,73 @@ public class SmppServer {
         }
     }
 
+    /**
+     * Get all active ESME sessions keyed by smpp_username (systemId).
+     * Used by DlrPusher to find the correct session for deliver_sm push.
+     */
     public Map<String, SmppSession> getSessions() {
         return sessions;
     }
 
     /**
-     * Per-session ESME handler — handles bind, submit_sm, enquire_link, unbind.
+     * Get a specific ESME session by systemId.
+     */
+    public SmppSession getSession(String systemId) {
+        return sessions.get(systemId);
+    }
+
+    /**
+     * Per-session ESME handler — handles submit_sm, enquire_link, unbind.
+     * Authentication is performed in sessionBindRequested() at the server level;
+     * this handler receives the pre-authenticated systemId via constructor.
      */
     private class EsmeSessionHandler extends DefaultSmppSessionHandler {
         private final SmppSession session;
-        private boolean authenticated = false;
-        private String boundSystemId = null;
+        private final String boundSystemId;
+        private final int cachedEntityId;   // cached entity ID (supplier or client)
+        private final String entityType;    // "supplier" or "client"
 
-        EsmeSessionHandler(SmppSession session) {
+        EsmeSessionHandler(SmppSession session, String boundSystemId, int entityId, String entityType) {
             this.session = session;
+            this.boundSystemId = boundSystemId;
+            this.cachedEntityId = entityId;
+            this.entityType = entityType;
+            if (boundSystemId != null) {
+                sessions.put(boundSystemId, session);
+            }
+        }
+
+        /** Refresh last_activity for whichever entity type this session represents. */
+        private void refreshActivity() {
+            if (cachedEntityId <= 0 || entityType == null) return;
+            if ("supplier".equals(entityType)) {
+                Database.refreshSupplierLastActivity(cachedEntityId);
+            } else if ("client".equals(entityType)) {
+                Database.refreshClientLastActivity(cachedEntityId);
+            }
         }
 
         @Override
         public PduResponse firePduRequestReceived(PduRequest pduRequest) {
-            // Handle bind requests
-            if (pduRequest instanceof BindTransceiver) {
-                return handleBind((BindTransceiver) pduRequest);
-            } else if (pduRequest instanceof BindTransmitter) {
-                return handleBind((BindTransmitter) pduRequest);
-            } else if (pduRequest instanceof BindReceiver) {
-                return handleBind((BindReceiver) pduRequest);
-            }
-
-            // All subsequent PDUs require authentication
-            if (!authenticated) {
+            // Authentication already done in sessionBindRequested().
+            // If boundSystemId is null, the session was never authenticated — reject all PDUs.
+            if (boundSystemId == null) {
                 log.warn("Unauthenticated PDU from {}", session.getConfiguration().getHost());
                 PduResponse resp = pduRequest.createResponse();
                 resp.setCommandStatus(0x0000000D);
                 return resp;
             }
 
-            if (pduRequest instanceof SubmitSm) {
-                return handleSubmitSm((SubmitSm) pduRequest);
-            }
+            // EnquireLink — keep-alive heartbeat
             if (pduRequest instanceof EnquireLink) {
+                refreshActivity();
                 PduResponse resp = pduRequest.createResponse();
                 resp.setCommandStatus(0);
                 return resp;
             }
+
+            // Unbind
             if (pduRequest instanceof Unbind) {
-                authenticated = false;
                 log.info("ESME {} unbound", boundSystemId);
                 sessions.remove(boundSystemId);
                 PduResponse resp = pduRequest.createResponse();
@@ -125,46 +232,16 @@ public class SmppServer {
                 return resp;
             }
 
-            return super.firePduRequestReceived(pduRequest);
-        }
-
-        private PduResponse handleBind(BindTransceiver bind) {
-            return authenticate(bind.getSystemId(), bind.getPassword());
-        }
-        private PduResponse handleBind(BindTransmitter bind) {
-            return authenticate(bind.getSystemId(), bind.getPassword());
-        }
-        private PduResponse handleBind(BindReceiver bind) {
-            return authenticate(bind.getSystemId(), bind.getPassword());
-        }
-
-        private PduResponse authenticate(String systemId, String password) {
-            try {
-                boolean valid = Database.authenticateClient(systemId, password);
-                if (!valid) {
-                    valid = Database.authenticateSupplier(systemId, password);
-                }
-                if (valid) {
-                    authenticated = true;
-                    boundSystemId = systemId;
-                    sessions.put(systemId, session);
-                    log.info("ESME {} authenticated (BOUND_TRX)", systemId);
-                    BindTransceiverResp resp = new BindTransceiverResp();
-                    resp.setSystemId("NET2APP-SMPP");
-                    resp.setCommandStatus(0);
-                    return resp;
-                } else {
-                    log.warn("Auth failed for {}", systemId);
-                    BindTransceiverResp resp = new BindTransceiverResp();
-                    resp.setCommandStatus(0x0000000D);
-                    return resp;
-                }
-            } catch (Exception e) {
-                log.error("Auth error for {}: {}", systemId, e.getMessage());
-                BindTransceiverResp resp = new BindTransceiverResp();
-                resp.setCommandStatus(0x0000000D);
-                return resp;
+            // SubmitSm — the core SMS delivery PDU
+            if (pduRequest instanceof SubmitSm) {
+                refreshActivity();
+                return handleSubmitSm((SubmitSm) pduRequest);
             }
+
+            // DeliverSmResp, DataSm, etc. — acknowledge silently
+            PduResponse resp = pduRequest.createResponse();
+            resp.setCommandStatus(0);
+            return resp;
         }
 
         private PduResponse handleSubmitSm(SubmitSm submitSm) {
@@ -173,6 +250,42 @@ public class SmppServer {
                 String destAddr = submitSm.getDestAddress().getAddress();
                 String message = new String(submitSm.getShortMessage(), "UTF-8");
                 log.info("SMPP SMS: {} → {} ({} chars)", sourceAddr, destAddr, message.length());
+
+                // Inbound GSM gateways often have source/dest swapped:
+                // the source is the real phone number and dest is our server IP.
+                // Auto-swap: use source as the real destination, discard the IP.
+                if (destAddr != null && destAddr.matches("^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$")) {
+                    if (sourceAddr != null && sourceAddr.matches("^\\d{5,15}$")) {
+                        log.info("SMPP AUTO-SWAP: {} sent dest={} (server IP) — using source={} as destination",
+                            boundSystemId, destAddr, sourceAddr);
+                        destAddr = sourceAddr;
+                        // sourceAddr stays as-is (will be used as sender_id by the relay poller)
+                    } else {
+                        log.warn("SMPP REJECTED: destination is server IP ({}) from {} and source is not a phone number",
+                            destAddr, boundSystemId);
+                        SubmitSmResp resp = submitSm.createResponse();
+                        resp.setCommandStatus(0x0000000B);
+                        return resp;
+                    }
+                }
+
+                // Queue depth check for inbound suppliers (GSM gateways).
+                // Prevents a single gateway from flooding the outbox and starving
+                // other inbound suppliers of processing capacity.
+                Database.SupplierLookup supplier = Database.lookupInboundSupplier(boundSystemId);
+                if (supplier != null) {
+                    int maxQueueSize = Database.getSupplierMaxQueueSize(supplier.id);
+                    if (maxQueueSize > 0) {
+                        int currentDepth = Database.getSupplierQueueDepth(supplier.id);
+                        if (currentDepth >= maxQueueSize) {
+                            log.warn("SMPP queue FULL for {} (#{}): {}/{} messages — rejecting submit_sm",
+                                supplier.supplierCode, supplier.id, currentDepth, maxQueueSize);
+                            SubmitSmResp resp = submitSm.createResponse();
+                            resp.setCommandStatus(0x00000014); // ESME_RMSGQFUL — Message Queue Full
+                            return resp;
+                        }
+                    }
+                }
 
                 String messageId = Database.insertSmsLog(
                     boundSystemId, sourceAddr, destAddr, message,

@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Plus, Search, Download, Trash2, Edit, Send, CheckSquare, Square, Mail, Clock } from 'lucide-react';
 import { useData } from '../../store/DataContext';
 import { api } from '../../services/api';
+import { ratesApi } from '../../services/apiServices';
 import { Card } from '../../components/UI/Card';
 import { Button } from '../../components/UI/Button';
 import { Badge } from '../../components/UI/Badge';
@@ -65,15 +66,15 @@ export const ClientRates: React.FC = () => {
 
   const filteredRates = clientRates.filter(rate => {
     const ms = rate.country.toLowerCase().includes(search.toLowerCase()) || rate.mcc.includes(search);
-    const mc = clientFilter === 'all' || rate.entity_id === clientFilter;
+    const mc = clientFilter === 'all' || String(rate.entity_id) === clientFilter;
     const mco = countryFilter === 'all' || rate.country === countryFilter;
     return ms && mc && mco;
   });
   const totalPages = Math.ceil(filteredRates.length / itemsPerPage);
   const paginatedRates = filteredRates.slice((currentPage-1)*itemsPerPage, currentPage*itemsPerPage);
 
-  const getClientName = (id: string) => { const c = clients.find(x => x.id === id); return c ? `${c.client_code} - ${c.company_name}` : 'Unknown'; };
-  const getClientEmail = (id: string) => { const c = clients.find(x => x.id === id); return c?.email || ''; };
+  const getClientName = (id: string | number) => { const c = clients.find(x => String(x.id) === String(id)); return c ? `${c.client_code} - ${c.company_name}` : 'Unknown'; };
+  const getClientEmail = (id: string | number) => { const c = clients.find(x => String(x.id) === String(id)); return c?.email || ''; };
 
   // Detect rate direction
   const getDirection = (oldRate: number, newRate: number): string => {
@@ -125,7 +126,7 @@ export const ClientRates: React.FC = () => {
       const op = countryOps.find(m => m.mcc === mcc && m.mnc === mnc);
       const opName = mnc === '*' ? 'All' : (op?.operator || 'All');
       // Find existing active rate to get old rate for notification
-      const existing = clientRates.find(r => r.entity_id === formData.entity_id && r.mcc === mcc && r.mnc === mnc && r.is_active);
+      const existing = clientRates.find(r => String(r.entity_id) === String(formData.entity_id) && r.mcc === mcc && r.mnc === mnc && r.is_active);
       const oldRate = existing?.rate || 0;
       // Deactivate old rate with timestamp
       if (existing) updateRate(existing.id, { is_active: false, effective_to: now.toISOString().split('T')[0] });
@@ -152,22 +153,51 @@ export const ClientRates: React.FC = () => {
   const handleBulkDelete = () => { selectedRates.forEach(id => deleteRate(id)); setSelectedRates([]); };
   const toggleSelect = (id: string) => setSelectedRates(p => p.includes(id) ? p.filter(i => i!==id) : [...p, id]);
 
-  const showRateHistory = (rate: Rate) => {
-    const hist = allRates.filter(r => r.entity_type==='client' && r.entity_id===rate.entity_id && r.mcc===rate.mcc && r.mnc===rate.mnc).sort((a,b) => new Date(String(b.effective_from)).getTime() - new Date(String(a.effective_from)).getTime());
-    setHistoryRates(hist); setShowHistoryModal(true);
+  // Fetch full rate history from server (includes all versions: active + inactive)
+  const showRateHistory = async (rate: Rate) => {
+    try {
+      const res: any = await ratesApi.getRateHistory('client', rate.entity_id, rate.mcc, rate.mnc);
+      if (res.success && res.data?.data) {
+        setHistoryRates(res.data.data as Rate[]);
+      } else {
+        setHistoryRates([]);
+      }
+    } catch {
+      setHistoryRates([]);
+    }
+    setShowHistoryModal(true);
   };
 
   const handleSendNotification = (rate: Rate) => { setNotificationData({ country:rate.country, account:getClientName(rate.entity_id), mcc:rate.mcc, mncs:rate.mnc, oldRate:0, newRate:rate.rate, direction:'New', effectiveDate:new Date().toLocaleString() }); setNotifyEmail(getClientEmail(rate.entity_id)); setShowNotifyModal(true); };
   const sendRateEmail = () => { alert(`✅ Rate notification email sent to ${notifyEmail}`); setShowNotifyModal(false); };
 
-  const handleExportCSV = () => { exportCSV('client_rates_export.csv', ['client_id','client_name','mcc','mnc','country','operator','rate','currency','effective_from','effective_to','is_active','status'], filteredRates.map(r => [r.entity_id, getClientName(r.entity_id), r.mcc, r.mnc, r.country, r.operator, Number(r.rate).toFixed(6), r.currency, r.effective_from, r.effective_to||'', String(r.is_active), r.is_active?'Active':'Inactive'])); };
+  const handleExportCSV = () => {
+    const rows = filteredRates.map(r => {
+      const prev = r.previous_rate ? Number(r.previous_rate) : 0;
+      const curr = Number(r.rate);
+      const pct = prev > 0 ? (((curr - prev) / prev) * 100).toFixed(1) + '%' : 'New';
+      return [r.entity_id, getClientName(r.entity_id), r.mcc, r.mnc, r.country, r.operator, curr.toFixed(6), r.currency || 'EUR', r.effective_from, r.effective_to||'', String(r.is_active), r.is_active?'Active':'Inactive', prev > 0 ? '€'+prev.toFixed(4) : '-', pct];
+    });
+    exportCSV('client_rates_export.csv', ['client_id','client_name','mcc','mnc','country','operator','rate','currency','effective_from','effective_to','is_active','status','previous_rate','%_change'], rows);
+  };
 
   const columns = [
     { key:'select', header:'☑', width:'40px', render:(rate:Rate) => <button onClick={(e)=>{e.stopPropagation();toggleSelect(rate.id);}} className="p-1">{selectedRates.includes(rate.id)?<CheckSquare size={16} className="text-blue-600"/>:<Square size={16} className="text-gray-400"/>}</button> },
     { key:'client', header:'Client', render:(rate:Rate) => <span className="text-sm">{getClientName(rate.entity_id)}</span> },
     { key:'destination', header:'Destination', render:(rate:Rate) => <div><p className="font-medium text-sm">{rate.country}</p><p className="text-xs text-gray-500">{rate.operator}</p></div> },
     { key:'mccmnc', header:'MCC/MNC', render:(rate:Rate) => <span className="font-mono bg-gray-100 px-1.5 py-0.5 rounded text-xs">{rate.mcc}{rate.mnc}</span> },
-    { key:'rate', header:'Rate (EUR)', align:'right' as const, render:(rate:Rate) => <div className="text-right"><p className={`font-semibold text-sm ${rate.is_active?'text-gray-800':'text-red-500 line-through'}`}>€{Number(rate.rate).toFixed(4)}</p>{!rate.is_active&&rate.effective_to&&<p className="text-[10px] text-red-400">Ended {rate.effective_to}</p>}</div> },
+    { key:'rate', header:'Rate (EUR)', align:'right' as const, render:(rate:Rate) => {
+        const prev = rate.previous_rate ? Number(rate.previous_rate) : 0;
+        const curr = Number(rate.rate);
+        const pct = prev > 0 ? (((curr - prev) / prev) * 100) : 0;
+        const pctStr = prev > 0 ? (pct > 0 ? `+${pct.toFixed(1)}%` : `${pct.toFixed(1)}%`) : '';
+        const pctColor = pct > 0 ? 'text-red-500' : pct < 0 ? 'text-green-500' : 'text-gray-400';
+        return <div className="text-right">
+          <p className={`font-semibold text-sm ${rate.is_active?'text-gray-800':'text-red-500 line-through'}`}>€{curr.toFixed(4)}</p>
+          {rate.is_active && pctStr && <span className={`text-[10px] font-medium ${pctColor}`}>{pctStr}</span>}
+          {!rate.is_active && rate.effective_to && <p className="text-[10px] text-red-400">Ended {rate.effective_to}</p>}
+        </div>;
+      } },
     { key:'effective', header:'Effective', render:(rate:Rate) => <span className="text-xs">{rate.effective_from} {rate.is_active?<span className="text-green-500">● Active</span>:<span className="text-red-500">● Inactive</span>}</span> },
     { key:'status', header:'Status', render:(rate:Rate) => <Badge variant={rate.is_active?'success':'danger'} dot size="sm">{rate.is_active?'Active':'Inactive'}</Badge> },
     { key:'actions', header:'', render:(rate:Rate) => <div className="flex gap-1">{rate.is_active&&<><button onClick={(e)=>{e.stopPropagation();openModal(rate);}} className="p-1 rounded hover:bg-gray-100"><Edit size={14} className="text-gray-500"/></button><button onClick={(e)=>{e.stopPropagation();handleSendNotification(rate);}} className="p-1 rounded hover:bg-gray-100"><Mail size={14} className="text-blue-500"/></button></>}<button onClick={(e)=>{e.stopPropagation();showRateHistory(rate);}} className="p-1 rounded hover:bg-gray-100"><Clock size={14} className="text-purple-500"/></button><button onClick={(e)=>{e.stopPropagation();deleteRate(rate.id);}} className="p-1 rounded hover:bg-gray-100"><Trash2 size={14} className="text-red-500"/></button></div> },
@@ -176,7 +206,7 @@ export const ClientRates: React.FC = () => {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <div><h1 className="text-2xl font-bold text-gray-800">Client Rates</h1><p className="text-gray-500 mt-1">{clientRates.length} rates — Select country → multi-select operators → one click add all</p></div>
+        <div><h1 className="text-2xl font-bold text-gray-800">Client Rates</h1><p className="text-gray-500 mt-1">{clientRates.filter(r => r.is_active).length} active / {clientRates.length} total — % change shows rate movement</p></div>
         <div className="flex gap-2"><Button variant="secondary" icon={<Download size={16}/>} onClick={handleExportCSV}>Export CSV</Button><Button icon={<Plus size={18}/>} onClick={()=>openModal()}>Add Rate</Button></div>
       </div>
 

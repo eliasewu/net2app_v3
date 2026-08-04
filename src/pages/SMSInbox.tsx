@@ -1,10 +1,13 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Search, Inbox, RefreshCw, Eye, Phone, Clock, MessageSquare, Download } from 'lucide-react';
 import { Card } from '../components/UI/Card';
 import { Button } from '../components/UI/Button';
 import { Badge } from '../components/UI/Badge';
 import { Table, Pagination } from '../components/UI/Table';
 import { Modal } from '../components/UI/Modal';
+import { InboundTrafficWidget } from '../components/Dashboard/InboundTrafficWidget';
+import { ErrorBoundary } from '../components/UI/ErrorBoundary';
+import { smsApi } from '../services/api';
 
 interface MOSMS {
   id: string;
@@ -21,23 +24,48 @@ interface MOSMS {
   notes?: string;
 }
 
-// MO SMS inbox - incoming messages from clients/suppliers
-const mockMO: MOSMS[] = [
-  { id:'1', from:'+1234567890', to:'NET2APP', message:'STOP', received_at:'2024-06-10T14:30:00Z', mcc:'310', mnc:'260', country:'United States', keyword:'STOP', processed:true, reply_sent:true },
-  { id:'2', from:'+1987654321', to:'TECHCORP', message:'HELP', received_at:'2024-06-10T14:25:00Z', mcc:'310', mnc:'410', country:'United States', keyword:'HELP', processed:true, reply_sent:true },
-  { id:'3', from:'+447900123456', to:'MEGABANK', message:'Yes, I confirm', received_at:'2024-06-10T14:20:00Z', mcc:'234', mnc:'10', country:'UK', processed:false, reply_sent:false },
-  { id:'4', from:'+491761234567', to:'APP', message:'Please send details', received_at:'2024-06-10T14:15:00Z', mcc:'262', mnc:'01', country:'Germany', processed:false, reply_sent:false },
-  { id:'5', from:'+33612345678', to:'NET2APP', message:'OK', received_at:'2024-06-10T14:10:00Z', mcc:'208', mnc:'01', country:'France', keyword:'OK', processed:true, reply_sent:false },
-  { id:'6', from:'+917012345678', to:'SMSHUB', message:'Where is my order?', received_at:'2024-06-10T14:05:00Z', mcc:'404', mnc:'10', country:'India', processed:false, reply_sent:false },
-  { id:'7', from:'+8801712345678', to:'INFO', message:'Call me', received_at:'2024-06-10T14:00:00Z', mcc:'470', mnc:'01', country:'Bangladesh', processed:false, reply_sent:false },
-];
-
+// MO SMS inbox — real data from sms_logs where source='smpp_mo'
 export const SMSInbox: React.FC = () => {
   const [search, setSearch] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
   const [viewModal, setViewModal] = useState<MOSMS | null>(null);
-  const [moSMS, setMoSMS] = useState<MOSMS[]>(mockMO);
+  const [moSMS, setMoSMS] = useState<MOSMS[]>([]);
   const [replyText, setReplyText] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const fetchMoMessages = useCallback(async () => {
+    setError(null);
+    try {
+      const res: any = await smsApi.getLogs({ source: 'smpp_mo', limit: 200, offset: 0 });
+      if (res.success && res.data) {
+        const rows = res.data.data || res.data.rows || res.data || [];
+        const mapped: MOSMS[] = rows.map((r: any) => ({
+          id: String(r.id || r.message_id),
+          from: r.sender_id || '',
+          to: r.supplier_code || r.destination || '',
+          message: r.message || '',
+          received_at: r.submit_time || r.created_at || '',
+          mcc: r.mcc || '',
+          mnc: r.mnc || '',
+          country: r.country || '',
+          processed: r.status !== 'received',
+          reply_sent: false,
+        }));
+        setMoSMS(mapped);
+      }
+    } catch (e: any) {
+      setError(e?.message || 'Failed to fetch MO messages');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchMoMessages();
+    const interval = setInterval(fetchMoMessages, 30000); // auto-refresh every 30s
+    return () => clearInterval(interval);
+  }, [fetchMoMessages]);
 
   const itemsPerPage = 15;
   const filtered = moSMS.filter(m => m.from.includes(search) || m.to.toLowerCase().includes(search.toLowerCase()) || m.message.toLowerCase().includes(search.toLowerCase()));
@@ -66,15 +94,28 @@ export const SMSInbox: React.FC = () => {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <div><h1 className="text-2xl font-bold text-gray-800">SMS Inbox (MO)</h1><p className="text-gray-500 mt-1">Mobile Originated messages - incoming SMS. Two-way SMS will be available in future.</p></div>
-        <div className="flex gap-2"><Button variant="secondary" icon={<RefreshCw size={16}/>}>Refresh</Button><Button variant="secondary" icon={<Download size={16}/>}>Export</Button></div>
+        <div><h1 className="text-2xl font-bold text-gray-800">SMS Inbox (MO)</h1><p className="text-gray-500 mt-1">Mobile Originated messages — incoming SMS from GSM gateways</p></div>
+        <div className="flex gap-2">
+          <Button variant="secondary" icon={<RefreshCw size={16} />} onClick={fetchMoMessages} disabled={loading}>Refresh</Button>
+          <Button variant="secondary" icon={<Download size={16} />}>Export</Button>
+        </div>
       </div>
 
+      {/* Inbound Traffic Widget — real-time MO stats from GSM gateways */}
+      <ErrorBoundary>
+        <InboundTrafficWidget />
+      </ErrorBoundary>
+
+      {error && (
+        <div className="bg-red-50 border border-red-200 rounded-xl p-4 text-red-700 text-sm">{error}</div>
+      )}
+
+      {/* Stats cards from real data */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-        <div className="bg-white rounded-xl p-4 border"><Inbox size={20} className="text-blue-500 mb-1"/><p className="text-2xl font-bold">{moSMS.length}</p><p className="text-sm text-gray-500">Total MO</p></div>
-        <div className="bg-white rounded-xl p-4 border"><MessageSquare size={20} className="text-green-500 mb-1"/><p className="text-2xl font-bold">{moSMS.filter(m=>m.reply_sent).length}</p><p className="text-sm text-gray-500">Replied</p></div>
-        <div className="bg-white rounded-xl p-4 border"><Clock size={20} className="text-yellow-500 mb-1"/><p className="text-2xl font-bold">{moSMS.filter(m=>!m.processed).length}</p><p className="text-sm text-gray-500">Unread</p></div>
-        <div className="bg-white rounded-xl p-4 border"><Download size={20} className="text-purple-500 mb-1"/><p className="text-2xl font-bold">Future</p><p className="text-sm text-gray-500">2-Way SMS</p></div>
+        <div className="bg-white rounded-xl p-4 border"><Inbox size={20} className="text-blue-500 mb-1"/><p className="text-2xl font-bold">{loading ? '...' : moSMS.length}</p><p className="text-sm text-gray-500">Total MO</p></div>
+        <div className="bg-white rounded-xl p-4 border"><Clock size={20} className="text-yellow-500 mb-1"/><p className="text-2xl font-bold">{loading ? '...' : moSMS.filter(m=>!m.processed).length}</p><p className="text-sm text-gray-500">Unread</p></div>
+        <div className="bg-white rounded-xl p-4 border"><MessageSquare size={20} className="text-green-500 mb-1"/><p className="text-2xl font-bold">{loading ? '...' : moSMS.filter(m=>m.reply_sent).length}</p><p className="text-sm text-gray-500">Replied</p></div>
+        <div className="bg-white rounded-xl p-4 border"><Download size={20} className="text-purple-500 mb-1"/><p className="text-2xl font-bold">{loading ? '...' : '—'}</p><p className="text-sm text-gray-500">2-Way SMS (Future)</p></div>
       </div>
 
       <Card><div className="relative"><Search size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"/><input type="text" placeholder="Search MO messages by number, keyword..." value={search} onChange={e=>setSearch(e.target.value)} className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"/></div></Card>

@@ -1,7 +1,12 @@
 package com.net2app.gateway.rest;
 
+import com.cloudhopper.smpp.SmppSession;
+import com.cloudhopper.smpp.pdu.SubmitSm;
+import com.cloudhopper.smpp.type.Address;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.net2app.gateway.db.Database;
 import com.net2app.gateway.smpp.SmppClientManager;
+import com.net2app.gateway.smpp.SmppServer;
 import com.sun.net.httpserver.HttpServer;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
@@ -9,6 +14,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.util.Map;
@@ -33,10 +39,12 @@ public class RestBridge {
     private static final ObjectMapper mapper = new ObjectMapper();
 
     private final int port;
+    private final SmppServer smppServer;
     private HttpServer server;
 
-    public RestBridge(int port) {
+    public RestBridge(int port, SmppServer smppServer) {
         this.port = port;
+        this.smppServer = smppServer;
     }
 
     public void start() {
@@ -47,6 +55,7 @@ public class RestBridge {
             server.createContext("/sessions", new SessionsHandler());
             server.createContext("/reconnect/", new ReconnectHandler());
             server.createContext("/stats", new StatsHandler());
+            server.createContext("/deliver", new DeliverHandler());
 
             server.setExecutor(java.util.concurrent.Executors.newFixedThreadPool(4));
             server.start();
@@ -152,6 +161,82 @@ public class RestBridge {
                 "threads", Thread.activeCount()
             );
             sendJson(exchange, 200, response);
+        }
+    }
+
+    /**
+     * Deliver submit_sm through an existing inbound SMPP session.
+     * POST /deliver
+     * Body: { "supplier_id": 65, "source_addr": "1234", "dest_addr": "2519...", "message": "OTP 123456" }
+     */
+    private class DeliverHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                sendJson(exchange, 405, Map.of("error", "Method not allowed"));
+                return;
+            }
+
+            try {
+                // Read request body
+                InputStream is = exchange.getRequestBody();
+                String body = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+                @SuppressWarnings("unchecked")
+                Map<String, Object> req = mapper.readValue(body, Map.class);
+
+                int supplierId = req.get("supplier_id") instanceof Number
+                    ? ((Number) req.get("supplier_id")).intValue()
+                    : Integer.parseInt(String.valueOf(req.get("supplier_id")));
+                String sourceAddr = String.valueOf(req.getOrDefault("source_addr", ""));
+                String destAddr = String.valueOf(req.getOrDefault("dest_addr", ""));
+                String message = String.valueOf(req.getOrDefault("message", ""));
+
+                if (destAddr.isEmpty() || message.isEmpty()) {
+                    sendJson(exchange, 400, Map.of("error", "Missing dest_addr or message"));
+                    return;
+                }
+
+                // Look up supplier's smpp_username to find the session
+                Database.SupplierLookup supplier = Database.lookupSupplierById(supplierId);
+                if (supplier == null) {
+                    sendJson(exchange, 404, Map.of("error", "Supplier not found: " + supplierId));
+                    return;
+                }
+
+                // Find active session by systemId (smpp_username)
+                SmppSession session = smppServer.getSession(supplier.smppUsername);
+                if (session == null || !session.isBound()) {
+                    sendJson(exchange, 503, Map.of(
+                        "error", "No active session for supplier " + supplier.supplierCode,
+                        "supplier_id", supplierId,
+                        "system_id", supplier.smppUsername
+                    ));
+                    return;
+                }
+
+                // Build and send submit_sm
+                SubmitSm sm = new SubmitSm();
+                sm.setSourceAddress(new Address((byte) 0x01, (byte) 0x01, sourceAddr));
+                sm.setDestAddress(new Address((byte) 0x01, (byte) 0x01, destAddr));
+                sm.setShortMessage(message.getBytes("UTF-8"));
+                sm.setRegisteredDelivery((byte) 1);
+                sm.setDataCoding((byte) 0);
+
+                log.info("REST DELIVER: {} -> {} ({} chars) via {} session",
+                    sourceAddr, destAddr, message.length(), supplier.supplierCode);
+
+                session.sendRequestPdu(sm, 10000, false);
+
+                sendJson(exchange, 200, Map.of(
+                    "status", "ok",
+                    "supplier_code", supplier.supplierCode,
+                    "system_id", supplier.smppUsername,
+                    "dest_addr", destAddr
+                ));
+            } catch (Exception e) {
+                log.error("Deliver handler error: {}", e.getMessage());
+                sendJson(exchange, 500, Map.of("error", e.getMessage()));
+            }
         }
     }
 

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Plus, Search, Edit, Trash2, CheckCircle, XCircle, Upload, Wand2, ChevronDown, ChevronRight } from 'lucide-react';
+import { Plus, Search, Edit, Trash2, CheckCircle, XCircle, Upload, Wand2, ChevronDown, ChevronRight, ExternalLink, MessageCircle, Send, Phone, Check, X } from 'lucide-react';
 import { Card } from '../../components/UI/Card';
 import { Button } from '../../components/UI/Button';
 import { Badge } from '../../components/UI/Badge';
@@ -29,6 +29,10 @@ const emptyForm = {
   username: '', password: '',
   phone_number_id: '', business_account_id: '', bot_token: '',
   dlr_url: '', http_method: 'POST', connector_type: '',
+  // WhatsApp-specific
+  waba_version: 'v18.0', webhook_verify_token: '',
+  // Telegram-specific
+  telegram_webhook_url: '',
   // Response configuration
   send_url: '', submit_pattern: '', dlr_pattern: '', dlr_value: '',
   params: '', dlr_status_mapping: '{"failed":"UNDELIV","delivered":"DELIVRD"}',
@@ -56,6 +60,11 @@ export const APIConnectors: React.FC = () => {
   const [aiDocs, setAiDocs] = useState('');
   const [aiLoading, setAiLoading] = useState(false);
   const [aiResult, setAiResult] = useState<any>(null);
+  
+  // Number validation state
+  const [validateNumber, setValidateNumber] = useState('');
+  const [validating, setValidating] = useState(false);
+  const [validationResult, setValidationResult] = useState<{has: boolean; number: string; channel: string} | null>(null);
   
   const itemsPerPage = 25;
 
@@ -87,6 +96,8 @@ export const APIConnectors: React.FC = () => {
       username: c.username || '', password: c.password || '',
       phone_number_id: c.phone_number_id || '', business_account_id: c.business_account_id || '',
       bot_token: c.bot_token || '',
+      waba_version: c.waba_version || 'v18.0', webhook_verify_token: c.webhook_verify_token || '',
+      telegram_webhook_url: c.telegram_webhook_url || '',
       dlr_url: c.dlr_url || '', http_method: c.http_method || 'POST', connector_type: c.connector_type || '',
       send_url: c.send_url || '', submit_pattern: c.submit_pattern || '',
       dlr_pattern: c.dlr_pattern || '', dlr_value: c.dlr_value || '',
@@ -157,11 +168,14 @@ export const APIConnectors: React.FC = () => {
   };
 
   const getStatus = (c: any) => {
-    if (!c.is_active) return { variant: 'danger' as const, label: 'Inactive' };
-    const hasDlr = c.dlr_url && c.dlr_pattern;
-    if (c.send_url && c.submit_pattern && hasDlr) return { variant: 'success' as const, label: 'Configured' };
-    if (c.send_url) return { variant: 'info' as const, label: 'Send Only' };
-    return { variant: 'warning' as const, label: 'Needs Config' };
+    // Show real connection status if available (from periodic health checks via suppliers table)
+    // API connectors mirror their linked supplier's bind_status for real health state
+    if (c.connection_status === 'connected' || c.connection_status === 'bound') return { variant: 'success' as const, label: 'Connected' };
+    if (c.connection_status === 'failed' || c.connection_status === 'error') return { variant: 'danger' as const, label: 'Down' };
+    if (c.connection_status === 'testing') return { variant: 'warning' as const, label: 'Testing...' };
+    // Fall back to is_active toggle for config status
+    if (c.is_active) return { variant: 'success' as const, label: 'Active' };
+    return { variant: 'danger' as const, label: 'Inactive' };
   };
 
   const columns = [
@@ -241,13 +255,47 @@ export const APIConnectors: React.FC = () => {
           </div>
         )}
         {form.type === 'whatsapp' && (
-          <div className="grid grid-cols-2 gap-4">
-            <Input label="Phone Number ID" value={form.phone_number_id} onChange={e => setForm(p => ({ ...p, phone_number_id: e.target.value }))} placeholder="123456789012345" />
-            <Input label="Business Account ID" value={form.business_account_id} onChange={e => setForm(p => ({ ...p, business_account_id: e.target.value }))} placeholder="987654321098765" />
+          <div className="space-y-4 p-4 bg-green-50/50 border border-green-200 rounded-lg">
+            <div className="flex items-center gap-2">
+              <MessageCircle size={18} className="text-green-600" />
+              <span className="font-medium text-sm text-green-800">WhatsApp Business API Configuration</span>
+              <a href="https://developers.facebook.com/docs/whatsapp/cloud-api" target="_blank" rel="noopener" className="text-xs text-green-600 hover:underline flex items-center gap-1 ml-auto"><ExternalLink size={12} /> Docs</a>
+            </div>
+            <p className="text-xs text-green-700">Connect via Meta's WhatsApp Cloud API. Get credentials from <strong>Meta Business Suite → WhatsApp → API Setup</strong>.</p>
+            <div className="grid grid-cols-2 gap-4">
+              <Select label="API Version" value={form.waba_version} onChange={e => setForm(p => ({ ...p, waba_version: e.target.value, base_url: `https://graph.facebook.com/${e.target.value}/${p.phone_number_id}` }))} 
+                options={[{value:'v18.0',label:'v18.0'},{value:'v19.0',label:'v19.0'},{value:'v20.0',label:'v20.0'},{value:'v21.0',label:'v21.0'}]} />
+              <Input label="Phone Number ID *" value={form.phone_number_id} onChange={e => { const v=e.target.value; setForm(p => ({ ...p, phone_number_id: v, base_url: `https://graph.facebook.com/${p.waba_version}/${v}` })); }} placeholder="123456789012345" hint="From WhatsApp Business Account → Phone numbers" />
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <Input label="Business Account ID" value={form.business_account_id} onChange={e => setForm(p => ({ ...p, business_account_id: e.target.value }))} placeholder="987654321098765" hint="WhatsApp Business Account ID from Meta" />
+              <Input label="Access Token" type="password" value={form.api_key} onChange={e => setForm(p => ({ ...p, api_key: e.target.value }))} placeholder="EAAx..." hint="Permanent or System User access token" />
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <Input label="Webhook Verify Token" value={form.webhook_verify_token} onChange={e => setForm(p => ({ ...p, webhook_verify_token: e.target.value }))} placeholder="my_custom_verify_token" hint="Used to verify webhook endpoint on setup" />
+              <Input label="DLR Webhook URL" value={form.dlr_url} onChange={e => setForm(p => ({ ...p, dlr_url: e.target.value }))} placeholder="https://your-server.com/api/webhooks/whatsapp" hint="Set this in Meta Business Suite → Webhooks — point to your callback URL" disabled />
+            </div>
+            <Input label="Base URL (auto-filled)" value={form.base_url} onChange={e => setForm(p => ({ ...p, base_url: e.target.value }))} disabled hint="Graph API endpoint — auto-generated from version + phone ID" />
           </div>
         )}
         {form.type === 'telegram' && (
-          <Input label="Bot Token" value={form.bot_token} onChange={e => setForm(p => ({ ...p, bot_token: e.target.value }))} placeholder="123456789:ABCdefGHIjklMNOpqrsTUVwxyz" />
+          <div className="space-y-4 p-4 bg-blue-50/50 border border-blue-200 rounded-lg">
+            <div className="flex items-center gap-2">
+              <Send size={18} className="text-blue-600" />
+              <span className="font-medium text-sm text-blue-800">Telegram Business API Configuration</span>
+              <a href="https://core.telegram.org/bots/api" target="_blank" rel="noopener" className="text-xs text-blue-600 hover:underline flex items-center gap-1 ml-auto"><ExternalLink size={12} /> Docs</a>
+            </div>
+            <p className="text-xs text-blue-700">Connect via Telegram Bot API. Create a bot with <strong>@BotFather</strong> on Telegram to get your token.</p>
+            <div className="grid grid-cols-2 gap-4">
+              <Input label="Bot Token *" type="password" value={form.bot_token} onChange={e => { const v=e.target.value; setForm(p => ({ ...p, bot_token: v, base_url: v ? `https://api.telegram.org/bot${v}` : '' })); }} placeholder="123456789:ABCdefGHIjklMNOpqrsTUVwxyz" hint="Get from @BotFather → /newbot → copy token" />
+              <Input label="Bot Username (auto)" value={form.username} onChange={e => setForm(p => ({ ...p, username: e.target.value }))} placeholder="@my_bot" hint="Set in form or leave blank — retrieved from getMe API" />
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <Input label="Webhook URL" value={form.telegram_webhook_url} onChange={e => setForm(p => ({ ...p, telegram_webhook_url: e.target.value }))} placeholder="https://your-server.com/api/webhooks/telegram" hint="Set via setWebhook API — DLRs arrive as updates" />
+              <Input label="DLR Webhook Secret" value={form.dlr_webhook_secret} onChange={e => setForm(p => ({ ...p, dlr_webhook_secret: e.target.value }))} placeholder="secret_token_for_validation" hint="Optional: validate incoming webhook requests" />
+            </div>
+            <Input label="Base URL (auto-filled)" value={form.base_url} onChange={e => setForm(p => ({ ...p, base_url: e.target.value }))} disabled hint="Bot API endpoint — auto-generated from bot token" />
+          </div>
         )}
         {form.type === 'voice_otp' && (
           <Select label="HTTP Method" value={form.http_method} onChange={e => setForm(p => ({ ...p, http_method: e.target.value }))} options={[{ value: 'GET', label: 'GET' }, { value: 'POST', label: 'POST' }]} />

@@ -14,6 +14,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.List;
 import java.util.Map;
+import java.util.ArrayList;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -51,32 +52,110 @@ public class SmppClientManager {
     }
 
     public SmppSession connect(Database.SupplierConfig cfg) {
-        try {
-            SmppSessionConfiguration sessionConfig = new SmppSessionConfiguration();
-            sessionConfig.setType(SmppBindType.TRANSCEIVER);
-            sessionConfig.setHost(cfg.smppHost);
-            sessionConfig.setPort(cfg.smppPort);
-            sessionConfig.setSystemId(cfg.smppUsername);
-            sessionConfig.setPassword(cfg.smppPassword);
-            sessionConfig.setSystemType(cfg.systemType != null ? cfg.systemType : "SMPP");
+        // Determine SMPP interface versions to try (auto-negotiation)
+        byte[] versionsToTry = resolveVersions(cfg.smppVersion);
+        // Bind types to try: TRANSCEIVER first, fall back to TRANSMITTER
+        SmppBindType[] bindTypesToTry = {SmppBindType.TRANSCEIVER, SmppBindType.TRANSMITTER};
+        Exception lastError = null;
 
-            DefaultSmppClient clientBootstrap = new DefaultSmppClient();
-            SmppSession session = clientBootstrap.bind(sessionConfig,
-                new SupplierSessionHandler(cfg.id, cfg.supplierCode));
+        for (byte interfaceVersion : versionsToTry) {
+            for (SmppBindType bindType : bindTypesToTry) {
+                DefaultSmppClient clientBootstrap = null;
+                try {
+                    SmppSessionConfiguration sessionConfig = new SmppSessionConfiguration();
+                    sessionConfig.setType(bindType);
+                    sessionConfig.setHost(cfg.smppHost);
+                    sessionConfig.setPort(cfg.smppPort);
+                    sessionConfig.setSystemId(cfg.smppUsername);
+                    sessionConfig.setPassword(cfg.smppPassword);
+                    sessionConfig.setSystemType(cfg.systemType != null ? cfg.systemType : "SMPP");
+                    sessionConfig.setInterfaceVersion(interfaceVersion);
 
-            activeSessions.put(cfg.id, session);
-            clients.put(cfg.id, clientBootstrap);
+                    String versionLabel = versionLabel(interfaceVersion);
+                    String bindLabel = bindType == SmppBindType.TRANSCEIVER ? "TRX" : "TX";
+                    log.info("Connecting to {} at {}:{} with SMPP v{} ({})",
+                        cfg.supplierCode, cfg.smppHost, cfg.smppPort, versionLabel, bindLabel);
 
-            Database.updateBindStatus(cfg.id, "bound", 0);
-            log.info("Connected to supplier {} ({}) at {}:{}",
-                cfg.supplierCode, cfg.companyName, cfg.smppHost, cfg.smppPort);
-            return session;
-        } catch (Exception e) {
-            log.error("Failed to connect to supplier {} ({}): {}",
-                cfg.supplierCode, cfg.id, e.getMessage());
-            Database.recordBindFailure(cfg.id);
-            return null;
+                    clientBootstrap = new DefaultSmppClient();
+                    SmppSession session = clientBootstrap.bind(sessionConfig,
+                        new SupplierSessionHandler(cfg.id, cfg.supplierCode));
+
+                    activeSessions.put(cfg.id, session);
+                    clients.put(cfg.id, clientBootstrap);
+
+                    Database.updateBindStatus(cfg.id, "bound", 0);
+                    log.info("Connected to supplier {} ({}) at {}:{} — SMPP v{} ({})",
+                        cfg.supplierCode, cfg.companyName, cfg.smppHost, cfg.smppPort,
+                        versionLabel, bindLabel);
+                    return session;
+                } catch (Exception e) {
+                    lastError = e;
+                    if (clientBootstrap != null) {
+                        try { clientBootstrap.destroy(); } catch (Exception ex) { /* ignore */ }
+                    }
+                    String versionLabel = versionLabel(interfaceVersion);
+                    String bindLabel = bindType == SmppBindType.TRANSCEIVER ? "TRX" : "TX";
+                    log.warn("SMPP v{} ({}) bind failed for {} ({}): {} — will try next combination",
+                        versionLabel, bindLabel, cfg.supplierCode, cfg.id, e.getMessage());
+                }
+            }
         }
+
+        log.error("All SMPP version+bind attempts failed for supplier {} ({}): {}",
+            cfg.supplierCode, cfg.id, lastError != null ? lastError.getMessage() : "unknown");
+        Database.recordBindFailure(cfg.id);
+        return null;
+    }
+
+    /**
+     * Resolve SMPP interface versions to try in priority order.
+     * If a specific version is configured, try it first, then fall back.
+     * If "auto" or null, try all common versions.
+     */
+    private byte[] resolveVersions(String configuredVersion) {
+        // Map of version labels to interface version bytes
+        // 0x33 = SMPP 3.3, 0x34 = SMPP 3.4, 0x50 = SMPP 5.0
+        List<Byte> versions = new ArrayList<>();
+
+        if (configuredVersion != null && !configuredVersion.isEmpty() && !"auto".equalsIgnoreCase(configuredVersion)) {
+            // Try the configured version first
+            byte configured = versionToByte(configuredVersion);
+            if (configured != 0) {
+                versions.add(configured);
+            }
+        }
+
+        // Add fallback versions (3.4 → 5.0 → 3.3) — most common order
+        for (byte v : new byte[]{0x34, 0x50, 0x33}) {
+            if (!versions.contains(v)) {
+                versions.add(v);
+            }
+        }
+
+        byte[] result = new byte[versions.size()];
+        for (int i = 0; i < versions.size(); i++) result[i] = versions.get(i);
+        return result;
+    }
+
+    private byte versionToByte(String version) {
+        return switch (version.trim()) {
+            case "3.3", "33" -> (byte) 0x33;
+            case "3.4", "34" -> (byte) 0x34;
+            case "5.0", "5", "50" -> (byte) 0x50;
+            default -> {
+                try { yield Byte.parseByte(version.trim(), 16); }
+                catch (NumberFormatException e) { yield 0; }
+            }
+        };
+    }
+
+    private String versionLabel(byte interfaceVersion) {
+        return switch (interfaceVersion) {
+            case 0x33 -> "3.3";
+            case 0x34 -> "3.4";
+            case 0x50 -> "5.0";
+            default -> String.format("0x%02X", interfaceVersion);
+        };
     }
 
     public void disconnect(String supplierId) {

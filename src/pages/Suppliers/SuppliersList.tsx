@@ -1,6 +1,6 @@
 import React, { useState, useRef } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { Plus, Search, Download, Upload, MoreVertical, Edit, Trash2, Eye, Wifi, WifiOff, RotateCcw } from 'lucide-react';
+import { Plus, Search, Download, Upload, MoreVertical, Edit, Trash2, Eye, Wifi, WifiOff, RotateCcw, CheckCircle } from 'lucide-react';
 import { useData } from '../../store/DataContext';
 import { Card } from '../../components/UI/Card';
 import { Button } from '../../components/UI/Button';
@@ -11,7 +11,7 @@ import { Supplier } from '../../types';
 
 export const SuppliersList: React.FC = () => {
   const navigate = useNavigate();
-  const { suppliers, deleteSupplier, restoreSupplier } = useData();
+  const { suppliers, deleteSupplier, restoreSupplier, updateSupplier } = useData();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('all');
@@ -45,7 +45,7 @@ export const SuppliersList: React.FC = () => {
       'connection_type','smpp_host','smpp_port','smpp_username','smpp_password','system_id',
       'smpp_version','smpp_system_type','smpp_bind_type','smpp_addr_ton','smpp_addr_npi','smpp_addr_range',
       'is_inbound','api_url','api_key','api_method','api_connector_id','voice_otp_config_id',
-      'whatsapp_device_ids','telegram_device_ids','balance','credit_limit','currency',
+      'whatsapp_device_ids','telegram_device_ids','balance','credit_limit','currency','billing_mode',
       'bind_status','consecutive_failures','force_dlr','status'];
     const csvRows = [headers.join(',')];
     for (const s of filteredSuppliers) {
@@ -139,21 +139,35 @@ export const SuppliersList: React.FC = () => {
     },
     {
       key: 'bind_status',
-      header: 'Bind Status',
-      render: (supplier: Supplier) => (
+      header: 'Status',
+      render: (supplier: Supplier) => {
+        const ct = supplier.connection_type;
+        const isSMPP = ct === 'smpp';
+        // SMPP: bound/unbound | HTTP/VoiceOTP: online/offline | OTT/RCS: connected/disconnected
+        const onlineLabel = isSMPP ? 'bound' : (ct === 'http' || ct === 'voice_otp') ? 'online' : 'connected';
+        const offlineLabel = isSMPP ? 'unbound' : (ct === 'http' || ct === 'voice_otp') ? 'offline' : 'disconnected';
+        const isOnline = supplier.bind_status === 'bound';
+        return (
         <div className="flex items-center gap-2">
-          {supplier.bind_status === 'bound' ? (
+          {supplier.status === 'inactive' ? (
+            <WifiOff size={16} className="text-orange-500" />
+          ) : isOnline ? (
             <Wifi size={16} className="text-green-500" />
           ) : (
             <WifiOff size={16} className="text-red-500" />
           )}
-          <Badge
-            variant={supplier.bind_status === 'bound' ? 'success' : supplier.bind_status === 'error' ? 'danger' : 'warning'}
-          >
-            {supplier.bind_status}
-          </Badge>
+          {supplier.status === 'inactive' ? (
+            <Badge variant="danger">BLOCKED</Badge>
+          ) : (
+            <Badge
+              variant={isOnline ? 'success' : 'warning'}
+            >
+              {isOnline ? onlineLabel : offlineLabel}
+            </Badge>
+          )}
         </div>
-      ),
+      );
+      },
     },
     {
       key: 'failures',
@@ -162,7 +176,10 @@ export const SuppliersList: React.FC = () => {
       render: (supplier: Supplier) => (
         <span className={`font-medium ${supplier.consecutive_failures > 10 ? 'text-red-600' : supplier.consecutive_failures > 0 ? 'text-yellow-600' : 'text-green-600'}`}>
           {supplier.consecutive_failures}
-          {supplier.consecutive_failures >= 20 && (
+          {supplier.status === 'inactive' && (
+            <span className="ml-1 text-xs text-red-500">🚫 INACTIVE</span>
+          )}
+          {supplier.status !== 'inactive' && supplier.consecutive_failures >= 20 && (
             <span className="ml-1 text-xs text-red-500">(BLOCKED)</span>
           )}
         </span>
@@ -176,6 +193,16 @@ export const SuppliersList: React.FC = () => {
         <div className="text-right">
           <p className="font-semibold text-gray-800">€{supplier.balance.toLocaleString()}</p>
         </div>
+      ),
+    },
+    {
+      key: 'billing',
+      header: 'Billing',
+      hideOnMobile: true,
+      render: (supplier: Supplier) => (
+        <Badge variant={supplier.billing_mode === 'submit' ? 'warning' : 'info'}>
+          {supplier.billing_mode === 'submit' ? 'On Submit' : 'On DLR'}
+        </Badge>
       ),
     },
     {
@@ -221,6 +248,23 @@ export const SuppliersList: React.FC = () => {
                 <Edit size={14} />
                 Edit
               </button>
+              {supplier.status === 'inactive' && (
+                <>
+                  <hr className="my-1" />
+                  <button
+                    onClick={() => {
+                      if (window.confirm(`Reactivate ${supplier.company_name}? Failures will be reset and the health monitor will re-check.`)) {
+                        updateSupplier(supplier.id, { status: 'active', bind_status: 'unbound', consecutive_failures: 0 });
+                        setActionMenu(null);
+                      }
+                    }}
+                    className="w-full flex items-center gap-2 px-4 py-2 text-sm text-green-600 hover:bg-green-50"
+                  >
+                    <CheckCircle size={14} />
+                    Reactivate
+                  </button>
+                </>
+              )}
               <hr className="my-1" />
               <button
                 onClick={() => {
@@ -284,7 +328,7 @@ export const SuppliersList: React.FC = () => {
           </p>
         </div>
         <div className="bg-white rounded-xl p-4 border border-gray-200">
-          <p className="text-sm text-gray-500">Bound</p>
+          <p className="text-sm text-gray-500">Online</p>
           <p className="text-2xl font-bold text-blue-600 mt-1">
             {suppliers.filter(s => s.bind_status === 'bound').length}
           </p>

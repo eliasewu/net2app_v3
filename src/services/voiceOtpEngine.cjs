@@ -9,11 +9,19 @@
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const callerIdPool = require('./callerIdPool.cjs');
+
+// Track active Voice OTP calls by destination to prevent overlapping calls.
+// Key = normalized E.164 destination, Value = { callId, startedAt }
+const activeVoiceCalls = new Map();
 
 // Lazy-loaded: asterisk bridge module
 let asteriskBridge = null;
-try { asteriskBridge = require('../../asterisk-bridge.cjs'); } catch (e) {
-    console.error('[VoiceOTP] Asterisk bridge not available — all calls will be simulated:', e.message);
+try {
+    asteriskBridge = require('../../asterisk-bridge.cjs');
+    console.log('[VoiceOTP] Asterisk bridge LOADED — originateCall is', typeof asteriskBridge.originateCall);
+} catch (e) {
+    console.error('[VoiceOTP] Asterisk bridge FAILED to load:', e.message, e.stack);
 }
 
 // ============================================================================
@@ -355,35 +363,42 @@ async function resolveVoiceOtpConfig(pool, destination, defaultLanguageCode) {
  * Build the audio sequence for a Voice OTP call.
  * Returns an array of audio paths/descriptions in playback order.
  * 
- * Sequence:
- *   [greeting] + [digits 0..9] + [retry]
+ * Sequence (single language):
+ *   [greeting] + [digits] + [retry greeting if retry text set]
+ * 
+ * Sequence (dual language with secondaryConfig):
+ *   [primary greeting] + [primary digits] + [secondary greeting] + [secondary digits]
  * 
  * When useSecondaryLanguage=false → primary language audio
- * When useSecondaryLanguage=true  → secondary language audio (falls back to primary if none)
+ * When useSecondaryLanguage=true  → secondary language audio (uses secondaryConfig if provided, else falls back to primary config)
  * 
- * @param {object} config - voice_otp_configs row
+ * @param {object} config - voice_otp_configs row (primary language)
  * @param {string} otpCode - OTP digits to speak
  * @param {number} playCount - repeat count (1-3)
  * @param {boolean} useSecondaryLanguage - whether to use secondary language audio
+ * @param {object} [secondaryConfig] - optional secondary language config (e.g. English config for local_international mode)
  * @returns {{ audio: string[], repeat: number, language: string, usedSecondary: boolean }}
  */
-function buildAudioSequence(config, otpCode, playCount, useSecondaryLanguage) {
+function buildAudioSequence(config, otpCode, playCount, useSecondaryLanguage, secondaryConfig) {
     const digits = otpCode.split('');
     const audio = [];
     const audioDir = path.join(__dirname, '..', '..', 'data', 'uploads', 'audio');
     
     const primaryLang = config.primary_language_code || config.language_code || 'en-US';
-    const secondaryLang = config.secondary_language_code || primaryLang;
-    const hasSecondaryConfig = !!(config.secondary_greeting_audio_url || (config.audio_0_9_secondary && Object.keys(typeof config.audio_0_9_secondary === 'string' ? JSON.parse(config.audio_0_9_secondary) : (config.audio_0_9_secondary || {})).length > 0));
+    const secondaryLang = (secondaryConfig && secondaryConfig.primary_language_code) || config.secondary_language_code || primaryLang;
+    // Check if secondary has actual audio uploaded (on the secondaryConfig or on the primary config)
+    const secCfg = secondaryConfig || config;
+    const hasSecondaryAudio = !!(secCfg.greeting_audio_url || 
+        (secCfg.audio_0_9_primary && Object.keys(typeof secCfg.audio_0_9_primary === 'string' ? JSON.parse(secCfg.audio_0_9_primary) : (secCfg.audio_0_9_primary || {})).length > 0) ||
+        (secCfg.audio_0_9 && Object.keys(typeof secCfg.audio_0_9 === 'string' ? JSON.parse(secCfg.audio_0_9) : (secCfg.audio_0_9 || {})).length > 0));
     
-    // Determine which language to use
-    const useSecondary = useSecondaryLanguage && (secondaryLang !== primaryLang || hasSecondaryConfig);
+    // Determine which language/config to use
+    const useSecondary = useSecondaryLanguage && (secondaryLang !== primaryLang || hasSecondaryAudio);
     const lang = useSecondary ? secondaryLang : primaryLang;
+    const effectiveConfig = useSecondary ? secCfg : config;
     
-    // Greeting — pick the right one
-    const greeting = useSecondary
-        ? (config.secondary_greeting_audio_url || config.greeting_audio_url || path.join(audioDir, lang, 'greeting.wav'))
-        : (config.greeting_audio_url || path.join(audioDir, lang, 'greeting.wav'));
+    // Greeting — pick from effective config (secondaryConfig if available and active, else primary config)
+    const greeting = effectiveConfig.greeting_audio_url || path.join(audioDir, lang, 'greeting.wav');
     audio.push(greeting);
     
     // Helper: parse JSONB safely
@@ -392,21 +407,14 @@ function buildAudioSequence(config, otpCode, playCount, useSecondaryLanguage) {
         return typeof raw === 'string' ? JSON.parse(raw) : raw;
     };
     
-    // Digits 0-9 — MERGE primary/secondary layer with legacy audio_0_9
-    // Uploaded data URLs take priority over legacy disk paths for same digit
-    const legacyMap = parseJson(config.audio_0_9);
-    const primaryUploadMap = parseJson(config.audio_0_9_primary);
-    const secondaryUploadMap = parseJson(config.audio_0_9_secondary);
+    // Digits 0-9 — use effective config's audio
+    // Merge: legacy audio_0_9 < audio_0_9_primary (uploaded data URLs take priority)
+    const legacyMap = parseJson(effectiveConfig.audio_0_9);
+    const primaryUploadMap = parseJson(effectiveConfig.audio_0_9_primary);
+    const secondaryUploadMap = parseJson(effectiveConfig.audio_0_9_secondary);
     
     // Build effective map: legacy < primary-upload < secondary-upload
-    let effectiveDigitMap;
-    if (useSecondary) {
-        // Secondary: merge legacy + primary + secondary, with secondary on top
-        effectiveDigitMap = { ...legacyMap, ...primaryUploadMap, ...secondaryUploadMap };
-    } else {
-        // Primary: merge legacy + primary
-        effectiveDigitMap = { ...legacyMap, ...primaryUploadMap };
-    }
+    const effectiveDigitMap = { ...legacyMap, ...primaryUploadMap, ...secondaryUploadMap };
     
     for (const digit of digits) {
         if (effectiveDigitMap[digit]) {
@@ -416,8 +424,8 @@ function buildAudioSequence(config, otpCode, playCount, useSecondaryLanguage) {
         }
     }
     
-    // Retry text
-    const retryText = useSecondary ? (config.secondary_retry_text || config.retry_text) : (config.primary_retry_text || config.retry_text);
+    // Retry text — from effective config
+    const retryText = effectiveConfig.primary_retry_text || effectiveConfig.retry_text || '';
     if (retryText) {
         audio.push(greeting);
     }
@@ -504,19 +512,61 @@ function concatenateWavFiles(filePaths) {
  * @returns {Promise<{status:string, dlr:string, duration:number, error?:string}>}
  */
 async function originateCall(pool, options) {
-    const { callId, destination, otpCode, supplier, config, playCount, timeout = 45000, useSecondaryLanguage = false } = options;
+    const { callId, destination, otpCode, supplier, config, playCount, timeout = 45000, useSecondaryLanguage = false, secondaryConfig = null } = options;
     
     // Build audio sequence FIRST — so language info is available even in error paths
-    const audioSeq = buildAudioSequence(config, otpCode, playCount, useSecondaryLanguage);
+    const audioSeq = buildAudioSequence(config, otpCode, playCount, useSecondaryLanguage, secondaryConfig);
     
-    // Parse supplier SIP address
-    const sipAddr = parseSipAddress(supplier.dst_sip_address || '');
+    // Parse supplier SIP address — fall back to platform_settings.sip_servers
+    let sipAddr = parseSipAddress(supplier.dst_sip_address || '');
+    if (!sipAddr) {
+        // Fallback: look up global SIP servers from platform_settings
+        try {
+            const svrR = await pool.query("SELECT value FROM platform_settings WHERE key = 'sip_servers'");
+            let sipServers = [];
+            if (svrR.rows.length && svrR.rows[0].value) {
+                try { sipServers = typeof svrR.rows[0].value === 'string' ? JSON.parse(svrR.rows[0].value) : svrR.rows[0].value; }
+                catch { sipServers = []; }
+            }
+            if (!Array.isArray(sipServers)) sipServers = [];
+            if (sipServers.length > 0) {
+                // Match by destination MCC
+                let destMcc = '';
+                try {
+                    const destNum = String(destination).replace(/^\+/, '');
+                    for (let len = 4; len >= 1; len--) {
+                        const prefix = destNum.substring(0, len);
+                        const mccR = await pool.query(
+                            "SELECT mcc FROM mccmnc WHERE calling_code = $1 AND (is_deleted IS NULL OR is_deleted = false) LIMIT 1",
+                            [prefix]
+                        );
+                        if (mccR.rows.length) { destMcc = mccR.rows[0].mcc; break; }
+                    }
+                } catch (e) { /* non-critical */ }
+                let selected = sipServers[0];
+                if (destMcc && sipServers.length > 1) {
+                    for (const srv of sipServers) {
+                        const allowed = (srv.mccmnc_allowed || '').split(',').map(s => s.trim()).filter(Boolean);
+                        if (allowed.includes(destMcc) || allowed.includes('*') || allowed.includes(destMcc + '*')) { selected = srv; break; }
+                    }
+                }
+                const addr = (selected && selected.host) ? (selected.host + ':' + (selected.port || 5060)) : '';
+                sipAddr = parseSipAddress(addr);
+                if (sipAddr) console.log('[VoiceOTP] Using platform_settings SIP server: %s:%s (MCC=%s)', sipAddr.host, sipAddr.port, destMcc || 'none');
+            }
+        } catch (e) {
+            console.error('[VoiceOTP] SIP server fallback lookup failed:', e.message);
+        }
+    }
     if (!sipAddr) {
         return { status: 'failed', dlr: 'FAILED', duration: 0,
                  error: 'No SIP address configured for supplier',
                  language: audioSeq.language,
                  usedSecondary: audioSeq.usedSecondary };
     }
+
+    // DIAGNOSTIC: confirm bridge status and resolved SIP at call time
+    console.log('[VoiceOTP-DIAG] originateCall id=%s bridge=%s sip=%s:%s', callId, !!asteriskBridge, sipAddr.host, sipAddr.port);
     
     // If asterisk bridge is available, use it
     if (asteriskBridge && typeof asteriskBridge.originateCall === 'function') {
@@ -529,7 +579,7 @@ async function originateCall(pool, options) {
                 sipPort: sipAddr.port,
                 sipUsername: supplier.smpp_username || '',
                 sipPassword: supplier.smpp_password || '',
-                callerId: config.caller_id || otpCode,
+                callerId: config.caller_id || (await resolveCallerId(pool, destination)) || callerIdPool.pickCallerId(destination) || generateRandomCallerId(destination),
                 greetingAudio: audioSeq.audio[0] || null,
                 digitAudio: digitMap,       // key-value map for backward compat
                 audioFiles: audioSeq.audio, // flat array for sequential playback
@@ -558,6 +608,32 @@ async function originateCall(pool, options) {
     return { ...simResult, language: audioSeq.language, usedSecondary: audioSeq.usedSecondary };
 }
 
+/**
+ * Generate a random caller ID with a FOREIGN country prefix.
+ * Carriers reject same-country ANI (e.g. Bangladesh rejects +880... caller).
+ * Picks a random DIFFERENT country prefix to appear as an international call.
+ * @param {string} destination - E.164 number (e.g. +8801615069178)
+ * @returns {string} random number matching destination country prefix
+ */
+function generateRandomCallerId(destination) {
+    const cleaned = (destination || '').replace(/\D/g, '');
+    // Find the destination's country prefix
+    let destPrefix = '';
+    const sortedPrefixes = Object.keys(COUNTRY_LANGUAGE_MAP).sort((a, b) => b.length - a.length);
+    for (const p of sortedPrefixes) {
+        if (cleaned.startsWith(p)) { destPrefix = p; break; }
+    }
+    // Pick a DIFFERENT foreign country prefix (carriers reject same-country ANI)
+    const foreignPrefixes = sortedPrefixes.filter(p => p !== destPrefix);
+    if (foreignPrefixes.length === 0) {
+        return '+' + Array.from({ length: 10 }, () => Math.floor(Math.random() * 10)).join('');
+    }
+    const prefix = foreignPrefixes[Math.floor(Math.random() * foreignPrefixes.length)];
+    const remaining = Math.max(5, 12 - prefix.length);
+    const suffix = Array.from({ length: remaining }, () => Math.floor(Math.random() * 10)).join('');
+    return '+' + prefix + suffix;
+}
+
 function parseSipAddress(addr) {
     if (!addr) return null;
     const parts = addr.split(':');
@@ -565,6 +641,60 @@ function parseSipAddress(addr) {
         host: parts[0] || '127.0.0.1',
         port: parseInt(parts[1]) || 5060,
     };
+}
+
+/**
+ * Resolve the caller ID for a voice OTP call.
+ * Chain: config.caller_id → SIP server caller_id → platform_settings sip_caller_id → null
+ * NEVER uses the destination (callee) number as caller ID.
+ */
+async function resolveCallerId(pool, destination) {
+    if (!pool) return null;
+    try {
+        // Look up SIP servers from platform_settings
+        const svrR = await pool.query("SELECT value FROM platform_settings WHERE key = 'sip_servers'");
+        let sipServers = [];
+        if (svrR.rows.length && svrR.rows[0].value) {
+            try { sipServers = typeof svrR.rows[0].value === 'string' ? JSON.parse(svrR.rows[0].value) : svrR.rows[0].value; }
+            catch { sipServers = []; }
+        }
+        if (!Array.isArray(sipServers)) sipServers = [];
+
+        // Match by destination MCC to find the right SIP server
+        let destMcc = '';
+        try {
+            const destNum = String(destination || '').replace(/^\+/, '');
+            for (let len = 4; len >= 1; len--) {
+                const prefix = destNum.substring(0, len);
+                const mccR = await pool.query(
+                    "SELECT mcc FROM mccmnc WHERE calling_code = $1 AND (is_deleted IS NULL OR is_deleted = false) LIMIT 1",
+                    [prefix]
+                );
+                if (mccR.rows.length) { destMcc = mccR.rows[0].mcc; break; }
+            }
+        } catch (e) { /* non-critical */ }
+
+        // Find matching server's caller_id
+        let selected = sipServers.length > 0 ? sipServers[0] : null;
+        if (destMcc && sipServers.length > 1) {
+            for (const srv of sipServers) {
+                const allowed = (srv.mccmnc_allowed || '').split(',').map(s => s.trim()).filter(Boolean);
+                if (allowed.includes(destMcc) || allowed.includes('*') || allowed.includes(destMcc + '*')) { selected = srv; break; }
+            }
+        }
+        // Only use the server's caller_id if is_e164 is enabled (not explicitly false).
+        // When is_e164 is unchecked, return null so generateRandomCallerId() handles it.
+        if (selected && selected.is_e164 !== false && selected.caller_id && /^\+?\d{6,15}$/.test(selected.caller_id)) return selected.caller_id;
+        if (selected && selected.is_e164 === false) return null; // user explicitly disabled E.164 — skip all configured caller IDs
+
+        // Fall back to global sip_caller_id — only if it looks like a real E.164 number
+        const globalR = await pool.query("SELECT value FROM platform_settings WHERE key = 'sip_caller_id'");
+        const globalCallerId = globalR.rows[0]?.value || '';
+        if (globalCallerId && /^\+?\d{6,15}$/.test(globalCallerId)) return globalCallerId;
+    } catch (e) {
+        console.error('[VoiceOTP] resolveCallerId failed:', e.message);
+    }
+    return null;
 }
 
 function buildDigitAudioMap(audioSeq) {
@@ -679,7 +809,7 @@ async function executeWithRetry(pool, options) {
         }
         
         // Attempt the call with the selected language
-        const callOpts = { ...options, useSecondaryLanguage };
+        const callOpts = { ...options, useSecondaryLanguage, secondaryConfig: config._englishConfig || null };
         const result = await originateCall(pool, callOpts);
         totalDuration += result.duration || 0;
         const langTag = useSecondaryLanguage ? 'sec' : 'pri';
@@ -773,7 +903,48 @@ async function applyForceDlr(pool, log, forceDlrOverride, realDlr) {
  * @returns {Promise<{callId:string, otpCode:string, dlr:string, duration:number}>}
  */
 async function executeVoiceOtpPipeline(pool, ctx) {
-    const { client, supplier, destination, message, messageId, configId } = ctx;
+    const { client, supplier, destination, message, messageId, configId, preRegisteredCallId } = ctx;
+    
+    // 0. Prevent overlapping calls to the same destination.
+    // If caller already registered us (preRegisteredCallId), skip check.
+    // Otherwise, atomically check and register now.
+    const destKey = (destination || '').replace(/\D/g, '');
+    let callId = preRegisteredCallId || null;
+    
+    if (!callId) {
+        // No pre-registration — check and register now
+        if (activeVoiceCalls.has(destKey)) {
+            const existing = activeVoiceCalls.get(destKey);
+            console.log('[VoiceOTP] BLOCKED overlapping call to %s (existing call %s, age=%dms)',
+                destination, existing.callId, Date.now() - existing.startedAt);
+            
+            if (messageId) {
+                await pool.query(
+                    `UPDATE sms_logs SET status = 'failed', dlr_status = 'REJECTED',
+                     delivery_time = NOW(), error = 'destination_busy_overlapping_call'
+                     WHERE message_id = $1`,
+                    [messageId]
+                ).catch(() => {});
+            }
+            
+            return {
+                callId: null,
+                otpCode: '',
+                dlr: 'REJECTED',
+                duration: 0,
+                attempts: 0,
+                error: 'Overlapping call — destination already has an active Voice OTP call',
+            };
+        }
+        callId = `VOICE_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+    }
+    
+    try {
+    // Mark destination as active — inside try so cleanup always runs on error
+    // Skip set() if caller already registered us (preRegisteredCallId)
+    if (!preRegisteredCallId) {
+        activeVoiceCalls.set(destKey, { callId, startedAt: Date.now() });
+    }
     
     // 1. Extract OTP digits
     const { otp, method } = extractOtpDigits(message, client.otp_extraction_pattern);
@@ -808,6 +979,20 @@ async function executeVoiceOtpPipeline(pool, ctx) {
             config = { ...config, play_count: 2, secondary_language_code: config.primary_language_code };
         } else if (voiceOtpMode === 'local_international') {
             config = { ...config, play_count: config.play_count || 1, secondary_language_code: 'en-US' };
+            // Look up the best English config for concatenated dual-language audio
+            const enResult = await pool.query(
+                `SELECT * FROM voice_otp_configs 
+                 WHERE is_active = true AND primary_language_code LIKE 'en%'
+                 ORDER BY greeting_audio_url IS NOT NULL DESC, 
+                          (audio_0_9_primary IS NOT NULL OR audio_0_9 IS NOT NULL) DESC
+                 LIMIT 1`
+            );
+            if (enResult.rows.length > 0) {
+                config._englishConfig = enResult.rows[0];
+                console.log(`[VoiceOTP] English config #${enResult.rows[0].id} (${enResult.rows[0].language}) resolved for dual-language`);
+            } else {
+                console.log('[VoiceOTP] No English config found — dual-language will fall back to primary');
+            }
         }
         console.log(`[VoiceOTP] Mode '${voiceOtpMode}' applied: play_count=${config.play_count}, secondary=${config.secondary_language_code}`);
     }
@@ -815,8 +1000,7 @@ async function executeVoiceOtpPipeline(pool, ctx) {
     // 3. Determine play count (client-level > mode-override > config-level > default 1)
     const playCount = client.play_count || (config ? config.play_count : 1) || 1;
     
-    // 4. Build call ID
-    const callId = `VOICE_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+    // 4. (callId already generated above for overlap tracking)
     
     // 5. Insert voice_otp_logs entry (status=sent as soon as handed to engine)
     // max_retries: supplier > config.retry_count > default 3
@@ -849,50 +1033,54 @@ async function executeVoiceOtpPipeline(pool, ctx) {
         supplier,
         config,
         playCount,
-        timeout: playCount * 15000, // scale timeout with play_count
+        timeout: playCount * 10000,
     });
     
-    // 8. Update voice_otp_logs with final result
-    const duration = result.totalDuration || 0;
-    const realDlr = result.finalDlr || 'FAILED';
-    
-    // Calculate costs
-    const supplierRatePerSec = supplier.rate_per_second || 0;
-    const totalCost = (duration / 1000) * supplierRatePerSec;
-    
-    await pool.query(
-        `UPDATE voice_otp_logs 
-         SET status = $1, dlr_status = $2, duration = $3, 
-             reconnect_trace = $4, retry_count = $5,
-             total_cost = $6, completed_at = NOW()
-         WHERE call_id = $7`,
-        [result.finalStatus, realDlr, duration,
-         result.reconnectTrace || [], result.attempts || 0,
-         totalCost, callId]
-    );
-    
-    // 9. Apply Force DLR if enabled
-    const forceDlr = await applyForceDlr(
-        pool,
-        { id: callId }, // voice_otp_logs reference
-        client.force_dlr_override || false,
-        realDlr
-    );
-    
-    // 10. Update sms_logs with final delivery status
-    const clientFacingDlr = forceDlr.applied ? forceDlr.clientDlr : realDlr;
-    await pool.query(
-        `UPDATE sms_logs 
-         SET status = $1, dlr_status = $2, delivery_time = NOW(),
-             is_force_dlr = $3
-         WHERE message_id = $4`,
-        [clientFacingDlr === 'DELIVRD' ? 'delivered' : 'failed',
-         clientFacingDlr, forceDlr.applied, messageId]
-    );
+    // 8. Process result and update DB — always release lock in finally
+    let duration = 0, realDlr = 'FAILED', clientFacingDlr = 'FAILED', forceDlr = null;
+    try {
+      duration = result.totalDuration || 0;
+      realDlr = result.finalDlr || 'FAILED';
+      
+      const supplierRatePerSec = supplier.rate_per_second || 0;
+      const totalCost = (duration / 1000) * supplierRatePerSec;
+      
+      await pool.query(
+          `UPDATE voice_otp_logs 
+           SET status = $1, dlr_status = $2, duration = $3, 
+               reconnect_trace = $4, retry_count = $5,
+               total_cost = $6, completed_at = NOW()
+           WHERE call_id = $7`,
+          [result.finalStatus, realDlr, duration,
+           result.reconnectTrace || [], result.attempts || 0,
+           totalCost, callId]
+      );
+      
+      // 9. Apply Force DLR if enabled
+      forceDlr = await applyForceDlr(
+          pool,
+          { id: callId },
+          client.force_dlr_override || false,
+          realDlr
+      );
+      
+      // 10. Update sms_logs with final delivery status
+      clientFacingDlr = forceDlr.applied ? forceDlr.clientDlr : realDlr;
+      await pool.query(
+          `UPDATE sms_logs 
+           SET status = $1, dlr_status = $2, delivery_time = NOW(),
+               is_force_dlr = $3
+           WHERE message_id = $4`,
+          [clientFacingDlr === 'DELIVRD' ? 'delivered' : 'failed',
+           clientFacingDlr, forceDlr.applied, messageId]
+      );
+    } finally {
+      releaseActiveCall(destination);
+    }
     
     // 11. Trigger client DLR callback if webhook configured
-    if (client.dlr_callback_url) {
-        sendDlrCallback(client.dlr_callback_url, {
+    if (client.webhook_url) {
+        sendDlrCallback(client.webhook_url, {
             message_id: messageId,
             destination,
             status: clientFacingDlr,
@@ -912,6 +1100,10 @@ async function executeVoiceOtpPipeline(pool, ctx) {
         attempts: result.attempts,
         forceDlrApplied: forceDlr.applied,
     };
+    } finally {
+        // Clean up: remove destination from active set when done
+        activeVoiceCalls.delete(destKey);
+    }
 }
 
 // ============================================================================
@@ -958,9 +1150,56 @@ async function sendDlrCallback(url, payload) {
 // EXPORT
 // ============================================================================
 
+/**
+ * Try to atomically register a destination for an active call.
+ * Called from smsQueueManager BEFORE any async work to prevent
+ * race conditions between multiple workers.
+ * 
+ * @param {string} destination - E.164 number
+ * @returns {string|null} callId if registered, null if destination is busy
+ */
+function tryRegisterActiveCall(destination) {
+    const destKey = (destination || '').replace(/\D/g, '');
+    const existing = activeVoiceCalls.get(destKey);
+    if (existing) {
+        // Auto-cleanup stale locks (older than 60s — call should complete within 30s)
+        if (Date.now() - existing.startedAt > 60000) {
+            console.log('[VoiceOTP] Cleaning stale lock for %s (age=%dms)', destKey, Date.now() - existing.startedAt);
+            activeVoiceCalls.delete(destKey);
+        } else {
+            return null; // genuinely busy
+        }
+    }
+    const callId = `VOICE_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+    activeVoiceCalls.set(destKey, { callId, startedAt: Date.now() });
+    console.log('[VoiceOTP] Registered active call %s → %s', callId, destination);
+    return callId;
+}
+
+/**
+ * Release a previously registered destination lock.
+ * Called when the queue manager exits early (before firing the engine)
+ * so the destination doesn't stay permanently locked.
+ * 
+ * @param {string} destination - E.164 number (same as passed to tryRegisterActiveCall)
+ */
+function releaseActiveCall(destination) {
+    const destKey = (destination || '').replace(/\D/g, '');
+    const existing = activeVoiceCalls.get(destKey);
+    if (existing) {
+        console.log('[VoiceOTP] Released active call %s → %s (age=%dms)',
+            existing.callId, destination, Date.now() - existing.startedAt);
+    }
+    activeVoiceCalls.delete(destKey);
+}
+
 module.exports = {
     // Core pipeline
     executeVoiceOtpPipeline,
+    
+    // Overlap prevention — called from queue manager BEFORE async work
+    tryRegisterActiveCall,
+    releaseActiveCall,
     
     // Individual steps (for testing/custom use)
     extractOtpDigits,

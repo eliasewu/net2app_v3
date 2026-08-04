@@ -26,6 +26,9 @@ class SmppClient {
     this.maxReconnectAttempts = 10;
     this._connecting = false; // guard against concurrent connect calls
     this._connectResolved = false; // guard against double-resolve in connect()
+    this._unboundSynced = false; // guard against double _syncBindStatus('unbound')
+    /** DLR callback: (dlr) => void where dlr = { message_id, status, error_code, text } */
+    this.onDlr = null;
   }
 
   async connect() {
@@ -75,6 +78,7 @@ class SmppClient {
             this.bound = true;
             this.reconnectAttempts = 0;
             this._connectResolved = true;
+            this._unboundSynced = false;
             const negotiatedVer = pdu.sc_interface_version || pdu.interface_version;
             console.log(`[SMPP-CLIENT] ✅ ${supplier.supplier_code}: BOUND (v${negotiatedVer?.toString(16) || '34'})`);
             await this._syncBindStatus('bound', negotiatedVer);
@@ -102,7 +106,8 @@ class SmppClient {
         this.connected = false;
         this.bound = false;
         this._connecting = false;
-        if (this.pool) {
+        if (this.pool && !this._unboundSynced) {
+          this._unboundSynced = true;
           try { await this._syncBindStatus('unbound'); } catch (e) { /* ignore */ }
         }
       });
@@ -111,16 +116,162 @@ class SmppClient {
         console.log(`[SMPP-CLIENT] ${supplier.supplier_code}: Connection closed`);
         this.connected = false;
         this.bound = false;
-        await this._syncBindStatus('unbound');
+        if (!this._unboundSynced) {
+          this._unboundSynced = true;
+          await this._syncBindStatus('unbound');
+        }
         this.reconnect();
       });
 
       // Handle incoming deliver_sm (DLR from SMSC)
-      this.session.on('deliver_sm', (pdu, callback) => {
+      this.session.on('deliver_sm', async (pdu, pduCallback) => {
+        pduCallback(); // ACK the PDU immediately
         const source = pdu.source_addr ? pdu.source_addr.toString() : '';
-        const message = pdu.short_message ? pdu.short_message.toString() : '';
-        console.log(`[SMPP-CLIENT] ${supplier.supplier_code}: DLR from ${source}: ${message}`);
-        callback();
+
+        // Parse short_message — can be Buffer, string, or object (depending on smpp library version)
+        let rawMessage = '';
+        if (pdu.short_message) {
+          if (Buffer.isBuffer(pdu.short_message)) {
+            rawMessage = pdu.short_message.toString('utf8');
+          } else if (typeof pdu.short_message === 'object') {
+            rawMessage = pdu.short_message.message || pdu.short_message.short_message || JSON.stringify(pdu.short_message);
+          } else {
+            rawMessage = String(pdu.short_message);
+          }
+        }
+
+        console.log(`[SMPP-CLIENT] ${supplier.supplier_code}: DLR from ${source}: ${rawMessage.substring(0, 200)}`);
+
+        // Parse SMPP DLR receipt format:
+        // "id:ABC123 sub:001 dlvrd:001 submit date:... done date:... stat:DELIVRD err:000 text:..."
+        const idMatch = rawMessage.match(/\bid:(\S+)/i);
+        const statMatch = rawMessage.match(/\bstat:(\S+)/i);
+        const errMatch = rawMessage.match(/\berr:(\S+)/i);
+        const textMatch = rawMessage.match(/\btext:(.+)$/im);
+
+        const dlrMessageId = idMatch ? idMatch[1] : '';
+        const dlrStatus = statMatch ? statMatch[1] : '';
+        const dlrError = errMatch ? errMatch[1] : '000';
+        const dlrText = textMatch ? textMatch[1].trim() : (dlrStatus || '');
+
+        if (!dlrMessageId) {
+          console.warn(`[SMPP-CLIENT] ${supplier.supplier_code}: DLR missing message_id in: "${rawMessage.substring(0, 100)}"`);
+          return;
+        }
+
+        const isDelivered = dlrStatus === 'DELIVRD';
+        const finalStatus = isDelivered ? 'delivered' : (dlrStatus === 'REJECTD' || dlrStatus === 'EXPIRED' ? 'failed' : 'failed');
+        const finalDlr = dlrStatus || 'UNDELIV';
+
+        console.log(`[SMPP-CLIENT] ${supplier.supplier_code}: DLR parsed — ${dlrMessageId} → stat=${finalDlr} err=${dlrError} delivered=${isDelivered}`);
+
+        try {
+          // Update sms_outbox
+          const outboxR = await this.pool.query(
+            `UPDATE sms_outbox SET
+               dlr_status = $1,
+               dlr_received_at = NOW(),
+               dlr_confirmed_at = NOW(),
+               status = $2,
+               completed_at = NOW()
+             WHERE message_id = $3
+             RETURNING id, client_id, client_code, supplier_id, destination, sender_id, source, queued_at,
+                       client_rate, supplier_rate, message_parts, billing_mode, supplier_billing_mode`,
+            [finalDlr, finalStatus, dlrMessageId]
+          );
+
+          // Update sms_logs
+          await this.pool.query(
+            `UPDATE sms_logs SET
+               dlr_status = $1,
+               status = $2,
+               delivery_time = NOW(),
+               dlr_timestamp = NOW(),
+               error_code = CASE WHEN $4 != '000' THEN $4 ELSE error_code END
+             WHERE message_id = $3`,
+            [finalDlr, finalStatus, dlrMessageId, dlrError]
+          );
+
+          // DLR BILLING: charge remaining parties whose billing_mode='dlr' on DELIVRD
+          if (isDelivered && outboxR.rows.length > 0) {
+            const outbox = outboxR.rows[0];
+            const clientCost = parseFloat(((parseFloat(outbox.client_rate || 0)) * (parseInt(outbox.message_parts || 1))).toFixed(6));
+            const supplierCost = parseFloat(((parseFloat(outbox.supplier_rate || 0)) * (parseInt(outbox.message_parts || 1))).toFixed(6));
+            const clientBillingMode = outbox.billing_mode || 'dlr';
+            const supplierBillingMode = outbox.supplier_billing_mode || 'dlr';
+            
+            try {
+              // Check billing flags — only charge parties that haven't been billed yet
+              const flagsR = await this.pool.query(
+                'SELECT is_client_billed, is_supplier_billed FROM sms_logs WHERE message_id = $1',
+                [dlrMessageId]
+              );
+              const isClientBilled = flagsR.rows[0]?.is_client_billed || false;
+              const isSupplierBilled = flagsR.rows[0]?.is_supplier_billed || false;
+              
+              let clientBilledNow = false, supplierBilledNow = false;
+              
+              // Client billing: only if dlr-mode and not yet billed
+              if (!isClientBilled && clientBillingMode === 'dlr' && clientCost > 0 && outbox.client_id) {
+                await this.pool.query(
+                  'UPDATE clients SET balance = GREATEST(0, balance - $1), updated_at = NOW() WHERE id = $2',
+                  [clientCost, outbox.client_id]
+                ).catch(() => {});
+                await this.pool.query(
+                  'UPDATE sms_logs SET is_client_billed = true WHERE message_id = $1 AND is_client_billed = false',
+                  [dlrMessageId]
+                ).catch(() => {});
+                clientBilledNow = true;
+                console.log(`[SMPP-CLIENT] 💰 ${supplier.supplier_code}: Client #${outbox.client_id} billed €${clientCost} on DLR (${dlrMessageId})`);
+              }
+              
+              // Supplier billing: only if dlr-mode and not yet billed
+              if (!isSupplierBilled && supplierBillingMode === 'dlr' && supplierCost > 0 && outbox.supplier_id) {
+                await this.pool.query(
+                  'UPDATE suppliers SET balance = GREATEST(0, balance - $1), updated_at = NOW() WHERE id = $2',
+                  [supplierCost, outbox.supplier_id]
+                ).catch(() => {});
+                await this.pool.query(
+                  'UPDATE sms_logs SET is_supplier_billed = true WHERE message_id = $1 AND is_supplier_billed = false',
+                  [dlrMessageId]
+                ).catch(() => {});
+                supplierBilledNow = true;
+                console.log(`[SMPP-CLIENT] 💰 ${supplier.supplier_code}: Supplier #${outbox.supplier_id} billed €${supplierCost} on DLR (${dlrMessageId})`);
+              }
+              
+              // Update composite is_billed flag
+              if ((isClientBilled || clientBilledNow) && (isSupplierBilled || supplierBilledNow || !outbox.supplier_id)) {
+                await this.pool.query(
+                  'UPDATE sms_logs SET is_billed = true WHERE message_id = $1 AND is_billed = false',
+                  [dlrMessageId]
+                ).catch(() => {});
+              }
+            } catch (e) {
+              console.error(`[SMPP-CLIENT] ${supplier.supplier_code}: DLR billing failed for ${dlrMessageId}: ${e.message}`);
+            }
+          }
+
+          // Notify DLR callback (forward to QueueManager for external client push)
+          if (this.onDlr && outboxR.rows.length > 0) {
+            const job = outboxR.rows[0];
+            try {
+              this.onDlr({
+                message_id: dlrMessageId,
+                client_id: job.client_id,
+                client_code: job.client_code,
+                destination: job.destination,
+                sender_id: job.sender_id,
+                status: finalDlr,
+                source: job.source || 'smpp',
+                queued_at: job.queued_at,
+              });
+            } catch (e) { /* non-critical */ }
+          }
+
+          console.log(`[SMPP-CLIENT] ${supplier.supplier_code}: DLR processed ✓ — ${dlrMessageId} → sms_outbox=${finalStatus}, sms_logs=${finalDlr}`);
+        } catch (e) {
+          console.error(`[SMPP-CLIENT] ${supplier.supplier_code}: DLR DB update failed for ${dlrMessageId}: ${e.message}`);
+        }
       });
     });
   }
@@ -128,6 +279,7 @@ class SmppClient {
   async disconnect() {
     this.maxReconnectAttempts = 0;
     this._connecting = false;
+    this._unboundSynced = true; // prevent close event from double-syncing
     if (this.session) {
       try { this.session.close(); } catch (e) { /* ignore */ }
     }
@@ -192,6 +344,7 @@ class SmppClient {
   async _syncBindStatus(status, negotiatedVersion) {
     const { id: supplierId, supplier_code: supplierCode, smpp_username: systemId, smpp_host: host, smpp_port: port } = this.supplier;
     const db = this.pool;
+    if (!db) return; // pool not yet initialized
 
     if (status === 'bound') {
       const ver = negotiatedVersion ? negotiatedVersion.toString(16) : '34';
@@ -236,15 +389,24 @@ class SmppClient {
 
       try {
         await db.query(
+          `UPDATE suppliers SET bind_status='unbound',
+           consecutive_failures = consecutive_failures + 1, updated_at = NOW()
+           WHERE id=$1`,
+          [supplierId]
+        );
+      } catch (e) { console.error(`[SMPP-CLIENT] supplier unbind update failed: ${e.message}`); }
+
+      try {
+        await db.query(
           `INSERT INTO bind_history (entity_type, entity_id, system_id, ip_address, port, bind_mode, status, created_at)
            VALUES ('supplier',$1,$2,$3,$4,'BIND_TRX','unbound',NOW())`,
           [supplierId, systemId, host, port]
         );
       } catch (e) { console.error(`[SMPP-CLIENT] bind_history insert failed: ${e.message}`); }
 
-      // Note: suppliers.bind_status is NOT set to 'unbound' on disconnect.
-      // Valid SMSC connections stay 'bound' across disconnects — only a
-      // credential mismatch or manual unbind should change bind_status.
+      // suppliers.bind_status set to 'unbound' on disconnect so routing
+      // and health checks see real-time state. consecutive_failures
+      // increments atomically — auto-blocked at 20 by health monitor.
     }
   }
 }

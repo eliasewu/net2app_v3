@@ -2,6 +2,7 @@ package com.net2app.gateway;
 
 import com.net2app.gateway.smpp.SmppServer;
 import com.net2app.gateway.smpp.SmppClientManager;
+import com.net2app.gateway.smpp.DlrPusher;
 import com.net2app.gateway.rest.RestBridge;
 import com.net2app.gateway.db.Database;
 import org.slf4j.Logger;
@@ -41,13 +42,19 @@ public class SmpGatewayMain {
         log.info("SMPP Client Manager started");
 
         // 4. Start REST Bridge (exposes Java SMPP status/mgmt to Node.js)
-        RestBridge restBridge = new RestBridge(9091);
+        RestBridge restBridge = new RestBridge(9091, smppServer);
         restBridge.start();
         log.info("REST Bridge started on port 9091");
 
-        // 5. Register shutdown hook
+        // 5. Start DLR Pusher (polls dlr_outbox every 5s → deliver_sm to ESMEs)
+        DlrPusher dlrPusher = new DlrPusher(smppServer);
+        dlrPusher.start();
+        log.info("DLR Pusher started — real-time deliver_sm to connected SMPP clients");
+
+        // 6. Register shutdown hook
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             log.info("Shutting down...");
+            dlrPusher.stop();
             smppServer.stop();
             clientManager.stopAll();
             restBridge.stop();

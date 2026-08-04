@@ -2,6 +2,7 @@ import React, { useState, useCallback } from 'react';
 import { Outlet } from 'react-router-dom';
 import { Sidebar } from './Sidebar';
 import { Header } from './Header';
+import { ErrorBoundary } from '../UI/ErrorBoundary';
 
 export const MainLayout: React.FC = () => {
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
@@ -26,7 +27,9 @@ export const MainLayout: React.FC = () => {
           ${isSidebarCollapsed ? 'lg:ml-16' : 'lg:ml-64'}`}
       >
         <div className="p-4 lg:p-6">
-          <Outlet />
+          <ErrorBoundary>
+            <Outlet />
+          </ErrorBoundary>
         </div>
       </main>
     </div>

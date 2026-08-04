@@ -5,6 +5,11 @@ dotenv.config();
 
 const { Pool } = pg;
 
+// ── Pure numeric message ID generator (mirrors genNumericMsgId in server.cjs) ──
+// Prefixes: '3'=MO/GSM inbound, '4'=SMPP server direct
+// Format: PREFIX + timestamp(ms) + 5-digit random → ~19-digit pure numeric ID
+const genNumericMsgId = (prefix) => `${prefix}${Date.now()}${String(Math.floor(Math.random() * 100000)).padStart(5, '0')}`;
+
 // Server-supported SMPP versions (highest to lowest)
 const SUPPORTED_VERSIONS = [0x50, 0x34, 0x33]; // 5.0, 3.4, 3.3
 
@@ -234,24 +239,50 @@ export default class SmppServer {
             if (origMsgId) {
               try {
                 const origRes = await db.query(
-                  `UPDATE sms_logs SET status='delivered', dlr_status=$1, delivery_time=NOW()
+                  `UPDATE sms_logs SET dlr_status=$1, delivery_time=NOW()
                    WHERE message_id=$2 AND status IN ('submitted','queued','pending')
-                   RETURNING client_id, client_code, sender_id, destination, submit_time, client_rate, message_parts, webhook_url, billing_mode`,
+                   RETURNING client_id, client_code, sender_id, destination, submit_time, client_rate, message_parts, webhook_url, billing_mode_snapshot`,
                   [dlrStatus, origMsgId]
                 );
                 if (origRes.rows.length > 0) {
                   const orig = origRes.rows[0];
+                  const finalStatus = dlrStatus === 'DELIVRD' ? 'delivered' : 'failed';
                   console.log(`[SMPP-DLR] 📥 DLR from gateway ${boundEntity.entityCode}: ${origMsgId} → ${dlrStatus}`);
 
+                  // Update sms_logs status to match DLR outcome
+                  await db.query(`UPDATE sms_logs SET status=$1 WHERE message_id=$2`, [finalStatus, origMsgId]);
                   // Update outbox
-                  await db.query(`UPDATE sms_outbox SET status='delivered', dlr_status=$1 WHERE message_id=$2`, [dlrStatus, origMsgId]);
+                  await db.query(`UPDATE sms_outbox SET status=$1, dlr_status=$2 WHERE message_id=$3`, [finalStatus, dlrStatus, origMsgId]);
 
                   if (dlrStatus === 'DELIVRD') {
-                    // DLR billing
-                    if (orig.billing_mode === 'dlr' && orig.client_rate) {
-                      const cost = parseFloat(orig.client_rate || 0) * parseInt(orig.message_parts || 1);
-                      await db.query('UPDATE clients SET balance = balance - $1, updated_at = NOW() WHERE id = $2', [cost, orig.client_id]);
+                    // DLR billing — client + supplier deduction on DELIVRD only.
+                    // Failed/UNDELIV DLRs are NOT billed.
+                    if (orig.billing_mode_snapshot === 'dlr' && orig.client_rate) {
+                      const clientCost = parseFloat(((orig.client_rate || 0) * (orig.message_parts || 1)).toFixed(6));
+                      await db.query('UPDATE clients SET balance = GREATEST(0, balance - $1), updated_at = NOW() WHERE id = $2', [clientCost, orig.client_id]);
+                      console.log(`[SMPP-DLR] 💰 ${origMsgId}: Client billed €${clientCost} on DLR (client #${orig.client_id})`);
                     }
+                    // Supplier-side billing — deduct supplier_rate from supplier balance
+                    // Only if supplier's billing_mode is 'dlr' (same principle as client)
+                    try {
+                      const outboxR = await db.query(
+                        `SELECT o.supplier_id, o.supplier_rate, o.message_parts, s.billing_mode AS supplier_billing_mode
+                         FROM sms_outbox o JOIN suppliers s ON s.id = o.supplier_id
+                         WHERE o.message_id = $1 LIMIT 1`,
+                        [origMsgId]
+                      );
+                      if (outboxR.rows.length) {
+                        const supCost = parseFloat(((outboxR.rows[0].supplier_rate || 0) * (outboxR.rows[0].message_parts || 1)).toFixed(6));
+                        if (supCost > 0 && outboxR.rows[0].supplier_id && (outboxR.rows[0].supplier_billing_mode || 'dlr') === 'dlr') {
+                          await db.query('UPDATE suppliers SET balance = GREATEST(0, balance - $1), updated_at = NOW() WHERE id = $2', [supCost, outboxR.rows[0].supplier_id]);
+                          console.log(`[SMPP-DLR] 💰 ${origMsgId}: Supplier billed €${supCost} on DLR (supplier #${outboxR.rows[0].supplier_id})`);
+                        }
+                      }
+                    } catch (e) {
+                      console.error(`[SMPP-DLR] ⚠ Supplier billing lookup failed for ${origMsgId}: ${e.message}`);
+                    }
+                    // Mark as billed
+                    await db.query('UPDATE sms_logs SET is_billed = true WHERE message_id = $1', [origMsgId]).catch(() => {});
                     // Webhook
                     if (orig.webhook_url && this.queueManager) {
                       this.queueManager.sendWebhook(orig.webhook_url, origMsgId, orig.destination, 'delivered', 'DELIVRD', orig.client_code).catch(() => {});
@@ -280,7 +311,7 @@ export default class SmppServer {
           }
 
           // === MO SMS from GSM gateway (real incoming mobile message) ===
-          const msgId = `MO${Date.now()}${Math.random().toString(36).substr(2, 6)}`;
+          const msgId = genNumericMsgId('3'); // INBOUND MO: prefix=3
           try {
             await db.query(
               `INSERT INTO sms_logs (message_id, supplier_id, supplier_code, sender_id, destination, message, status, source, submit_time, created_at)
@@ -322,7 +353,7 @@ export default class SmppServer {
         // Use the production queue if available; otherwise fallback to direct INSERT
         if (this.queueManager && boundEntity) {
           try {
-            const msgId = `SMPP${Date.now()}${Math.random().toString(36).substr(2, 6)}`;
+            const msgId = genNumericMsgId('4'); // SMPP SERVER: prefix=4
 
             // Resolve route data: MCC/MNC, operator, supplier, rates, country
             let routeData = { supplier_id: null, supplier_code: null, supplier_rate: 0,
@@ -379,7 +410,7 @@ export default class SmppServer {
         }
 
         // --- Fallback: direct db insert (no queue manager available) ---
-        const msgId = `SMPP${Date.now()}${Math.random().toString(36).substr(2, 4)}`;
+        const msgId = genNumericMsgId('4'); // SMPP FALLBACK: prefix=4
         await db.query(
           `INSERT INTO sms_logs (message_id, client_id, client_code, sender_id, destination, message, status, submit_time)
            VALUES ($1,$2,$3,$4,$5,$6,'submitted',NOW())`,
@@ -426,10 +457,19 @@ export default class SmppServer {
           );
         } catch (e) { console.error(`[SMPP] bind_history insert failed: ${e.message}`); }
 
-        // Note: suppliers.bind_status is NOT set to 'unbound' on disconnect.
-        // Valid SMSC/ESME connections stay 'bound' — only a credential mismatch
-        // (bind failure) or manual unbind via API should change bind_status.
-        // Real-time connection state is tracked in smpp_sessions.session_state.
+        // Suppliers are unbound on disconnect so routing skips them.
+        // consecutive_failures increments atomically — auto-blocked at 20
+        // by the universal health monitor.
+        if (entityType === 'supplier') {
+          try {
+            await db.query(
+              `UPDATE suppliers SET bind_status='unbound',
+               consecutive_failures = consecutive_failures + 1, updated_at = NOW()
+               WHERE id=$1`,
+              [entityId]
+            );
+          } catch (e) { console.error(`[SMPP] supplier unbind update failed: ${e.message}`); }
+        }
 
         boundEntity = null;
       };

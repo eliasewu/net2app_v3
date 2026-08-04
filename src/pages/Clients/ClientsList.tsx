@@ -1,6 +1,6 @@
 import React, { useState, useRef } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { Plus, Search, Filter, Download, Upload, MoreVertical, Edit, Trash2, Eye, RotateCcw, Wifi, WifiOff } from 'lucide-react';
+import { Plus, Search, Filter, Download, Upload, MoreVertical, Edit, Trash2, Eye, RotateCcw, Wifi, WifiOff, RefreshCw } from 'lucide-react';
 import { useData } from '../../store/DataContext';
 import { Card } from '../../components/UI/Card';
 import { Button } from '../../components/UI/Button';
@@ -169,6 +169,16 @@ export const ClientsList: React.FC = () => {
       ),
     },
     {
+      key: 'billing',
+      header: 'Billing',
+      hideOnMobile: true,
+      render: (client: Client) => (
+        <Badge variant={client.billing_mode === 'submit' ? 'warning' : 'info'}>
+          {client.billing_mode === 'submit' ? 'On Submit' : 'On DLR'}
+        </Badge>
+      ),
+    },
+    {
       key: 'routing_plan',
       header: 'Route Plan',
       hideOnMobile: true,
@@ -219,6 +229,32 @@ export const ClientsList: React.FC = () => {
                 <Edit size={14} />
                 Edit
               </button>
+              <hr className="my-1" />
+              {bindStatuses[client.id] === 'bound' ? (
+                <button
+                  onClick={async () => {
+                    try { await bindApi.unbindClient(client.id); setBindStatuses(p => ({...p, [client.id]: 'unbound'})); }
+                    catch (e) { console.error('Disconnect failed:', e); }
+                    setActionMenu(null);
+                  }}
+                  className="w-full flex items-center gap-2 px-4 py-2 text-sm text-orange-600 hover:bg-orange-50"
+                >
+                  <WifiOff size={14} />
+                  Disconnect
+                </button>
+              ) : (
+                <button
+                  onClick={async () => {
+                    try { await bindApi.bindClient(client.id); setBindStatuses(p => ({...p, [client.id]: 'bound'})); }
+                    catch (e) { console.error('Reconnect failed:', e); }
+                    setActionMenu(null);
+                  }}
+                  className="w-full flex items-center gap-2 px-4 py-2 text-sm text-green-600 hover:bg-green-50"
+                >
+                  <RefreshCw size={14} />
+                  Reconnect
+                </button>
+              )}
               <hr className="my-1" />
               <button
                 onClick={() => {

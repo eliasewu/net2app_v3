@@ -152,6 +152,7 @@ export interface Supplier {
   balance: number;
   credit_limit: number;
   currency: Currency;
+  billing_mode: 'submit' | 'dlr';
   force_dlr: boolean;
   dlr_timeout?: number;
 
@@ -222,6 +223,8 @@ export interface Rate {
   effective_to: string | null;
   is_active: boolean;
   version?: number;
+  previous_rate?: number | null;
+  updated_at?: string;
   created_at?: string;
 }
 
@@ -435,6 +438,19 @@ export interface OTTDevice {
 
 // ==================== VOICE OTP ====================
 
+export interface SipPingResult {
+  host: string;
+  latency_ms: number | null;  // average RTT in ms, null if all packets lost
+  min_ms: number | null;
+  max_ms: number | null;
+  ttl: number | null;
+  packets_sent: number;
+  packets_received: number;
+  packet_loss_pct: number;   // 0-100
+  alive: boolean;             // at least one reply received
+  error?: string;
+}
+
 export interface SipServer {
   id?: string;
   name: string;
@@ -446,6 +462,8 @@ export interface SipServer {
   codec: 'g729' | 'g711' | 'gsm';
   is_e164: boolean;
   mccmnc_allowed: string;
+  destination_prefix: string;
+  pingResult?: SipPingResult | null;
 }
 
 export interface VoiceOTPConfig {

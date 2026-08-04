@@ -1,10 +1,12 @@
 import React from 'react';
-import { MessageSquare, CheckCircle, XCircle, AlertTriangle, Bell, WifiOff, FileText, DollarSign, TrendingUp } from 'lucide-react';
+import { MessageSquare, CheckCircle, XCircle, AlertTriangle, Bell, Wifi, WifiOff, FileText, DollarSign, TrendingUp } from 'lucide-react';
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, PieChart, Pie, Cell } from 'recharts';
 import { useData } from '../store/DataContext';
 import { Card } from '../components/UI/Card';
 import { StatCard } from '../components/UI/StatCard';
 import { Badge } from '../components/UI/Badge';
+import { ProfitWidget } from '../components/Dashboard/ProfitWidget';
+import { ErrorBoundary } from '../components/UI/ErrorBoundary';
 
 export const Dashboard: React.FC = () => {
   const { clients, suppliers, smsLogs, invoices, payments, dashboardStats } = useData();
@@ -30,6 +32,8 @@ export const Dashboard: React.FC = () => {
   const recentPayments = payments.slice(-5);
   const boundCount = suppliers.filter(s => s.bind_status === 'bound').length;
   const unboundCount = suppliers.filter(s => s.bind_status !== 'bound').length;
+  const inactiveSuppliers = suppliers.filter(s => s.status === 'inactive');
+  const totalSuppliers = suppliers.filter(s => !s.is_deleted).length;
 
   // Computed alerts
   const alerts: { type: 'error' | 'warning' | 'info' | 'success'; title: string; message: string; time: string }[] = [];
@@ -73,9 +77,9 @@ export const Dashboard: React.FC = () => {
       const d = new Date(l.submit_time);
       return d.toISOString().split('T')[0] === dayStr;
     });
-    const rev = daySMS.reduce((s, l) => s + (l.client_rate || 0) * (l.message_parts || 1), 0);
-    const cost = daySMS.reduce((s, l) => s + (l.supplier_rate || 0) * (l.message_parts || 1), 0);
-    const prof = daySMS.reduce((s, l) => s + (l.profit || 0), 0);
+    const rev = daySMS.filter(l => l.is_billed).reduce((s, l) => s + (l.client_rate || 0) * (l.message_parts || 1), 0);
+    const cost = daySMS.filter(l => l.is_billed).reduce((s, l) => s + (l.supplier_rate || 0) * (l.message_parts || 1), 0);
+    const prof = daySMS.filter(l => l.is_billed).reduce((s, l) => s + (l.profit || 0), 0);
     return { date: targetDate.toLocaleDateString('en', {month:'short', day:'numeric'}), revenue: rev, cost: cost, profit: prof };
   });
 
@@ -86,6 +90,7 @@ export const Dashboard: React.FC = () => {
   })();
 
   return (
+    <ErrorBoundary fallback={<div className="p-8 text-center"><h2 className="text-xl font-bold text-red-600">Dashboard Error</h2><p className="text-gray-500 mt-2">Something went wrong rendering the dashboard. Check the browser console for details.</p><button onClick={() => window.location.reload()} className="mt-4 px-4 py-2 bg-blue-600 text-white rounded-lg">Reload Page</button></div>}>
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <div><h1 className="text-2xl font-bold text-gray-800">Dashboard</h1><p className="text-gray-500 mt-1">Real-time platform overview from database</p></div>
@@ -93,12 +98,32 @@ export const Dashboard: React.FC = () => {
       </div>
 
       {/* Stats */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
         <StatCard title="Total SMS" value={formatNumber(smsLogs.length)} icon={<MessageSquare size={24}/>} change={12.5} changeLabel="from DB" color="blue"/>
         <StatCard title="Delivered" value={formatNumber(smsLogs.filter(l => l.status === 'delivered').length)} icon={<CheckCircle size={24}/>} color="green"/>
         <StatCard title="Revenue" value={formatCurrency(dashboardStats.revenue_today)} icon={<DollarSign size={24}/>} color="blue"/>
         <StatCard title="Profit" value={formatCurrency(dashboardStats.profit_today)} icon={<TrendingUp size={24}/>} color="green"/>
+        <div className={`rounded-xl p-5 border ${inactiveSuppliers.length > 0 ? 'bg-red-50 border-red-200' : unboundCount > 0 ? 'bg-yellow-50 border-yellow-200' : 'bg-green-50 border-green-200'}`}>
+          <div className="flex items-center gap-2">
+            {inactiveSuppliers.length > 0 ? <WifiOff size={20} className="text-red-500" /> : unboundCount > 0 ? <WifiOff size={20} className="text-yellow-500" /> : <Wifi size={20} className="text-green-500" />}
+            <span className="text-sm font-medium text-gray-700">Active Binds</span>
+          </div>
+          <p className={`text-2xl font-bold mt-1 ${inactiveSuppliers.length > 0 ? 'text-red-600' : unboundCount > 0 ? 'text-yellow-600' : 'text-green-600'}`}>
+            {boundCount}<span className="text-base font-normal text-gray-400">/{totalSuppliers}</span>
+          </p>
+          {inactiveSuppliers.length > 0 && (
+            <p className="text-xs text-red-500 mt-1 flex items-center gap-1"><AlertTriangle size={12} />{inactiveSuppliers.length} blocked</p>
+          )}
+          {inactiveSuppliers.length === 0 && unboundCount > 0 && (
+            <p className="text-xs text-yellow-500 mt-1">{unboundCount} unbound</p>
+          )}
+        </div>
       </div>
+
+      {/* Real-time Profit Widget */}
+      <ErrorBoundary>
+        <ProfitWidget />
+      </ErrorBoundary>
 
       {/* Alert Row */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -199,5 +224,6 @@ export const Dashboard: React.FC = () => {
         </Card>
       </div>
     </div>
+    </ErrorBoundary>
   );
 };

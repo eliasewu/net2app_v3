@@ -10,6 +10,38 @@ interface ApiResponse<T> {
   message?: string;
 }
 
+// ==================== ID NORMALIZATION ====================
+// PostgreSQL returns integer IDs, but TypeScript types expect strings.
+// This recursive normalizer converts all numeric IDs to strings at the API boundary,
+// so the entire frontend can safely use strict string equality without coercion.
+//
+// Rules:
+//   - key === 'id' and value is number → String(value)
+//   - key ends with '_id' and value is number → String(value)
+//   - key ends with '_ids' and value is array of numbers → array of strings
+//   - Nested objects/arrays are traversed recursively
+function normalizeNumericIds(obj: any): any {
+  if (Array.isArray(obj)) {
+    return obj.map(normalizeNumericIds);
+  }
+  if (obj !== null && typeof obj === 'object' && !(obj instanceof Blob) && !(obj instanceof FormData)) {
+    const normalized: any = {};
+    for (const [key, value] of Object.entries(obj)) {
+      if ((key === 'id' || key.endsWith('_id')) && typeof value === 'number') {
+        normalized[key] = String(value);
+      } else if (key.endsWith('_ids') && Array.isArray(value)) {
+        normalized[key] = value.map((v: any) => typeof v === 'number' ? String(v) : v);
+      } else if (typeof value === 'object' && value !== null && !(value instanceof Blob)) {
+        normalized[key] = normalizeNumericIds(value);
+      } else {
+        normalized[key] = value;
+      }
+    }
+    return normalized;
+  }
+  return obj;
+}
+
 // HTTP Client
 class ApiClient {
   private baseUrl: string;
@@ -34,9 +66,19 @@ class ApiClient {
         credentials: 'include',  // Send cookies with every request
       });
 
-      const data = await response.json();
+      const raw = await response.json();
+      const data = normalizeNumericIds(raw);
 
       if (!response.ok) {
+        // Auto-redirect to login on 401 (expired session)
+        if (response.status === 401 && !window.location.pathname.includes('/login')) {
+          // Clear auth token from localStorage so AuthContext detects logout.
+          // Otherwise PublicRoute immediately redirects back to dashboard,
+          // making the user see dashboard instead of the login page.
+          localStorage.removeItem('auth_token');
+          window.location.href = '/login';
+          throw new Error('Session expired — redirecting to login');
+        }
         throw new Error(data.error || 'Request failed');
       }
 
@@ -82,7 +124,16 @@ class ApiClient {
         credentials: 'include',
       });
 
-      const data = await response.json();
+      const raw = await response.json();
+      const data = normalizeNumericIds(raw);
+
+      if (!response.ok) {
+        return {
+          success: false,
+          error: data.error || data.message || `Upload failed (HTTP ${response.status})`,
+        };
+      }
+
       return { success: true, data };
     } catch (error) {
       return {
@@ -228,6 +279,7 @@ export const smsApi = {
   getLog: (id: string) => api.get<any>(`/sms/logs/${id}`),
   sendTest: (data: any) => api.post<any>('/sms/test', data),
   getStats: (period: string) => api.get<any>(`/sms/stats?period=${period}`),
+  getInboundStats: () => api.get<any>('/sms/stats/inbound'),
   resend: (id: string) => api.post(`/sms/${id}/resend`, {}),
 };
 
@@ -235,6 +287,8 @@ export const smsApi = {
 export const bindApi = {
   getStatus: (showDeleted?: boolean) => api.get<any[]>(`/bind/status${showDeleted ? '?show_deleted=true' : ''}`),
   getClientStatus: () => api.get<any[]>('/bind/clients'),
+  getAsteriskStatus: () => api.get<any>('/bind/asterisk-status'),
+  getSipPeers: () => api.get<any>('/bind/sip-peers'),
   bindSupplier: (supplierId: string) => suppliersApi.bind(supplierId),
   unbindSupplier: (supplierId: string) => suppliersApi.unbind(supplierId),
   bindClient: (clientId: string) => api.post<any>(`/clients/${clientId}/bind`, {}),
@@ -322,7 +376,6 @@ export const licenseApi = {
   activate: (key: string) => api.post<any>('/license/activate', { key }),
   deactivate: () => api.post('/license/deactivate', {}),
   validateKey: (key: string) => api.post<any>('/license/validate', { key }),
-  getSystemInfo: () => api.get<any>('/license/system-info'),
   
   // Tenant Management
   getTenants: () => api.get<any[]>('/license/tenants'),
@@ -330,6 +383,7 @@ export const licenseApi = {
   updateTenant: (id: string, data: any) => api.put<any>(`/license/tenants/${id}`, data),
   deleteTenant: (id: string) => api.delete(`/license/tenants/${id}`),
   getTenantUsage: (id: string) => api.get<any>(`/license/tenants/${id}/usage`),
+  getSystemInfo: () => api.get<{ ip: string; mac: string; hostname: string }>('/license/system-info'),
   
   // License Key Generation (for admin)
   generateKey: (data: any) => api.post<{ key: string }>('/license/generate', data),
@@ -352,11 +406,20 @@ export const campaignsApi = {
 
 // ==================== TRANSLATIONS API ====================
 export const translationsApi = {
-  getAll: () => api.get<any[]>('/translations'),
+  getAll: (type?: string) => {
+    const qs = type && type !== 'all' ? `?type=${encodeURIComponent(type)}` : '';
+    return api.get<any[]>(`/translations${qs}`);
+  },
   create: (data: any) => api.post<any>('/translations', data),
   update: (id: string, data: any) => api.put<any>(`/translations/${id}`, data),
   delete: (id: string) => api.delete(`/translations/${id}`),
+  bulkDelete: (data: { type?: string; ids?: string[] }) => api.post<any>('/translations/bulk-delete', data),
   test: (data: any) => api.post<any>('/translations/test', data),
+  import: (csv: string, type: string) => api.post<any>('/translations/import', { csv, type }),
+  export: (type?: string) => api.get<Blob>(`/translations/export${type ? `?type=${encodeURIComponent(type)}` : ''}`),
+  getSample: (type: string) => api.get<string>(`/translations/sample/${type}`),
+  replay: (data: { original_destination: string; original_sender_id: string; original_message: string; client_id?: string; supplier_id?: string }) =>
+    api.post<any>('/translations/replay', data),
 };
 
 // ==================== CHANNELS API (RCS, Flash SMS, WhatsApp, Telegram, HTTP) ====================
@@ -379,8 +442,9 @@ export const voiceOtpApi = {
   updateSipSettings: (data: any) => api.put<any>('/voice-otp/sip-settings', data),
   getSipServers: () => api.get<any>('/voice-otp/sip-servers'),
   updateSipServers: (data: any) => api.put<any>('/voice-otp/sip-servers', data),
+  pingSipServer: (host: string) => api.post<any>('/voice-otp/sip-ping', { host }),
   getLogs: (filters?: any) => api.post<any[]>('/voice-otp/logs', filters || {}),
-  testCall: (data: any) => api.post<any>('/voice-otp/test', data),
+  testCall: (data: any) => api.post<any>('/voice-otp/send', data),
   testMulti: (data: { client_id: string; destination: string; otp_code?: string }) => api.post<any>('/voice-otp/test-multi', data),
   retryCall: (callId: string) => api.post(`/voice-otp/retry/${callId}`, {}),
 };

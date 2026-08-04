@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Plus, Search, Download, Trash2, Edit, CheckSquare, Square, Mail, Clock, RefreshCw, Send } from 'lucide-react';
 import { useData } from '../../store/DataContext';
 import { api } from '../../services/api';
+import { ratesApi } from '../../services/apiServices';
 import { Card } from '../../components/UI/Card';
 import { Button } from '../../components/UI/Button';
 import { Badge } from '../../components/UI/Badge';
@@ -79,14 +80,14 @@ export const SupplierRates: React.FC = () => {
   }, [selectedCountry]);
   const filteredRates = supplierRates.filter(rate => {
     const ms = rate.country.toLowerCase().includes(search.toLowerCase()) || rate.mcc.includes(search);
-    const mc = supplierFilter === 'all' || rate.entity_id === supplierFilter;
+    const mc = supplierFilter === 'all' || String(rate.entity_id) === supplierFilter;
     const mco = countryFilter === 'all' || rate.country === countryFilter;
     return ms && mc && mco;
   });
   const totalPages = Math.ceil(filteredRates.length / itemsPerPage);
   const paginatedRates = filteredRates.slice((currentPage-1)*itemsPerPage, currentPage*itemsPerPage);
-  const getSupplierName = (id: string) => { const s = suppliers.find(x => x.id === id); return s ? `${s.supplier_code} - ${s.company_name}` : 'Unknown'; };
-  const getSupplierEmail = (id: string) => { const s = suppliers.find(x => x.id === id); return s?.email || ''; };
+  const getSupplierName = (id: string | number) => { const s = suppliers.find(x => String(x.id) === String(id)); return s ? `${s.supplier_code} - ${s.company_name}` : 'Unknown'; };
+  const getSupplierEmail = (id: string | number) => { const s = suppliers.find(x => String(x.id) === String(id)); return s?.email || ''; };
 
   // Detect rate direction
   const getDirection = (oldRate: number, newRate: number): string => {
@@ -137,7 +138,7 @@ export const SupplierRates: React.FC = () => {
     for (const mnc of mncsToAdd) {
       const op = countryOps.find(m => m.mcc === mcc && m.mnc === mnc);
       const opName = mnc === '*' ? 'All' : (op?.operator || 'All');
-      const existing = supplierRates.find(r => r.entity_id === formData.entity_id && r.mcc === mcc && r.mnc === mnc && r.is_active);
+      const existing = supplierRates.find(r => String(r.entity_id) === String(formData.entity_id) && r.mcc === mcc && r.mnc === mnc && r.is_active);
       const oldRate = existing?.rate || 0;
       if (existing) updateRate(existing.id, { is_active: false, effective_to: now.toISOString().split('T')[0] });
       addRate({ entity_type: 'supplier', entity_id: formData.entity_id, mcc, mnc, country: selectedCountry, operator: opName, rate: rateValue, currency: 'EUR', effective_from: formData.effective_from, effective_to: null, is_active: true });
@@ -167,7 +168,7 @@ export const SupplierRates: React.FC = () => {
     let count = 0; let lastOldRate = 0;
     for (const mnc of bulkSelectedMncs) {
       const countryName = bulkCountry; const opName = bulkCountryOps.find(m=>m.mcc===bulkMCC&&m.mnc===mnc)?.operator||'All';
-      const existing = supplierRates.find(r=>r.entity_id===entityId&&r.mcc===bulkMCC&&r.mnc===mnc&&r.is_active);
+      const existing = supplierRates.find(r=>String(r.entity_id)===String(entityId)&&r.mcc===bulkMCC&&r.mnc===mnc&&r.is_active);
       if (existing) { updateRate(existing.id,{is_active:false,effective_to:now.toISOString().split('T')[0]}); lastOldRate = existing.rate; }
       addRate({ entity_type:'supplier', entity_id:entityId, mcc:bulkMCC, mnc, country:countryName, operator:opName, rate:bulkNewRate, currency:'EUR', effective_from:now.toISOString().split('T')[0], effective_to:null, is_active:true });
       count++;
@@ -189,7 +190,20 @@ export const SupplierRates: React.FC = () => {
 
   const handleBulkDelete = () => { selectedRates.forEach(id => deleteRate(id)); setSelectedRates([]); };
   const toggleSelect = (id: string) => setSelectedRates(p => p.includes(id) ? p.filter(i => i!==id) : [...p, id]);
-  const showRateHistory = (rate: Rate) => { setHistoryRates(supplierRates.filter(r => r.entity_id===rate.entity_id && r.mcc===rate.mcc && r.mnc===rate.mnc).sort((a,b) => b.effective_from.localeCompare(a.effective_from))); setShowHistoryModal(true); };
+  // Fetch full rate history from server (includes all versions: active + inactive)
+  const showRateHistory = async (rate: Rate) => {
+    try {
+      const res: any = await ratesApi.getRateHistory('supplier', rate.entity_id, rate.mcc, rate.mnc);
+      if (res.success && res.data?.data) {
+        setHistoryRates(res.data.data as Rate[]);
+      } else {
+        setHistoryRates([]);
+      }
+    } catch {
+      setHistoryRates([]);
+    }
+    setShowHistoryModal(true);
+  };
   const handleSendNotification = (rate: Rate) => {
     setNotificationData({
       country:rate.country, account:getSupplierName(rate.entity_id), mcc:rate.mcc, mncs:rate.mnc,
@@ -200,10 +214,13 @@ export const SupplierRates: React.FC = () => {
   const sendRateEmail = () => { alert(`✅ Rate notification email sent to ${notifyEmail}`); setShowNotifyModal(false); };
 
   const handleExportCSV = () => {
-    exportCSV('supplier_rates_export.csv',
-      ['supplier_id','supplier_name','mcc','mnc','country','operator','rate','currency','effective_from','effective_to','is_active','status'],
-      filteredRates.map(r => [r.entity_id, getSupplierName(r.entity_id), r.mcc, r.mnc, r.country, r.operator, Number(r.rate).toFixed(6), r.currency, r.effective_from, r.effective_to||'', String(r.is_active), r.is_active?'Active':'Inactive'])
-    );
+    const rows = filteredRates.map(r => {
+      const prev = r.previous_rate ? Number(r.previous_rate) : 0;
+      const curr = Number(r.rate);
+      const pct = prev > 0 ? (((curr - prev) / prev) * 100).toFixed(1) + '%' : 'New';
+      return [r.entity_id, getSupplierName(r.entity_id), r.mcc, r.mnc, r.country, r.operator, curr.toFixed(6), r.currency || 'EUR', r.effective_from, r.effective_to||'', String(r.is_active), r.is_active?'Active':'Inactive', prev > 0 ? '€'+prev.toFixed(4) : '-', pct];
+    });
+    exportCSV('supplier_rates_export.csv', ['supplier_id','supplier_name','mcc','mnc','country','operator','rate','currency','effective_from','effective_to','is_active','status','previous_rate','%_change'], rows);
   };
 
   const columns = [
@@ -211,7 +228,18 @@ export const SupplierRates: React.FC = () => {
     { key:'supplier', header:'Supplier', render:(rate:Rate) => <span className="text-sm">{getSupplierName(rate.entity_id)}</span> },
     { key:'destination', header:'Destination', render:(rate:Rate) => <div><p className="font-medium text-sm">{rate.country}</p><p className="text-xs text-gray-500">{rate.operator}</p></div> },
     { key:'mccmnc', header:'MCC/MNC', render:(rate:Rate) => <span className="font-mono bg-gray-100 px-1.5 py-0.5 rounded text-xs">{rate.mcc}{rate.mnc}</span> },
-    { key:'rate', header:'Rate (EUR)', align:'right' as const, render:(rate:Rate) => <div className="text-right"><p className={`font-semibold text-sm ${rate.is_active?'text-gray-800':'text-red-500 line-through'}`}>€{Number(rate.rate).toFixed(4)}</p>{!rate.is_active&&rate.effective_to&&<p className="text-[10px] text-red-400">Ended {rate.effective_to}</p>}</div> },
+    { key:'rate', header:'Rate (EUR)', align:'right' as const, render:(rate:Rate) => {
+        const prev = rate.previous_rate ? Number(rate.previous_rate) : 0;
+        const curr = Number(rate.rate);
+        const pct = prev > 0 ? (((curr - prev) / prev) * 100) : 0;
+        const pctStr = prev > 0 ? (pct > 0 ? `+${pct.toFixed(1)}%` : `${pct.toFixed(1)}%`) : '';
+        const pctColor = pct > 0 ? 'text-red-500' : pct < 0 ? 'text-green-500' : 'text-gray-400';
+        return <div className="text-right">
+          <p className={`font-semibold text-sm ${rate.is_active?'text-gray-800':'text-red-500 line-through'}`}>€{curr.toFixed(4)}</p>
+          {rate.is_active && pctStr && <span className={`text-[10px] font-medium ${pctColor}`}>{pctStr}</span>}
+          {!rate.is_active && rate.effective_to && <p className="text-[10px] text-red-400">Ended {rate.effective_to}</p>}
+        </div>;
+      } },
     { key:'effective', header:'Effective', render:(rate:Rate) => <span className="text-xs">{rate.effective_from} {rate.is_active?<span className="text-green-500">● Active</span>:<span className="text-red-500">● Inactive</span>}</span> },
     { key:'status', header:'Status', render:(rate:Rate) => <Badge variant={rate.is_active?'success':'danger'} dot size="sm">{rate.is_active?'Active':'Inactive'}</Badge> },
     { key:'actions', header:'', render:(rate:Rate) => <div className="flex gap-1">{rate.is_active&&<><button onClick={(e)=>{e.stopPropagation();openModal(rate);}} className="p-1 rounded hover:bg-gray-100"><Edit size={14} className="text-gray-500"/></button><button onClick={(e)=>{e.stopPropagation();handleSendNotification(rate);}} className="p-1 rounded hover:bg-gray-100"><Mail size={14} className="text-blue-500"/></button></>}<button onClick={(e)=>{e.stopPropagation();showRateHistory(rate);}} className="p-1 rounded hover:bg-gray-100"><Clock size={14} className="text-purple-500"/></button><button onClick={(e)=>{e.stopPropagation();deleteRate(rate.id);}} className="p-1 rounded hover:bg-gray-100"><Trash2 size={14} className="text-red-500"/></button></div> },
@@ -220,7 +248,7 @@ export const SupplierRates: React.FC = () => {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <div><h1 className="text-2xl font-bold text-gray-800">Supplier Rates</h1><p className="text-gray-500 mt-1">{supplierRates.length} rates — Select country → multi-select operators → one click add all</p></div>
+        <div><h1 className="text-2xl font-bold text-gray-800">Supplier Rates</h1><p className="text-gray-500 mt-1">{supplierRates.filter(r => r.is_active).length} active / {supplierRates.length} total — % change shows rate movement</p></div>
         <div className="flex gap-2"><Button variant="secondary" icon={<RefreshCw size={16}/>} onClick={()=>{setSupplierFilter(supplierFilter!=='all'?supplierFilter:'');setShowBulkModal(true);}}>Bulk Update</Button><Button variant="secondary" icon={<Download size={16}/>} onClick={handleExportCSV}>Export CSV</Button><Button icon={<Plus size={18}/>} onClick={()=>openModal()}>Add Rate</Button></div>
       </div>
 
@@ -311,9 +339,31 @@ export const SupplierRates: React.FC = () => {
         </div>
       </Modal>
 
-      {/* Rate History Modal */}
-      <Modal isOpen={showHistoryModal} onClose={()=>setShowHistoryModal(false)} title="Rate History" size="lg">
-        <table className="w-full text-sm"><thead><tr className="bg-gray-50"><th className="px-3 py-2 text-left">Version</th><th className="px-3 py-2 text-left">Rate</th><th className="px-3 py-2 text-left">Status</th><th className="px-3 py-2 text-left">From</th><th className="px-3 py-2 text-left">To</th></tr></thead><tbody className="divide-y">{historyRates.map((r,i)=><tr key={r.id} className={!r.is_active?'bg-red-50':'bg-green-50'}><td className="px-3 py-2 font-mono text-xs">v{historyRates.length-i}</td><td className={`px-3 py-2 font-semibold ${!r.is_active?'text-red-600 line-through':'text-green-600'}`}>€{Number(r.rate).toFixed(4)}</td><td className="px-3 py-2"><Badge variant={r.is_active?'success':'danger'} size="sm">{r.is_active?'ACTIVE':'Inactive'}</Badge></td><td className="px-3 py-2 text-xs">{r.effective_from}</td><td className="px-3 py-2 text-xs">{r.effective_to||'Present'}</td></tr>)}</tbody></table>
+      {/* Rate History Modal — matches ClientRates with old/new rate, change direction, duration */}
+      <Modal isOpen={showHistoryModal} onClose={()=>setShowHistoryModal(false)} title="Rate History (Version Timeline)" size="xl">
+        <table className="w-full text-sm"><thead><tr className="bg-gray-50"><th className="px-3 py-2 text-left text-xs font-medium">Version</th><th className="px-3 py-2 text-left text-xs font-medium">Old Rate</th><th className="px-3 py-2 text-left text-xs font-medium">New Rate</th><th className="px-3 py-2 text-left text-xs font-medium">Change</th><th className="px-3 py-2 text-left text-xs font-medium">Effective From</th><th className="px-3 py-2 text-left text-xs font-medium">Effective To</th><th className="px-3 py-2 text-left text-xs font-medium">Status</th><th className="px-3 py-2 text-left text-xs font-medium">Duration</th></tr></thead><tbody className="divide-y">
+          {historyRates.map((r, i) => {
+            const prev = historyRates[i+1];
+            const oldRateVal = prev?.rate || 0;
+            const newRateVal = r.rate;
+            const dir = i === historyRates.length-1 ? 'New' : newRateVal > oldRateVal ? 'Increase' : newRateVal < oldRateVal ? 'Decrease' : 'Same';
+            const pct = oldRateVal > 0 ? (((newRateVal - oldRateVal) / oldRateVal) * 100).toFixed(1) + '%' : '—';
+            const duration = r.effective_to ? `${Math.round((new Date(r.effective_to).getTime() - new Date(r.effective_from).getTime()) / 86400000)} days` : 'Ongoing';
+            return (
+              <tr key={r.id} className={!r.is_active ? 'bg-red-50' : 'bg-green-50'}>
+                <td className="px-3 py-2 font-mono text-xs font-bold">v{historyRates.length - i}</td>
+                <td className="px-3 py-2 text-xs text-red-600 line-through">{i < historyRates.length-1 ? `€${Number(oldRateVal).toFixed(4)}` : '—'}</td>
+                <td className="px-3 py-2 font-semibold text-green-700 text-xs">€{Number(newRateVal).toFixed(4)}</td>
+                <td className="px-3 py-2"><Badge variant={dir==='New'?'info':dir==='Increase'?'warning':'success'} size="sm">{dir} {oldRateVal > 0 ? `(${pct})` : ''}</Badge></td>
+                <td className="px-3 py-2 text-xs">{r.effective_from} {r.created_at ? <span className="text-[10px] text-gray-400 block">{new Date(r.created_at).toLocaleTimeString()}</span> : null}</td>
+                <td className="px-3 py-2 text-xs">{r.effective_to || 'Present'}</td>
+                <td className="px-3 py-2"><Badge variant={r.is_active?'success':'danger'} size="sm">{r.is_active?'ACTIVE':'Inactive'}</Badge></td>
+                <td className="px-3 py-2 text-xs">{duration}</td>
+              </tr>
+            );
+          })}
+        </tbody></table>
+        {historyRates.length === 0 && <p className="text-center py-4 text-gray-500">No rate history found</p>}
       </Modal>
     </div>
   );

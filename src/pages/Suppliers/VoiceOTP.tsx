@@ -1,12 +1,12 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { Plus, Search, Edit, Trash2, Play, Pause, Globe, Phone, Settings, Save, CheckCircle, XCircle, Upload, SkipForward, Download, RefreshCw } from 'lucide-react';
+import { Plus, Search, Edit, Trash2, Play, Pause, Globe, Phone, Settings, Save, CheckCircle, XCircle, Upload, SkipForward, Download, RefreshCw, Wifi, WifiOff, Activity } from 'lucide-react';
 import { Card } from '../../components/UI/Card';
 import { Button } from '../../components/UI/Button';
 import { Badge } from '../../components/UI/Badge';
 import { Modal } from '../../components/UI/Modal';
 import { Input } from '../../components/UI/Input';
 import { Table } from '../../components/UI/Table';
-import { voiceOtpApi } from '../../services/api';
+import { voiceOtpApi, mccmncApi } from '../../services/api';
 import type { VoiceOTPConfig, VoiceOTPLog, SipServer } from '../../types';
 
 // ──────────────────────── helpers ────────────────────────
@@ -21,9 +21,8 @@ const statusBadge = (s: string, dlr?: string | null) => {
 
 const emptyForm = {
   language: '', language_code: 'en', country_prefix: '',
-  greeting_text: '', retry_text: '',
   is_active: true,
-  primary_language_code: 'en', secondary_language_code: 'en',
+  primary_language_code: 'en',
   retry_count: 4, play_count: 1,
 };
 
@@ -68,11 +67,9 @@ export const VoiceOTP: React.FC = () => {
     setEditing(s); setError('');
     setForm({
       language: s.language || '', language_code: s.language_code || 'en',
-      country_prefix: s.country_prefix || '', greeting_text: s.greeting_text || '',
-      retry_text: s.retry_text || '',
+      country_prefix: s.country_prefix || '',
       is_active: s.is_active !== false,
       primary_language_code: s.primary_language_code || 'en',
-      secondary_language_code: s.secondary_language_code || 'en',
       retry_count: s.retry_count || 4,
       play_count: s.play_count || 1,
     });
@@ -102,7 +99,6 @@ export const VoiceOTP: React.FC = () => {
   // ──────────── Audio tab ────────────
 
   const [uploadTarget, setUploadTarget] = useState<VoiceOTPConfig | null>(null);
-  const [audioLayer, setAudioLayer] = useState<'primary' | 'secondary'>('primary');
   const [uploading, setUploading] = useState(false);
   const [playingKey, setPlayingKey] = useState<string | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -121,32 +117,18 @@ export const VoiceOTP: React.FC = () => {
     return typeof raw === 'string' ? JSON.parse(raw) : raw;
   };
 
-  // audio map: picks primary or secondary column, with fallback
+  // audio map: MERGE legacy + primary uploads (single language per config)
+  // Uploaded data URLs take priority over legacy disk paths for the same digit
   const audioMap = useMemo(() => {
     if (!uploadTarget) return {};
-    const key = audioLayer === 'primary' ? 'audio_0_9_primary' : 'audio_0_9_secondary';
-    const raw = (uploadTarget as any)[key];
-    if (!raw) {
-      // fallback: if secondary is empty, reuse primary
-      if (audioLayer === 'secondary') {
-        const pri = (uploadTarget as any).audio_0_9_primary || uploadTarget.audio_0_9;
-        if (pri) return typeof pri === 'string' ? JSON.parse(pri) : pri;
-      }
-      // for primary, try legacy audio_0_9
-      const legacy = uploadTarget.audio_0_9;
-      if (legacy) return typeof legacy === 'string' ? JSON.parse(legacy) : legacy;
-      return {};
-    }
-    return typeof raw === 'string' ? JSON.parse(raw) : raw;
-  }, [uploadTarget?.id, (uploadTarget as any)?.audio_0_9_primary, (uploadTarget as any)?.audio_0_9_secondary, uploadTarget?.audio_0_9, audioLayer]);
+    const legacy = parseAudioJson(uploadTarget.audio_0_9);
+    const primary = parseAudioJson((uploadTarget as any).audio_0_9_primary);
+    return { ...legacy, ...primary };
+  }, [uploadTarget?.id, uploadTarget?.audio_0_9, (uploadTarget as any)?.audio_0_9_primary]);
 
   const hasDigitAudio = (digit: string) => !!(audioMap && audioMap[digit]);
   const getDigitAudioUrl = (digit: string): string | null => (audioMap && audioMap[digit]) || null;
   const digitCount = Object.keys(audioMap).length;
-
-  // whether secondary is reusing primary
-  const isReusingPrimary = audioLayer === 'secondary' && !(uploadTarget as any)?.audio_0_9_secondary
-    && !!((uploadTarget as any)?.audio_0_9_primary || uploadTarget?.audio_0_9);
 
   const playAudio = (url: string, key: string) => {
     if (playingKey === key) {
@@ -170,13 +152,14 @@ export const VoiceOTP: React.FC = () => {
     fd.append('audio', file);
     fd.append('field', 'digit');
     fd.append('digit', digit);
-    fd.append('layer', audioLayer);
-    await voiceOtpApi.uploadAudio(String(uploadTarget.id), fd);
+    fd.append('layer', 'primary');
+    const res: any = await voiceOtpApi.uploadAudio(String(uploadTarget.id), fd);
+    if (!res.success) throw new Error(res.error || 'Upload failed');
     await loadConfigs();
     // refresh the upload target
-    const res: any = await voiceOtpApi.getConfigs();
-    const arr = res.success && res.data?.data ? res.data.data
-      : res.success && Array.isArray(res.data) ? res.data : [];
+    const allRes: any = await voiceOtpApi.getConfigs();
+    const arr = allRes.success && allRes.data?.data ? allRes.data.data
+      : allRes.success && Array.isArray(allRes.data) ? allRes.data : [];
     const found = arr.find((c: any) => String(c.id) === String(uploadTarget.id));
     if (found) setUploadTarget(found);
   };
@@ -192,7 +175,7 @@ export const VoiceOTP: React.FC = () => {
     digitUploadRef.current = null;
   };
 
-  const handleGreetingUpload = async (field: 'greeting' | 'secondary_greeting') => {
+  const handleGreetingUpload = async () => {
     const input = document.createElement('input');
     input.type = 'file';
     input.accept = 'audio/mp3,audio/wav,audio/mpeg,audio/x-wav';
@@ -203,12 +186,13 @@ export const VoiceOTP: React.FC = () => {
       try {
         const fd = new FormData();
         fd.append('audio', file);
-        fd.append('field', field);
-        await voiceOtpApi.uploadAudio(String(uploadTarget.id), fd);
+        fd.append('field', 'greeting_audio_url');
+        const res: any = await voiceOtpApi.uploadAudio(String(uploadTarget.id), fd);
+        if (!res.success) throw new Error(res.error || 'Upload failed');
         await loadConfigs();
-        const res: any = await voiceOtpApi.getConfigs();
-        const arr = res.success && res.data?.data ? res.data.data
-          : res.success && Array.isArray(res.data) ? res.data : [];
+        const allRes: any = await voiceOtpApi.getConfigs();
+        const arr = allRes.success && allRes.data?.data ? allRes.data.data
+          : allRes.success && Array.isArray(allRes.data) ? allRes.data : [];
         const found = arr.find((c: any) => String(c.id) === String(uploadTarget.id));
         if (found) setUploadTarget(found);
       } catch (err: any) { alert(err.message); }
@@ -290,9 +274,7 @@ export const VoiceOTP: React.FC = () => {
       const JSZip = (await import('jszip')).default;
       const zip = new JSZip();
       const lang = uploadTarget.language || uploadTarget.country_prefix || 'group';
-      const layer = audioLayer === 'primary'
-        ? `1st_${uploadTarget.primary_language_code || 'en'}`
-        : `2nd_${uploadTarget.secondary_language_code || 'en'}`;
+      const layer = uploadTarget.primary_language_code || 'en';
       const folderName = `${lang}_${layer}`;
       const folder = zip.folder(folderName);
 
@@ -308,9 +290,8 @@ export const VoiceOTP: React.FC = () => {
         folder!.file(filename + ext, bytes);
       };
 
-      // greetings
+      // greeting
       addFile(uploadTarget.greeting_audio_url, `greeting_${uploadTarget.primary_language_code || 'en'}`);
-      addFile(uploadTarget.secondary_greeting_audio_url, `greeting_${uploadTarget.secondary_language_code || 'en'}`);
 
       // digits 0-9
       for (let d = 0; d <= 9; d++) {
@@ -330,32 +311,39 @@ export const VoiceOTP: React.FC = () => {
 
   // ──────────── SIP Config tab (multi-server) ────────────
 
-  const emptySipServer: SipServer = { name: '', host: '', port: 5060, username: '', password: '', caller_id: '', codec: 'g729', is_e164: false, mccmnc_allowed: '' };
+  const emptySipServer: SipServer = { name: '', host: '', port: 5060, username: '', password: '', caller_id: '', codec: 'g729', is_e164: false, mccmnc_allowed: '', destination_prefix: '' };
   const [sipServers, setSipServers] = useState<SipServer[]>([]);
   const [sipLoading, setSipLoading] = useState(false);
-  const [sipSaving, setSipSaving] = useState(false);
+  const [_sipSaving, setSipSaving] = useState(false);
   const [sipForm, setSipForm] = useState<SipServer>(emptySipServer);
   const [sipFormIdx, setSipFormIdx] = useState<number | null>(null);
   const [showSipForm, setShowSipForm] = useState(false);
+  const [pingResults, setPingResults] = useState<Record<string, { loading: boolean; data?: any; error?: string }>>({});
+  // MCC/MNC multi-select picker
+  const [mccMncData, setMccMncData] = useState<{mcc:string; mnc:string; country:string; operator:string}[]>([]);
+  const [mccMncSearch, setMccMncSearch] = useState('');
+  const [mccMncOpen, setMccMncOpen] = useState(false);
+  const [mccMncLoading, setMccMncLoading] = useState(false);
+  const mccMncRef = useRef<HTMLDivElement>(null);
 
   const loadSipServers = async () => {
     setSipLoading(true);
     try {
       const res: any = await voiceOtpApi.getSipServers();
-      if (res.success && res.data) {
-        const servers = res.data?.servers || [];
-        setSipServers(Array.isArray(servers) ? servers : []);
-      }
+      // api.get wraps the server response: { success: true, data: { success: true, data: { servers: [...] } } }
+      const inner = res.data?.data || res.data;
+      const servers = inner?.servers || [];
+      setSipServers(Array.isArray(servers) ? servers : []);
     } catch { /* silent */ }
     setSipLoading(false);
   };
 
   useEffect(() => { if (tab === 'sip') loadSipServers(); }, [tab]);
 
-  const saveSipServers = async () => {
+  const persistSipServers = async (servers: SipServer[]) => {
     setSipSaving(true);
-    try { await voiceOtpApi.updateSipServers({ servers: sipServers }); alert('SIP servers saved.'); }
-    catch (e: any) { alert(e.message); }
+    try { await voiceOtpApi.updateSipServers({ servers }); }
+    catch (e: any) { alert('Save failed: ' + (e.message || 'Unknown error')); }
     setSipSaving(false);
   };
 
@@ -363,18 +351,110 @@ export const VoiceOTP: React.FC = () => {
   const openSipEdit = (idx: number) => { setSipForm({ ...sipServers[idx] }); setSipFormIdx(idx); setShowSipForm(true); };
   const handleSipFormSave = () => {
     if (!sipForm.host.trim()) { alert('SIP Host is required.'); return; }
+    let newServers: SipServer[];
     if (sipFormIdx !== null) {
-      const updated = [...sipServers];
-      updated[sipFormIdx] = { ...sipForm, id: sipForm.id || `srv_${Date.now()}_${Math.random().toString(36).substr(2, 5)}` };
-      setSipServers(updated);
+      newServers = [...sipServers];
+      newServers[sipFormIdx] = { ...sipForm, id: sipForm.id || `srv_${Date.now()}_${Math.random().toString(36).substr(2, 5)}` };
     } else {
-      setSipServers([...sipServers, { ...sipForm, id: `srv_${Date.now()}_${Math.random().toString(36).substr(2, 5)}` }]);
+      newServers = [...sipServers, { ...sipForm, id: `srv_${Date.now()}_${Math.random().toString(36).substr(2, 5)}` }];
     }
+    setSipServers(newServers);
     setShowSipForm(false);
+    persistSipServers(newServers);
   };
   const handleSipDelete = (idx: number) => {
     if (!window.confirm('Remove this SIP server?')) return;
-    setSipServers(sipServers.filter((_, i) => i !== idx));
+    const filtered = sipServers.filter((_, i) => i !== idx);
+    setSipServers(filtered);
+    persistSipServers(filtered);
+  };
+
+  // ── MCC/MNC multi-select helpers ──
+  const loadMccMncData = async () => {
+    if (mccMncData.length > 0) return;
+    setMccMncLoading(true);
+    try {
+      const res: any = await mccmncApi.getAll({ limit: 5000 });
+      const data = res?.data?.data || res?.data || [];
+      setMccMncData(Array.isArray(data) ? data : []);
+    } catch { setMccMncData([]); }
+    setMccMncLoading(false);
+  };
+  const parseSelectedMccMnc = (raw: string): string[] => {
+    if (!raw || raw === '*') return [];
+    return raw.split(',').map(s => s.trim()).filter(Boolean);
+  };
+  const isMccMncSelected = (mcc: string, mnc: string, operator: string): boolean => {
+    const sel = parseSelectedMccMnc(sipForm.mccmnc_allowed);
+    return sel.includes(`${mcc}:${mnc}:${operator}`) || sel.includes(`${mcc}*`);
+  };
+  const toggleMccMnc = (mcc: string, mnc: string, operator: string) => {
+    const key = `${mcc}:${mnc}:${operator}`;
+    const sel = parseSelectedMccMnc(sipForm.mccmnc_allowed);
+    const mccStar = `${mcc}*`;
+    if (sel.includes(key)) {
+      // Remove this specific entry
+      const next = sel.filter(s => s !== key);
+      setSipForm(p => ({ ...p, mccmnc_allowed: next.join(',') || '*' }));
+    } else if (sel.includes(mccStar)) {
+      // Remove MCC wildcard, add specific entries minus this one
+      const others = mccMncData.filter(r => r.mcc === mcc && `${mcc}:${r.mnc}:${r.operator}` !== key);
+      const next = [...sel.filter(s => s !== mccStar), ...others.map(r => `${mcc}:${r.mnc}:${r.operator}`)];
+      setSipForm(p => ({ ...p, mccmnc_allowed: next.join(',') || '*' }));
+    } else if (sel.filter(s => s.startsWith(mcc + ':')).length >= 3) {
+      // Most of this MCC's entries selected → switch to wildcard
+      const next = [...sel.filter(s => !s.startsWith(mcc + ':')), mccStar];
+      setSipForm(p => ({ ...p, mccmnc_allowed: next.join(',') || '*' }));
+    } else {
+      setSipForm(p => ({ ...p, mccmnc_allowed: [...sel, key].join(',') || '*' }));
+    }
+  };
+  const selectAllMcc = (mcc: string) => {
+    const sel = parseSelectedMccMnc(sipForm.mccmnc_allowed);
+    const mccStar = `${mcc}*`;
+    if (sel.includes(mccStar)) {
+      setSipForm(p => ({ ...p, mccmnc_allowed: sel.filter(s => s !== mccStar).join(',') || '*' }));    } else {
+      setSipForm(p => ({ ...p, mccmnc_allowed: [...sel.filter(s => !s.startsWith(mcc + ':')), mccStar].join(',') || '*' }));
+    }
+  };
+  // Close picker on click outside
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (mccMncRef.current && !mccMncRef.current.contains(e.target as Node)) setMccMncOpen(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
+  // Filtered MCC/MNC data grouped by country
+  const mccMncFiltered = useMemo(() => {
+    const q = mccMncSearch.toLowerCase();
+    return mccMncData.filter(r =>
+      !q || r.country?.toLowerCase().includes(q) || r.operator?.toLowerCase().includes(q) ||
+      r.mcc?.includes(q) || r.mnc?.includes(q)
+    );
+  }, [mccMncData, mccMncSearch]);
+  const mccMncGroups = useMemo(() => {
+    const groups: Record<string, typeof mccMncData> = {};
+    for (const r of mccMncFiltered) {
+      const key = `${r.country || 'Unknown'} (MCC ${r.mcc})`;
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(r);
+    }
+    return groups;
+  }, [mccMncFiltered]);
+
+  const handlePing = async (host: string, key: string) => {
+    setPingResults(p => ({ ...p, [key]: { loading: true } }));
+    try {
+      const res: any = await voiceOtpApi.pingSipServer(host);
+      if (res.success && res.data?.data) {
+        setPingResults(p => ({ ...p, [key]: { loading: false, data: res.data.data } }));
+      } else {
+        setPingResults(p => ({ ...p, [key]: { loading: false, error: res.error || 'Ping failed' } }));
+      }
+    } catch (e: any) {
+      setPingResults(p => ({ ...p, [key]: { loading: false, error: e.message || 'Ping error' } }));
+    }
   };
 
   // ──────────── Call Logs tab ────────────
@@ -399,8 +479,8 @@ export const VoiceOTP: React.FC = () => {
   // ──────────── table columns ────────────
 
   const langColumns = [
-    { key: 'language', header: 'Language / Group', render: (s: any) => <div><p className="font-medium text-sm">{s.language || 'Unnamed'}</p><p className="text-[10px] text-gray-500">{s.country_prefix ? '+' + s.country_prefix.replace(/,/g, ', +') : ''} • 1st:{s.primary_language_code || 'en'} {s.secondary_language_code ? '/ 2nd:' + s.secondary_language_code : ''}</p></div> },
-    { key: 'playback', header: 'Playback', render: (s: any) => <div className="text-xs"><span className="font-medium">{s.play_count || 1}x</span><span className="text-gray-400"> · </span><span>Rtry: {s.retry_count || 4}</span></div> },
+    { key: 'language', header: 'Language / Group', render: (s: any) => <div><p className="font-medium text-sm">{s.language || 'Unnamed'}</p><p className="text-[10px] text-gray-500">{s.country_prefix ? '+' + s.country_prefix.replace(/,/g, ', +') : 'Any'} · {s.primary_language_code || 'en'}</p></div> },
+    { key: 'playback', header: 'Playback', render: (s: any) => <div className="text-xs"><span className="font-medium">{s.play_count || 1}x Play</span><span className="text-gray-400"> · </span><span>Rtry: {s.retry_count || 4}</span></div> },
     { key: 'status', header: 'Status', render: (s: any) => <Badge variant={s.is_active ? 'success' : 'danger'} dot size="sm">{s.is_active ? 'Active' : 'Inactive'}</Badge> },
     { key: 'actions', header: 'Actions', render: (s: any) => <div className="flex gap-0.5">
       <button onClick={() => openEdit(s)} className="p-1 rounded hover:bg-gray-100"><Edit size={14} className="text-gray-500" /></button>
@@ -474,38 +554,24 @@ export const VoiceOTP: React.FC = () => {
               <select value={uploadTarget?.id || ''} onChange={e => {
                 const found = configs.find(c => String(c.id) === e.target.value);
                 setUploadTarget(found || null);
-                setAudioLayer('primary');
               }} className="mt-1 block w-full rounded-lg border-gray-300 text-sm py-2 px-3 bg-white">
                 <option value="">-- Select a language group --</option>
                 {configs.filter(c => c.is_active).map(c => (
                   <option key={String(c.id)} value={String(c.id)}>
-                    {c.language || 'Unnamed'} ({c.country_prefix || 'Any'}) — 1st:{c.primary_language_code || 'en'} 2nd:{c.secondary_language_code || 'en'}
+                    {c.language || 'Unnamed'} ({c.country_prefix || 'Any'}) — {c.primary_language_code || 'en'}
                   </option>
                 ))}
               </select>
             </div>
           </Card>
-          {uploadTarget && (
-            <div className="flex items-center gap-2 bg-white rounded-lg border p-1">
-              <button onClick={() => setAudioLayer('primary')}
-                className={'px-3 py-1.5 rounded-md text-sm font-medium transition-all ' +
-                  (audioLayer === 'primary' ? 'bg-blue-600 text-white shadow' : 'text-gray-600 hover:bg-gray-100')}>
-                1st: {uploadTarget.primary_language_code || 'en'}
-              </button>
-              <button onClick={() => setAudioLayer('secondary')}
-                className={'px-3 py-1.5 rounded-md text-sm font-medium transition-all ' +
-                  (audioLayer === 'secondary' ? 'bg-purple-600 text-white shadow' : 'text-gray-600 hover:bg-gray-100')}>
-                2nd: {uploadTarget.secondary_language_code || 'en'}
-              </button>
-            </div>
-          )}
+
           {/* Quick-select pills */}
           <div className="flex flex-wrap gap-2 items-center">
             <span className="text-xs text-gray-400 font-medium">Quick:</span>
             {configs.filter(c => c.is_active).slice(0, 8).map(c => (
               <button
                 key={String(c.id)}
-                onClick={() => { setUploadTarget(c); setAudioLayer('primary'); }}
+                onClick={() => { setUploadTarget(c); }}
                 className={'px-2.5 py-1 rounded-full text-xs font-medium border transition-all ' +
                   (uploadTarget && String(uploadTarget.id) === String(c.id)
                     ? 'bg-purple-600 text-white border-purple-600 shadow'
@@ -525,36 +591,22 @@ export const VoiceOTP: React.FC = () => {
         )}
 
         {uploadTarget && <>
-          {/* Greeting cards */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {(['greeting', 'secondary_greeting'] as const).map((gfield, gi) => {
-              const isPrimary = gi === 0;
-              const url = isPrimary ? uploadTarget.greeting_audio_url : uploadTarget.secondary_greeting_audio_url;
-              const hasAudio = !!url;
-              return (
-                <Card key={gfield} className={!isPrimary ? 'border-purple-200' : ''}>
-                  <div className="flex items-center justify-between mb-3">
-                    <div className="flex items-center gap-2">
-                      <Badge variant={isPrimary ? 'info' : 'warning'} size="sm">{isPrimary ? 'Primary' : 'Secondary'} Greeting</Badge>
-                      <span className="text-xs text-gray-400">{isPrimary ? uploadTarget.primary_language_code : uploadTarget.secondary_language_code}</span>
-                    </div>
-                    {hasAudio ? <Badge variant="success" size="sm" dot>✓ Uploaded</Badge> : <Badge variant="info" size="sm">No file</Badge>}
-                  </div>
-                  <div className="flex gap-2">
-                    <Button variant="secondary" size="sm" icon={<Upload size={14} />} onClick={() => handleGreetingUpload(gfield)}>Upload</Button>
-                    {hasAudio && <Button variant={playingKey === gfield ? 'danger' : 'primary'} size="sm" icon={playingKey === gfield ? <Pause size={14} /> : <Play size={14} />} onClick={() => playAudio(url!, gfield)}>{playingKey === gfield ? 'Stop' : 'Play'}</Button>}
-                  </div>
-                </Card>
-              );
-            })}
+          {/* Greeting card — single language */}
+          <div className="max-w-md">
+            <Card>
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2">
+                  <Badge variant="info" size="sm">Greeting</Badge>
+                  <span className="text-xs text-gray-400">{uploadTarget.primary_language_code || 'en'}</span>
+                </div>
+                {uploadTarget.greeting_audio_url ? <Badge variant="success" size="sm" dot>✓ Uploaded</Badge> : <Badge variant="info" size="sm">No file</Badge>}
+              </div>
+              <div className="flex gap-2">
+                <Button variant="secondary" size="sm" icon={<Upload size={14} />} onClick={handleGreetingUpload}>Upload</Button>
+                {uploadTarget.greeting_audio_url && <Button variant={playingKey === 'greeting' ? 'danger' : 'primary'} size="sm" icon={playingKey === 'greeting' ? <Pause size={14} /> : <Play size={14} />} onClick={() => playAudio(uploadTarget.greeting_audio_url!, 'greeting')}>{playingKey === 'greeting' ? 'Stop' : 'Play'}</Button>}
+              </div>
+            </Card>
           </div>
-
-          {/* Reuse banner */}
-          {isReusingPrimary && (
-            <div className="bg-amber-50 border border-amber-300 rounded-lg px-4 py-2 text-sm text-amber-800 flex items-center gap-2">
-              <RefreshCw size={16} />↻ Reusing primary digit audio for secondary (no secondary audio uploaded yet)
-            </div>
-          )}
 
           {/* Digit grid */}
           <Card>
@@ -615,43 +667,26 @@ export const VoiceOTP: React.FC = () => {
                 <thead>
                   <tr className="border-b text-xs text-gray-500 uppercase tracking-wider">
                     <th className="text-left px-2 py-2">Group</th>
-                    <th className="text-center px-2 py-2">1st Greeting</th>
-                    <th className="text-center px-2 py-2">1st Digits</th>
-                    <th className="text-center px-2 py-2">2nd Greeting</th>
-                    <th className="text-center px-2 py-2">2nd Digits</th>
+                    <th className="text-center px-2 py-2">Greeting</th>
+                    <th className="text-center px-2 py-2">Digits</th>
                     <th className="text-center px-2 py-2">Status</th>
                   </tr>
                 </thead>
                 <tbody>
                   {configs.map(cfg => {
                     const g1 = !!cfg.greeting_audio_url;
-                    const g2 = !!cfg.secondary_greeting_audio_url;
-                    const hasSecondaryCfg = !!(cfg as any).secondary_language_code;
-                    const am1 = parseAudioJson((cfg as any).audio_0_9_primary || cfg.audio_0_9);
+                    const am1 = { ...parseAudioJson(cfg.audio_0_9), ...parseAudioJson((cfg as any).audio_0_9_primary) };
                     const dc1 = Object.keys(am1).length;
-                    const am2raw = (cfg as any).audio_0_9_secondary;
-                    const am2 = am2raw ? parseAudioJson(am2raw) : null;
-                    const dc2 = am2 ? Object.keys(am2).length : (am1 ? Object.keys(am1).length : 0);
-                    const secReused = !am2raw && Object.keys(am1).length > 0;
-                    // Full = primary greeting + all 10 primary digits + (if secondary configured) secondary greeting + all 10 secondary digits
-                    const primaryFull = g1 && dc1 === 10;
-                    const secondaryFull = !hasSecondaryCfg || (g2 && (am2 ? Object.keys(am2).length === 10 : dc1 === 10));
-                    const allOk = primaryFull && secondaryFull;
-                    const partial = g1 || g2 || dc1 > 0 || (am2 && Object.keys(am2).length > 0);
+                    const allOk = g1 && dc1 === 10;
+                    const partial = g1 || dc1 > 0;
                     return (
                       <tr key={String(cfg.id)} className={'hover:bg-gray-50 ' + (uploadTarget && String(uploadTarget.id) === String(cfg.id) ? 'bg-blue-50' : '')}>
                         <td className="px-2 py-2.5">
                           <span className="font-medium text-gray-800 text-xs">{cfg.language || 'Unnamed'}</span>
-                          <span className="text-gray-400 ml-1 text-[10px]">{cfg.country_prefix ? '+' + String(cfg.country_prefix).replace(/,/g, ', +') : ''} {cfg.primary_language_code}/{cfg.secondary_language_code}</span>
+                          <span className="text-gray-400 ml-1 text-[10px]">{cfg.country_prefix ? '+' + String(cfg.country_prefix).replace(/,/g, ', +') : ''} · {cfg.primary_language_code || 'en'}</span>
                         </td>
                         <td className="text-center px-2 py-2.5">{g1 ? <span className="text-green-600 font-bold">✓</span> : <span className="text-red-400">✗</span>}</td>
                         <td className="text-center px-2 py-2.5"><span className={dc1 === 10 ? 'text-green-600 font-semibold text-xs' : dc1 > 0 ? 'text-orange-500 font-semibold text-xs' : 'text-red-400 text-xs'}>{dc1}/10</span></td>
-                        <td className="text-center px-2 py-2.5">{g2 ? <span className="text-green-600 font-bold">✓</span> : <span className="text-red-400">✗</span>}</td>
-                        <td className="text-center px-2 py-2.5">
-                          {secReused ? <span className="text-amber-500 font-semibold text-xs">↻ {dc2}/10</span>
-                            : am2 ? <span className={Object.keys(am2).length === 10 ? 'text-green-600 font-semibold text-xs' : Object.keys(am2).length > 0 ? 'text-orange-500 font-semibold text-xs' : 'text-red-400 text-xs'}>{Object.keys(am2).length}/10</span>
-                            : <span className="text-red-400 text-xs">0/10</span>}
-                        </td>
                         <td className="text-center px-2 py-2.5">
                           {allOk ? <Badge variant="success" size="sm">Full</Badge>
                             : partial ? <Badge variant="warning" size="sm">Partial</Badge>
@@ -676,7 +711,6 @@ export const VoiceOTP: React.FC = () => {
           </div>
           <div className="flex gap-2">
             <Button icon={<Plus size={14} />} onClick={openSipAdd} size="sm">Add Server</Button>
-            <Button icon={<Save size={14} />} onClick={saveSipServers} loading={sipSaving} size="sm">Save All</Button>
           </div>
         </div>
 
@@ -685,10 +719,13 @@ export const VoiceOTP: React.FC = () => {
           <Card><p className="text-gray-400 text-center py-8 text-sm">No SIP servers configured. Click "Add Server" to add one.</p></Card>
         ) : (
           <div className="grid gap-3">
-            {sipServers.map((srv, idx) => (
+            {sipServers.map((srv, idx) => {
+              const pingKey = srv.id || srv.host || `srv_${idx}`;
+              const ping = pingResults[pingKey];
+              return (
               <Card key={srv.id || idx} className="hover:shadow-md transition-shadow">
                 <div className="flex items-start justify-between">
-                  <div className="flex-1 grid grid-cols-2 md:grid-cols-4 gap-x-6 gap-y-2 text-sm">
+                  <div className="flex-1 grid grid-cols-2 md:grid-cols-5 gap-x-6 gap-y-2 text-sm">
                     <div>
                       <span className="text-xs text-gray-400">Name</span>
                       <p className="font-semibold text-gray-800">{srv.name || 'Unnamed'}</p>
@@ -705,18 +742,70 @@ export const VoiceOTP: React.FC = () => {
                       <span className="text-xs text-gray-400">Codec</span>
                       <p className="text-gray-700 uppercase">{srv.codec || 'g729'}</p>
                     </div>
+                    <div>
+                      <span className="text-xs text-gray-400">Dest Prefix</span>
+                      <p className="font-mono text-gray-700">{srv.destination_prefix || '-'}</p>
+                    </div>
                     <div className="col-span-2 md:col-span-4">
                       <span className="text-xs text-gray-400">MCC/MNC Filter</span>
                       <p className="text-gray-600 text-xs font-mono">{srv.mccmnc_allowed || '*'}</p>
                     </div>
+                    {/* Ping Results Row */}
+                    {ping && !ping.loading && ping.data && (
+                      <div className="col-span-2 md:col-span-4 mt-1 pt-2 border-t border-gray-100">
+                        <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-xs">
+                          {ping.data.alive ? (
+                            <>
+                              <span className="inline-flex items-center gap-1 text-green-700 font-semibold">
+                                <Wifi size={12} /> {ping.data.latency_ms?.toFixed(1)} ms
+                              </span>
+                              <span className="text-gray-500">|</span>
+                              <span className="text-gray-500">Min: <span className="text-gray-700 font-medium">{ping.data.min_ms?.toFixed(1)} ms</span></span>
+                              <span className="text-gray-500">|</span>
+                              <span className="text-gray-500">Max: <span className="text-gray-700 font-medium">{ping.data.max_ms?.toFixed(1)} ms</span></span>
+                              <span className="text-gray-500">|</span>
+                              <span className="text-gray-500">TTL: <span className="text-gray-700 font-medium">{ping.data.ttl ?? '-'}</span></span>
+                              <span className="text-gray-500">|</span>
+                              <span className={`font-medium ${ping.data.packet_loss_pct > 0 ? 'text-amber-600' : 'text-green-600'}`}>
+                                Loss: {ping.data.packet_loss_pct}% ({ping.data.packets_received}/{ping.data.packets_sent})
+                              </span>
+                            </>
+                          ) : (
+                            <>
+                              <span className="inline-flex items-center gap-1 text-red-600 font-semibold">
+                                <WifiOff size={12} /> Unreachable
+                              </span>
+                              <span className="text-gray-500">|</span>
+                              <span className="text-red-500">Loss: 100% ({ping.data.packets_received}/{ping.data.packets_sent})</span>
+                              {ping.data.error && <span className="text-red-400">— {ping.data.error}</span>}
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                    {ping && ping.loading && (
+                      <div className="col-span-2 md:col-span-4 mt-1 pt-2 border-t border-gray-100">
+                        <span className="inline-flex items-center gap-1 text-xs text-blue-500">
+                          <Activity size={12} className="animate-pulse" /> Pinging {srv.host}...
+                        </span>
+                      </div>
+                    )}
+                    {ping && ping.error && !ping.data && (
+                      <div className="col-span-2 md:col-span-4 mt-1 pt-2 border-t border-gray-100">
+                        <span className="text-xs text-red-500">{ping.error}</span>
+                      </div>
+                    )}
                   </div>
                   <div className="flex gap-1 ml-3">
+                    <button onClick={() => handlePing(srv.host, pingKey)} disabled={ping?.loading} className="p-1.5 rounded hover:bg-blue-50 disabled:opacity-50" title="Ping / Test Connection">
+                      <Activity size={14} className={ping?.loading ? 'text-blue-400 animate-spin' : 'text-blue-500'} />
+                    </button>
                     <button onClick={() => openSipEdit(idx)} className="p-1.5 rounded hover:bg-gray-100"><Edit size={14} className="text-gray-400" /></button>
                     <button onClick={() => handleSipDelete(idx)} className="p-1.5 rounded hover:bg-red-50"><Trash2 size={14} className="text-red-400" /></button>
                   </div>
                 </div>
               </Card>
-            ))}
+            )})}
           </div>
         )}
 
@@ -739,7 +828,95 @@ export const VoiceOTP: React.FC = () => {
                   <option value="gsm">GSM</option>
                 </select>
               </div>
-              <Input label="MCC/MNC Allowed" value={sipForm.mccmnc_allowed} onChange={e => setSipForm(p => ({ ...p, mccmnc_allowed: e.target.value }))} placeholder="310,311,302 or *" />
+              {/* MCC/MNC Multi-Select Picker */}
+              <div ref={mccMncRef} className="relative">
+                <label className="text-xs font-medium text-gray-500">MCC/MNC Allowed</label>
+                <div
+                  className="mt-1 flex flex-wrap gap-1 items-center min-h-[38px] px-2 py-1.5 border border-gray-300 rounded-lg bg-white cursor-text text-sm"
+                  onClick={() => { if (!mccMncOpen) { loadMccMncData(); setMccMncOpen(true); } }}
+                >
+                  {(() => {
+                    const sel = parseSelectedMccMnc(sipForm.mccmnc_allowed);
+                    if (sel.length === 0) return <span className="text-gray-400">All (*) — click to select countries</span>;
+                    return sel.slice(0, 5).map(s => {
+                      const isWildcard = s.endsWith('*');
+                      return (
+                        <span key={s} className="inline-flex items-center gap-0.5 bg-purple-100 text-purple-800 rounded px-1.5 py-0.5 text-xs font-medium">
+                          {s}
+                          <button onClick={(e) => {
+                            e.stopPropagation();
+                            if (isWildcard) selectAllMcc(s.replace('*', ''));
+                            else {
+                              const parts = s.split(':');
+                              toggleMccMnc(parts[0], parts[1] || '', parts[2] || '');
+                            }
+                          }} className="ml-0.5 hover:text-red-600">&times;</button>
+                        </span>
+                      );
+                    }).concat(sel.length > 5 ? [<span key="more" className="text-xs text-gray-400">+{sel.length - 5} more</span>] : []);
+                  })()}
+                </div>
+                {mccMncOpen && (
+                  <div className="absolute z-50 mt-1 w-full bg-white border border-gray-200 rounded-lg shadow-xl max-h-72 overflow-hidden">
+                    <div className="p-2 border-b">
+                      <input
+                        autoFocus
+                        className="w-full px-2 py-1 text-sm border border-gray-200 rounded focus:outline-none focus:border-purple-400"
+                        placeholder="Search country, operator, MCC..."
+                        value={mccMncSearch}
+                        onChange={e => setMccMncSearch(e.target.value)}
+                        onClick={e => e.stopPropagation()}
+                      />
+                    </div>
+                    <div className="overflow-y-auto max-h-56">
+                      {mccMncLoading ? (
+                        <div className="p-4 text-center text-sm text-gray-400">Loading MCC/MNC database...</div>
+                      ) : Object.keys(mccMncGroups).length === 0 ? (
+                        <div className="p-4 text-center text-sm text-gray-400">No matches</div>
+                      ) : (
+                        Object.entries(mccMncGroups).map(([group, rows]) => {
+                          const mcc = rows[0]?.mcc || '';
+                          const allSel = parseSelectedMccMnc(sipForm.mccmnc_allowed).includes(`${mcc}*`);
+                          return (
+                            <div key={group}>
+                              <div
+                                className="flex items-center gap-2 px-3 py-1.5 bg-gray-50 hover:bg-gray-100 cursor-pointer text-xs font-semibold text-gray-700 border-b"
+                                onClick={() => selectAllMcc(mcc)}
+                              >
+                                <input type="checkbox" checked={allSel} onChange={() => {}} className="w-3.5 h-3.5" />
+                                {group}
+                              </div>
+                              {!allSel && rows.slice(0, 8).map(r => {
+                                const key = `${r.mcc}:${r.mnc}:${r.operator}`;
+                                const checked = isMccMncSelected(r.mcc, r.mnc, r.operator);
+                                return (
+                                  <div key={key}
+                                    className="flex items-center gap-2 px-5 py-1 hover:bg-purple-50 cursor-pointer text-xs text-gray-600"
+                                    onClick={() => toggleMccMnc(r.mcc, r.mnc, r.operator)}
+                                  >
+                                    <input type="checkbox" checked={checked} onChange={() => {}} className="w-3 h-3" />
+                                    <span className="font-mono">{r.mcc}:{r.mnc}</span>
+                                    <span className="text-gray-400">—</span>
+                                    <span>{r.operator || 'All'}</span>
+                                  </div>
+                                );
+                              })}
+                              {!allSel && rows.length > 8 && (
+                                <div className="px-5 py-1 text-xs text-gray-400">+{rows.length - 8} more operators</div>
+                              )}
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                    <div className="p-2 border-t bg-gray-50 flex gap-2">
+                      <button onClick={() => { setSipForm(p => ({ ...p, mccmnc_allowed: '*' })); setMccMncOpen(false); }} className="text-xs text-blue-600 hover:underline">Reset to All (*)</button>
+                      <button onClick={() => setMccMncOpen(false)} className="text-xs text-gray-500 hover:underline">Close</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+              <Input label="Destination Prefix" value={sipForm.destination_prefix} onChange={e => setSipForm(p => ({ ...p, destination_prefix: e.target.value }))} placeholder="e.g. 99900" />
             </div>
             <label className="flex items-center gap-2 mt-3">
               <input type="checkbox" checked={sipForm.is_e164} onChange={e => setSipForm(p => ({ ...p, is_e164: e.target.checked }))} className="w-4 h-4 rounded" />
@@ -784,8 +961,7 @@ export const VoiceOTP: React.FC = () => {
           <div className="grid grid-cols-2 gap-4">
             <Input label="Language / Group Name *" value={form.language} onChange={e => setForm(p => ({ ...p, language: e.target.value }))} required />
             <Input label="Country Prefix(es)" value={form.country_prefix} onChange={e => setForm(p => ({ ...p, country_prefix: e.target.value }))} placeholder="93,91,880" />
-            <Input label="1st Language Code" value={form.primary_language_code} onChange={e => setForm(p => ({ ...p, primary_language_code: e.target.value }))} placeholder="bn" />
-            <Input label="2nd Language Code (optional)" value={form.secondary_language_code} onChange={e => setForm(p => ({ ...p, secondary_language_code: e.target.value }))} placeholder="en" />
+            <Input label="Language Code" value={form.primary_language_code} onChange={e => setForm(p => ({ ...p, primary_language_code: e.target.value }))} placeholder="bn" />
             <div><label className="text-xs font-medium text-gray-500">Retry Count</label>
               <select value={form.retry_count} onChange={e => setForm(p => ({ ...p, retry_count: parseInt(e.target.value) }))} className="mt-1 block w-full rounded-lg border-gray-300 text-sm py-2 px-3 bg-white">
                 {[1,2,3,4].map(n => <option key={n} value={n}>{n}</option>)}
@@ -794,10 +970,6 @@ export const VoiceOTP: React.FC = () => {
               <select value={form.play_count} onChange={e => setForm(p => ({ ...p, play_count: parseInt(e.target.value) }))} className="mt-1 block w-full rounded-lg border-gray-300 text-sm py-2 px-3 bg-white">
                 {[1,2,3].map(n => <option key={n} value={n}>{n}</option>)}
               </select></div>
-          </div>
-          <div className="grid grid-cols-2 gap-4">
-            <Input label="Greeting Text" value={form.greeting_text} onChange={e => setForm(p => ({ ...p, greeting_text: e.target.value }))} />
-            <Input label="Retry Text" value={form.retry_text} onChange={e => setForm(p => ({ ...p, retry_text: e.target.value }))} />
           </div>
           <label className="flex items-center gap-2"><input type="checkbox" checked={form.is_active} onChange={e => setForm(p => ({ ...p, is_active: e.target.checked }))} className="w-4 h-4 rounded" /><span className="text-sm">Active</span></label>
         </div>

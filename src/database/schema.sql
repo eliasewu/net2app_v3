@@ -72,8 +72,7 @@ INSERT INTO users (username, password_hash, email, role, permissions, name, is_a
 ('admin', '$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy', 'admin@net2app.com', 'super_admin', ARRAY['all'], 'Super Admin', true),
 ('support', '$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy', 'support@net2app.com', 'support', ARRAY['view_clients','view_suppliers','view_sms_logs','test_sms','manage_bind','view_reports'], 'Support Team', true),
 ('billing', '$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy', 'billing@net2app.com', 'billing', ARRAY['manage_invoices','manage_payments','view_reports','view_clients','view_suppliers'], 'Billing Team', true),
-('techcorp_user', '$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy', 'user@techcorp.com', 'client', ARRAY['view_own_cdr','view_own_usage','view_own_payments','test_sms','send_sms'], 'TechCorp Client', true),
-('globalsms_user', '$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy', 'user@globalsms.com', 'supplier', ARRAY['view_own_cdr','view_own_usage','view_own_payments','view_bind_status'], 'GlobalSMS Supplier', true);
+-- Client/supplier-specific users should be created per tenant, not seeded here);
 
 -- ============================================================
 -- 2. CLIENTS TABLE
@@ -121,10 +120,7 @@ CREATE TABLE clients (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-INSERT INTO clients (client_code, company_name, contact_person, email, phone, address, country, smpp_username, smpp_password, max_tps, billing_mode, balance, credit_limit, status) VALUES
-('CLT001', 'TechCorp Global', 'John Smith', 'john@techcorp.com', '+1234567890', '123 Tech Street, Silicon Valley', 'USA', 'techcorp_smpp', 'secure123', 100, 'dlr', 5000.0000, 10000.0000, 'active'),
-('CLT002', 'MegaBank Ltd', 'Sarah Johnson', 'sarah@megabank.com', '+9876543210', '456 Finance Road, London', 'UK', 'megabank_smpp', 'bank456', 200, 'submit', 25000.0000, 50000.0000, 'active'),
-('CLT003', 'EcomStore Inc', 'Mike Brown', 'mike@ecomstore.com', '+1122334455', '789 Commerce Ave, New York', 'USA', 'ecomstore_smpp', 'ecom789', 50, 'dlr', 1500.0000, 5000.0000, 'active');
+-- No default client seed data — each tenant adds their own clients
 
 -- ============================================================
 -- 3. SUPPLIERS TABLE
@@ -173,13 +169,7 @@ CREATE TABLE suppliers (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-INSERT INTO suppliers (supplier_code, company_name, contact_person, email, phone, connection_type, smpp_host, smpp_port, smpp_username, smpp_password, balance, bind_status, status) VALUES
-('SUP001', 'GlobalSMS Gateway', 'Alex Turner', 'alex@globalsms.com', '+1111222233', 'smpp', 'smpp.globalsms.com', 2775, 'net2app_client', 'gateway123', 50000.0000, 'bound', 'active'),
-('SUP002', 'DirectRoute Pro', 'Maria Garcia', 'maria@directroute.com', '+2222333344', 'smpp', 'smpp.directroute.com', 2775, 'net2app', 'direct456', 35000.0000, 'bound', 'active'),
-('SUP003', 'SIM OTP Services', 'James Wilson', 'james@simotp.com', '+3333444455', 'smpp', 'otp.simotp.com', 2776, 'net2app_otp', 'otp789', 20000.0000, 'bound', 'active'),
-('SUP004', 'WhatsApp Business API', 'Emma Davis', 'emma@wabusiness.com', '+4444555566', 'ott_whatsapp', NULL, 0, '', '', 15000.0000, 'bound', 'active'),
-('SUP005', 'Voice OTP Provider', 'Robert Lee', 'robert@voiceotp.com', '+5555666677', 'voice_otp', 'sip.voiceotp.com', 5060, 'net2app_voice', 'voice321', 10000.0000, 'bound', 'active'),
-('SUP006', 'Local Bypass Gateway', 'Chris Martin', 'chris@localbypass.com', '+7777888899', 'local_bypass', 'local.bypass.gateway', 2777, 'local_net2app', 'local654', 5000.0000, 'unbound', 'inactive');
+-- No default supplier seed data — each tenant adds their own suppliers
 
 -- ============================================================
 -- 4. TRUNKS TABLE
@@ -189,6 +179,7 @@ CREATE TABLE trunks (
     trunk_name VARCHAR(255) NOT NULL,
     trunk_type VARCHAR(50) NOT NULL CHECK (trunk_type IN ('sim_otp','sim_marketing','voice_otp','local_direct_otp','local_direct_marketing','direct_route_otp','direct_route_marketing','whatsapp','telegram','rcs')),
     supplier_id INTEGER REFERENCES suppliers(id) NOT NULL,
+    voice_otp_config_id INTEGER,
     priority INTEGER DEFAULT 1,
     percentage INTEGER DEFAULT 100,
     is_active BOOLEAN DEFAULT true,
@@ -197,12 +188,7 @@ CREATE TABLE trunks (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-INSERT INTO trunks (trunk_name, trunk_type, supplier_id, priority, percentage, mccmnc_allowed) VALUES
-('Global SMS Direct', 'direct_route_otp', 1, 1, 70, ARRAY['310*','311*','234*']),
-('SIM OTP Primary', 'sim_otp', 3, 1, 100, ARRAY['*']),
-('Direct Route Marketing', 'direct_route_marketing', 2, 2, 30, ARRAY['310*','311*']),
-('WhatsApp OTT', 'whatsapp', 4, 1, 100, ARRAY['*']),
-('Voice OTP Main', 'voice_otp', 5, 1, 100, ARRAY['*']);
+-- No default trunk seed data — each tenant configures their own trunks
 
 -- ============================================================
 -- 5. ROUTES TABLE
@@ -211,6 +197,7 @@ CREATE TABLE routes (
     id SERIAL PRIMARY KEY,
     route_name VARCHAR(255) NOT NULL,
     trunk_ids INTEGER[] DEFAULT '{}',
+    voice_otp_config_id INTEGER,
     route_method VARCHAR(20) DEFAULT 'priority' CHECK (route_method IN ('priority','percentage','lcr')),
     preferred_channel VARCHAR(50),
     mccmnc_allowed TEXT[] DEFAULT '{*}',
@@ -219,11 +206,7 @@ CREATE TABLE routes (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-INSERT INTO routes (route_name, trunk_ids, route_method) VALUES
-('Premium OTP Route', ARRAY[2,1], 'priority'),
-('Marketing Blend', ARRAY[1,3], 'percentage'),
-('OTT Messaging', ARRAY[4], 'lcr'),
-('Voice OTP Fallback', ARRAY[5], 'priority');
+-- No default route seed data — each tenant configures their own routes
 
 -- ============================================================
 -- 6. ROUTE PLANS TABLE
@@ -237,9 +220,7 @@ CREATE TABLE route_plans (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-INSERT INTO route_plans (plan_name, route_ids, is_default) VALUES
-('Premium Plan', ARRAY[1,3,4], true),
-('Marketing Plan', ARRAY[2], false);
+-- No default route_plan seed data — each tenant configures their own route plans
 
 -- ============================================================
 -- 8. RATES TABLE (with versioning)
@@ -261,13 +242,7 @@ CREATE TABLE rates (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-INSERT INTO rates (entity_type, entity_id, mcc, mnc, country, operator, rate, effective_from, version, is_active) VALUES
-('client', 1, '310', '*', 'United States', 'All', 0.025000, '2024-01-01', 2, true),
-('client', 1, '310', '*', 'United States', 'All', 0.020000, '2023-06-01', 1, false),
-('client', 1, '234', '*', 'United Kingdom', 'All', 0.022000, '2024-01-01', 1, true),
-('client', 2, '310', '*', 'United States', 'All', 0.023000, '2024-02-01', 1, true),
-('supplier', 1, '310', '*', 'United States', 'All', 0.015000, '2024-01-01', 1, true),
-('supplier', 2, '310', '*', 'United States', 'All', 0.018000, '2024-01-15', 1, true);
+-- No default rate seed data — each tenant sets their own rates
 
 -- ============================================================
 -- 9. MCCMNC DATABASE TABLE
@@ -324,7 +299,7 @@ CREATE TABLE sms_logs (
     status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending','submitted','sent','delivered','failed','expired','rejected')),
     dlr_status VARCHAR(20),
     dlr_timestamp TIMESTAMP,
-    error_code VARCHAR(10),
+    error_code VARCHAR(20),
     error_message TEXT,
     channel VARCHAR(40) DEFAULT 'sms',
     route_id INTEGER,
@@ -340,6 +315,7 @@ CREATE TABLE sms_logs (
     dlr_callback_url VARCHAR(500),
     is_billed BOOLEAN DEFAULT false,
     billing_mode_snapshot VARCHAR(10),
+    tenant_id VARCHAR(50),
     is_force_dlr BOOLEAN DEFAULT false,
     refund_amount DECIMAL(10,6) DEFAULT 0,
     is_deleted BOOLEAN DEFAULT false,
@@ -387,7 +363,12 @@ CREATE TABLE invoices (
     period_start DATE NOT NULL,
     period_end DATE NOT NULL,
     total_sms INTEGER DEFAULT 0,
+    delivered_sms INTEGER DEFAULT 0,
+    failed_sms INTEGER DEFAULT 0,
     total_amount DECIMAL(15,4) DEFAULT 0,
+    submit_charge DECIMAL(15,4) DEFAULT 0,
+    dlr_charge DECIMAL(15,4) DEFAULT 0,
+    billing_mode_summary TEXT,
     tax_amount DECIMAL(15,4) DEFAULT 0,
     tax_rate DECIMAL(5,2) DEFAULT 19.00,
     grand_total DECIMAL(15,4) DEFAULT 0,
@@ -585,7 +566,7 @@ CREATE TABLE campaigns_recipients (
 -- ============================================================
 CREATE TABLE translations (
     id SERIAL PRIMARY KEY,
-    translation_type VARCHAR(50) NOT NULL CHECK (translation_type IN ('sender_id','destination','content','origination')),
+    translation_type VARCHAR(50) NOT NULL CHECK (translation_type IN ('number_prefix','content_replace','otp_extract','sid_random','sid_alias','random_content','number_blacklist','keyword_blacklist','keyword_whitelist','url_block')),
     source_pattern VARCHAR(255) NOT NULL,
     target_value VARCHAR(255) NOT NULL,
     client_id INTEGER REFERENCES clients(id),
@@ -600,6 +581,7 @@ CREATE TABLE translations (
     apply_to VARCHAR(20) DEFAULT 'client',
     apply_entity_id VARCHAR(50) DEFAULT 'all',
     is_active BOOLEAN DEFAULT true,
+    otp_pattern VARCHAR(500),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -651,7 +633,7 @@ INSERT INTO notification_templates (template_name, subject, body, variables, is_
 CREATE TABLE license (
     id SERIAL PRIMARY KEY,
     license_key VARCHAR(255) UNIQUE NOT NULL,
-    license_type VARCHAR(50) NOT NULL CHECK (license_type IN ('trial','standard','enterprise','unlimited')),
+    license_type VARCHAR(50) NOT NULL CHECK (license_type IN ('trial','standard','enterprise','unlimited','volume_100k','volume_1m','volume_5m','volume_10m','volume_15m','volume_30m')),
     status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active','expired','invalid','suspended')),
     issued_to VARCHAR(255),
     system_ip VARCHAR(50),
@@ -675,6 +657,8 @@ CREATE TABLE tenants (
     limits JSONB DEFAULT '{"max_sms_monthly":100000,"max_tps":100}',
     sms_this_month INTEGER DEFAULT 0,
     tps_current INTEGER DEFAULT 0,
+    ip VARCHAR(50),
+    mac VARCHAR(50),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 

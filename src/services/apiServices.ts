@@ -49,6 +49,10 @@ export const smsService = {
   },
 };
 
+// ==================== RATE API (convenience export for ClientRates.tsx) ====================
+export const ratesApi = {
+};
+
 // ==================== RATE MANAGEMENT WITH NOTIFICATION ====================
 export const rateService = {
   // Create rate with auto-notification
@@ -106,9 +110,6 @@ export const rateService = {
   },
 
   // Get rate history with timestamps
-  getRateHistory: async (entity_type: string, entity_id: string, mcc: string, mnc: string) => {
-    return api.get<any[]>(`/rates/history?entity_type=${entity_type}&entity_id=${entity_id}&mcc=${mcc}&mnc=${mnc}`);
-  },
 
   // Send rate change notification to client/supplier
   sendRateNotification: async (entity_type: string, entity_id: string, rate_ids: string[]) => {
@@ -285,9 +286,9 @@ export const voiceOtpService = {
     return api.post<any[]>('/voice-otp/logs', filters);
   },
 
-  // Test voice OTP call
+  // Test voice OTP call — uses /send directly (no separate test endpoint needed)
   testCall: async (data: { destination: string; language: string }) => {
-    return api.post<any>('/voice-otp/test', data);
+    return api.post<any>('/voice-otp/send', data);
   },
 
   // Get language configurations
@@ -323,7 +324,7 @@ export const translationService = {
 
   // Create translation rule
   createTranslation: async (data: {
-    translation_type: 'sender_id' | 'destination' | 'content' | 'origination';
+    translation_type: 'number_prefix' | 'content_replace' | 'otp_extract' | 'sid_random' | 'sid_alias' | 'random_content';
     source_pattern: string;
     target_value: string;
     client_id?: string;

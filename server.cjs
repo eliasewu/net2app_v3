@@ -40,13 +40,47 @@ pg.types.setTypeParser(1015, parsePgArray);
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// ==================== GLOBAL CRASH HANDLERS ====================
+// Catches errors thrown OUTSIDE Express request/response cycle
+// (setInterval callbacks, async IIFEs, unhandled promises).
+// Without these, a single throw in a DLR poller, health check,
+// or queue worker callback crashes the entire Node.js process.
+// PM2 restarts it, but during the restart window (2-5s), all API
+// calls fail → frontend white screens. These handlers log the
+// error and keep the process alive.
+process.on('uncaughtException', (err) => {
+    console.error('[UNCAUGHT]', err.stack || err.message || err);
+    // Exit so PM2 restarts a clean process. Continuing after an
+    // uncaught exception risks corrupted state, leaked connections,
+    // and silently wrong results. A 2-5s restart is safer.
+    process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+    console.error('[UNHANDLED-REJECTION]', reason?.stack || reason?.message || reason);
+});
+
+
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
 app.use(cookieParser());
 
-const { applyRules } = require('./src/services/translationEngine.cjs');
+const { applyRules, checkBlocks } = require('./src/services/translationEngine.cjs');
+const callerIdPool = require('./src/services/callerIdPool.cjs');
+const { execFile } = require('child_process');
+const nodemailer = require('nodemailer');
 
 const voiceOtpUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+
+// ── Pure numeric message ID generator ──
+// Prefixes: '0'=external API/SMPP client, '1'=internal (test_sms/campaign/voice_otp),
+//           '2'=rejected, '3'=MO/GSM inbound, '4'=SMPP server direct, '7'=channel (WhatsApp/Telegram)
+// Format: PREFIX + timestamp(ms) + 5-digit random → ~19-digit pure numeric ID
+function genNumericMsgId(prefix) {
+  const ts = Date.now().toString();
+  const rand = Math.floor(Math.random() * 100000).toString().padStart(5, '0');
+  return (prefix || '0') + ts + rand;
+}
 
 // PRODUCTION-TUNED POOL: 50 connections for 1000+ clients/suppliers
 // idleTimeoutMillis: release idle connections after 30s
@@ -67,6 +101,10 @@ const pool = new Pool({
 // route handler sees it. Only strings containing a decimal point are converted
 // (e.g. "0.022000") to avoid corrupting phone numbers and integer IDs.
 console.error('[INIT] Server starting...');
+
+// Internal message sources — get numeric prefix '1' for distinguishable IDs
+// Also skipped by DLR outbox (only EXTERNAL_DLR_SOURCES trigger DLR push)
+const INTERNAL_SOURCES = ['test_sms', 'campaign', 'voice_otp', 'e2e_test'];
 
 // ============================================================
 // PRODUCTION QUEUE SYSTEM (1000+ clients, 1000+ suppliers)
@@ -89,9 +127,56 @@ let connectionPoolMgr = null;
             batchSize: 100,
             workerCount: 8,
             maxRetries: 5,
+            connectionPoolMgr,
         });
 
         await queueManager.initialize();
+
+        // Wire up inbound supplier delivery via Java SMPP gateway REST bridge.
+        // When the queue manager tries to deliver to an inbound supplier (GSM gateway
+        // behind NAT with no public IP), it calls this callback which POSTs to the
+        // Java gateway's /deliver endpoint. The Java gateway sends submit_sm through
+        // the existing inbound SMPP session.
+        queueManager.onDeliverToInboundSupplier = async (supplierId, job) => {
+            try {
+                const http = require('http');
+                const payload = JSON.stringify({
+                    supplier_id: supplierId,
+                    source_addr: job.sender_id || 'NET2APP',
+                    dest_addr: job.destination,
+                    message: job.message || ''
+                });
+                const result = await new Promise((resolve, reject) => {
+                    const req = http.request({
+                        hostname: '127.0.0.1',
+                        port: 9091,
+                        path: '/deliver',
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+                        timeout: 15000
+                    }, (res) => {
+                        let data = '';
+                        res.on('data', c => data += c);
+                        res.on('end', () => {
+                            if (res.statusCode === 200) {
+                                try { resolve(JSON.parse(data)); } catch { resolve({ success: true }); }
+                            } else {
+                                reject(new Error(`Java gateway returned ${res.statusCode}: ${data}`));
+                            }
+                        });
+                    });
+                    req.on('error', reject);
+                    req.on('timeout', () => { req.destroy(); reject(new Error('Java gateway /deliver timeout')); });
+                    req.write(payload);
+                    req.end();
+                });
+                console.error(`[InboundDeliver] ✓ ${job.message_id}: Delivered via Java gateway to supplier #${supplierId}`);
+                return true;
+            } catch (e) {
+                console.error(`[InboundDeliver] ✗ ${job.message_id}: Failed — ${e.message}`);
+                return false;
+            }
+        };
 
         // Configure rate limiters for existing active clients and suppliers
         const [clients, suppliers] = await Promise.all([
@@ -113,8 +198,8 @@ let connectionPoolMgr = null;
 
         console.error(`[INIT] QueueManager: ${clients.rows.length} clients, ${suppliers.rows.length} suppliers configured`);
 
-        // Start worker pool
-        queueManager.start();
+        // Start worker pool (async — orphan recovery runs before workers)
+        await queueManager.start();
 
         // Periodic health: reconnect broken pipelines every 30s
         setInterval(() => { connectionPoolMgr.healthCheck().catch(() => {}); }, 30000);
@@ -168,6 +253,39 @@ let connectionPoolMgr = null;
                                 [log.id, data?.duration || 0]
                             );
                             console.error(`[DLR-POLL] ✅ ${log.call_id}: DELIVERED (${conn.name})`);
+
+                            // DLR billing via unified applyBilling helper.
+                            // Charges remaining parties whose billing_mode='dlr' only on DELIVRD.
+                            if (log.client_id) {
+                                try {
+                                    const outboxR = await pool.query(
+                                        `SELECT o.billing_mode, o.supplier_billing_mode, o.client_rate, o.supplier_rate, o.supplier_id, o.message_parts, o.message_id
+                                         FROM sms_outbox o
+                                         WHERE o.client_id = $1 AND o.destination = $2
+                                           AND o.completed_at BETWEEN $3 - INTERVAL '10 seconds' AND $3 + INTERVAL '120 seconds'
+                                           AND o.status IN ('submitted','delivered')
+                                         ORDER BY o.completed_at DESC LIMIT 1`,
+                                        [log.client_id, log.destination, log.created_at]
+                                    );
+                                    if (outboxR.rows.length) {
+                                        const clientBillingMode = outboxR.rows[0].billing_mode || 'dlr';
+                                        const supplierBillingMode = outboxR.rows[0].supplier_billing_mode || 'dlr';
+                                        const clientCost = parseFloat(((outboxR.rows[0].client_rate || 0) * (parseInt(outboxR.rows[0].message_parts) || 1)).toFixed(6));
+                                        const supplierCost = parseFloat(((outboxR.rows[0].supplier_rate || 0) * (parseInt(outboxR.rows[0].message_parts) || 1)).toFixed(6));
+                                        await applyBilling({
+                                            messageId: outboxR.rows[0].message_id,
+                                            clientId: log.client_id,
+                                            supplierId: outboxR.rows[0].supplier_id,
+                                            clientCost, supplierCost,
+                                            clientBillingMode, supplierBillingMode,
+                                            isSubmit: false,
+                                            dlrStatus: 'DELIVRD'
+                                        });
+                                    }
+                                } catch (e) {
+                                    console.error(`[DLR-POLL] ⚠ Billing lookup failed for ${log.call_id}: ${e.message}`);
+                                }
+                            }
                         } else if (data?.status === 'failed') {
                             await pool.query(
                                 `UPDATE voice_otp_logs SET dlr_status = 'UNDELIV', status = 'failed',
@@ -175,6 +293,14 @@ let connectionPoolMgr = null;
                                 [log.id, data?.message || 'Delivery failed']
                             );
                             console.error(`[DLR-POLL] ❌ ${log.call_id}: FAILED (${conn.name})`);
+                            // DLR push on Voice OTP failure
+                            if (queueManager && queueManager.onDlr) {
+                                queueManager.onDlr({
+                                    client_id: log.client_id, message_id: log.call_id, destination: log.destination,
+                                    sender_id: '', status: 'UNDELIV', client_code: '', queued_at: log.created_at,
+                                    source: 'voice_otp'
+                                });
+                            }
                         }
                         // If status is 'not_found' or other — leave PENDING for next poll
                     } catch (err) {
@@ -242,6 +368,23 @@ let connectionPoolMgr = null;
                                 [job.message_id, data.call_end || new Date().toISOString()]
                             );
                             console.error(`[DLR-HTTPS] ✅ ${job.message_id}: DELIVERED (${data.call_end || 'N/A'}, ${data.duration || 0}s)`);
+
+                            // DLR billing via unified applyBilling helper.
+                            // Charges remaining parties whose billing_mode='dlr' only on DELIVRD.
+                            const clientBillingMode = job.billing_mode_snapshot || job.billing_mode || 'dlr';
+                            const supplierBillingMode = job.supplier_billing_mode || 'dlr';
+                            const clientDlrCost = parseFloat(((job.client_rate || 0) * (job.message_parts || 1)).toFixed(6));
+                            const supplierDlrCost = parseFloat(((job.supplier_rate || 0) * (job.message_parts || 1)).toFixed(6));
+                            await applyBilling({
+                                messageId: job.message_id,
+                                clientId: job.client_id,
+                                supplierId: job.supplier_id,
+                                clientCost: clientDlrCost,
+                                supplierCost: supplierDlrCost,
+                                clientBillingMode, supplierBillingMode,
+                                isSubmit: false,
+                                dlrStatus: 'DELIVRD'
+                            });
                             
 
                             // Webhook
@@ -252,7 +395,8 @@ let connectionPoolMgr = null;
                             if (queueManager && queueManager.onDlr) {
                                 queueManager.onDlr({
                                     client_id: job.client_id, message_id: job.message_id, destination: job.destination,
-                                    sender_id: job.sender_id, status: 'DELIVRD', client_code: job.client_code, queued_at: job.queued_at
+                                    sender_id: job.sender_id, status: 'DELIVRD', client_code: job.client_code, queued_at: job.queued_at,
+                                    source: job.source || ''
                                 });
                             }
                         } else if (data?.status === 'failed') {
@@ -262,23 +406,34 @@ let connectionPoolMgr = null;
                                 [job.id, data.message || 'Delivery failed']
                             );
                             await pool.query(
-                                `UPDATE sms_logs SET dlr_status = 'UNDELIV', status = 'failed', error_message = $2
+                                `UPDATE sms_logs SET dlr_status = 'UNDELIV', status = 'failed', error_code = 'UNDELIV', error_message = $2
                                  WHERE message_id = $1`,
                                 [job.message_id, data.message || 'Delivery failed']
                             );
                             console.error(`[DLR-HTTPS] ❌ ${job.message_id}: FAILED (${data.message || 'unknown'})`);
+                            // Webhook + DLR push on failure
+                            if (job.webhook_url && queueManager) {
+                                queueManager.sendWebhook(job.webhook_url, job.message_id, job.destination, 'failed', 'UNDELIV', job.client_code).catch(() => {});
+                            }
+                            if (queueManager && queueManager.onDlr) {
+                                queueManager.onDlr({
+                                    client_id: job.client_id, message_id: job.message_id, destination: job.destination,
+                                    sender_id: job.sender_id, status: 'UNDELIV', client_code: job.client_code, queued_at: job.queued_at,
+                                    source: job.source || ''
+                                });
+                            }
                         } else if (data?.status === 'not_found') {
                             // Transaction not found yet — call still in progress.
                             // Keep retrying for up to 3 minutes, then timeout.
                             const ageMs = Date.now() - new Date(job.completed_at || job.queued_at).getTime();
-                            if (ageMs > 180000) {
+                            if (ageMs > 75000) {
                                 await pool.query(
                                     `UPDATE sms_outbox SET dlr_confirmed_at = NOW(), dlr_status = 'UNDELIV', status = 'failed', last_error = $2
                                      WHERE id = $1`,
                                     [job.id, 'DLR timeout after 3 minutes']
                                 );
                                 await pool.query(
-                                    `UPDATE sms_logs SET dlr_status = 'UNDELIV', status = 'failed', error_message = $2
+                                    `UPDATE sms_logs SET dlr_status = 'UNDELIV', status = 'failed', error_code = 'DLR_TIMEOUT', error_message = $2
                                      WHERE message_id = $1`,
                                     [job.message_id, 'DLR timeout after 3 minutes']
                                 );
@@ -290,7 +445,8 @@ let connectionPoolMgr = null;
                                 if (queueManager && queueManager.onDlr) {
                                     queueManager.onDlr({
                                         client_id: job.client_id, message_id: job.message_id, destination: job.destination,
-                                        sender_id: job.sender_id, status: 'UNDELIV', client_code: job.client_code, queued_at: job.queued_at
+                                        sender_id: job.sender_id, status: 'UNDELIV', client_code: job.client_code, queued_at: job.queued_at,
+                                        source: job.source || ''
                                     });
                                 }
                             }
@@ -304,60 +460,1150 @@ let connectionPoolMgr = null;
             } catch (e) {
                 console.error('[DLR-HTTPS] Error in DLR polling cycle:', e.message);
             }
-        }, 5000);
+        }, 4000);
 
-        console.error('[INIT] HTTP connector DLR polling started — checks delivery status every 30s');
+        console.error('[INIT] HTTP connector DLR polling started — checks delivery status every 4s (75s timeout)');
 
         console.error('[INIT] Production queue system READY — 8 workers, 100 batch, token-bucket rate limiting');
 
+        // ======== DLR OUTBOX: stores pending DLRs for external client delivery ========
+        // External SMPP clients bind to the Java Gateway (port 2775), which holds
+        // their TCP connections. Node.js handles routing + DLR polling but cannot
+        // directly push deliver_sm to Java Gateway sessions. This outbox bridges
+        // the gap: DLRs are written here, then delivered via:
+        //   1. Webhook (if client has webhook_url configured)
+        //   2. Marked for Java Gateway SMPP push (polled by a future Java-side poller)
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS dlr_outbox (
+                id BIGSERIAL PRIMARY KEY,
+                message_id VARCHAR(100) UNIQUE NOT NULL,
+                entity_type VARCHAR(20) DEFAULT 'client',
+                entity_id INTEGER,
+                client_id INTEGER,
+                client_code VARCHAR(50),
+                destination VARCHAR(50),
+                sender_id VARCHAR(100),
+                status VARCHAR(20) NOT NULL,
+                dlr_receipt TEXT,
+                submit_time TIMESTAMP,
+                webhook_url TEXT,
+                webhook_sent BOOLEAN DEFAULT false,
+                smpp_pushed BOOLEAN DEFAULT false,
+                created_at TIMESTAMP DEFAULT NOW(),
+                completed_at TIMESTAMP
+            );
+            ALTER TABLE dlr_outbox ADD COLUMN IF NOT EXISTS entity_type VARCHAR(20) DEFAULT 'client';
+            ALTER TABLE dlr_outbox ADD COLUMN IF NOT EXISTS entity_id INTEGER;
+            ALTER TABLE dlr_outbox ALTER COLUMN client_id DROP NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_dlr_outbox_pending ON dlr_outbox(completed_at) WHERE completed_at IS NULL;
+        `).catch(() => {});
 
-        // ======== HTTP SUPPLIER HEALTH CHECK ========
-        // Pings all active HTTP suppliers' api_url every 60s.
-        // Updates bind_status (bound/unbound) and consecutive_failures
-        // so BindStatus, APIConnectors, and SMS routing all see real status.
+        // Wire DLR callback: stores pending DLRs for delivery to EXTERNAL clients only.
+        // WHITELIST approach: only push DLR for external sources.
+        // Internal sources (test_sms, campaign, voice_otp, e2e_test) — DLR stays in sms_logs only.
+        // Source is passed by callers — no extra DB query needed.
+        const EXTERNAL_DLR_SOURCES = ['smpp_client', 'external_api', 'smpp_esme', 'smpp'];
+
+        queueManager.onDlr = async (job) => {
+            try {
+                // Determine originator: client or supplier
+                let entityType = 'client';
+                let entityId = job.client_id;
+                let entityCode = job.client_code || '';
+                let webhookUrl = '';
+
+                if (!job.client_id) {
+                    // No client — check if this was supplier-originated
+                    try {
+                        const outboxR = await pool.query(
+                            `SELECT supplier_id, supplier_code FROM sms_outbox
+                             WHERE message_id = $1 AND supplier_id IS NOT NULL
+                             LIMIT 1`,
+                            [job.message_id]
+                        );
+                        if (outboxR.rows.length > 0 && outboxR.rows[0].supplier_id) {
+                            entityType = 'supplier';
+                            entityId = outboxR.rows[0].supplier_id;
+                            entityCode = outboxR.rows[0].supplier_code || '';
+                            // Suppliers don't have webhooks — SMPP delivery only
+                        } else {
+                            // Neither client nor supplier originator — internal DLR, skip push
+                            console.error(`[DLR-OUTBOX] 🔒 Skipping DLR ${job.message_id} → ${job.status} (no client or supplier originator)`);
+                            return;
+                        }
+                    } catch (e) {
+                        console.error(`[DLR-OUTBOX] ⚠ Originator lookup failed for ${job.message_id}: ${e.message} — storing as undeliverable`);
+                        // Store anyway so DLR isn't lost — Java Gateway will try delivery or mark as dead
+                        entityType = 'client';
+                        entityId = 0;
+                        entityCode = 'unknown';
+                    }
+                }
+
+                // WHITELIST: Only push DLR for external client sources.
+                // Supplier-originated messages ALWAYS get DLR pushed (they are external SMPP clients).
+                const messageSource = job.source || '';
+                if (entityType === 'client' && !EXTERNAL_DLR_SOURCES.includes(messageSource)) {
+                    console.error(`[DLR-OUTBOX] 🔒 Internal DLR (${messageSource || 'unknown'}): ${job.message_id} → ${job.status} (no external push)`);
+                    return;
+                }
+
+                // External client SMS — push DLR via webhook + SMPP
+                // Look up webhook URL only for client-type entities
+                if (entityType === 'client') {
+                    const clientR = await pool.query(
+                        'SELECT webhook_url FROM clients WHERE id = $1 LIMIT 1',
+                        [entityId]
+                    );
+                    webhookUrl = clientR.rows[0]?.webhook_url || '';
+                }
+                const receipt = `id:${job.message_id} sub:001 dlvrd:001 submit date:${new Date().toISOString().slice(0,16).replace(/[-:T]/g,'')} done date:${new Date().toISOString().slice(0,16).replace(/[-:T]/g,'')} stat:${job.status} err:000 text:${job.status === 'DELIVRD' ? 'Delivery success' : 'Delivery failed'}`;
+                let webhookSent = false;
+
+                // 1. Send webhook immediately if configured
+                if (webhookUrl) {
+                    try {
+                        await fetch(webhookUrl, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                message_id: job.message_id,
+                                destination: job.destination,
+                                status: job.status,
+                                dlr_receipt: receipt,
+                                timestamp: new Date().toISOString()
+                            }),
+                            signal: AbortSignal.timeout(5000)
+                        });
+                        webhookSent = true;
+                        console.error(`[DLR-OUTBOX] 📤 Webhook DLR sent to client ${job.client_code}: ${job.message_id} → ${job.status}`);
+                    } catch (e) {
+                        console.error(`[DLR-OUTBOX] ⚠ Webhook failed for ${job.message_id}: ${e.message}`);
+                    }
+                }
+
+                // 2. Store in dlr_outbox for SMPP push (Java Gateway polls this)
+                await pool.query(
+                    `INSERT INTO dlr_outbox (message_id, entity_type, entity_id, client_id, client_code, destination, sender_id, status, dlr_receipt, submit_time, webhook_url, webhook_sent)
+                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                     ON CONFLICT (message_id) DO UPDATE SET entity_type = EXCLUDED.entity_type, entity_id = EXCLUDED.entity_id, webhook_sent = EXCLUDED.webhook_sent`,
+                    [job.message_id, entityType, entityId, entityType === 'client' ? entityId : null, entityCode, job.destination, job.sender_id, job.status, receipt, job.submit_time || job.queued_at, webhookUrl, webhookSent]
+                );
+                console.error(`[DLR-OUTBOX] 📝 DLR stored: ${job.message_id} → ${job.status} (${entityType}=${entityCode}, source=${messageSource}, webhook=${webhookSent ? 'sent' : 'none'})`);
+            } catch (e) {
+                console.error(`[DLR-OUTBOX] ⚠ Failed to store DLR for ${job.message_id}: ${e.message}`);
+            }
+        };
+        console.error('[INIT] DLR outbox ready — webhook delivery + SMPP queue for Java Gateway');
+
+        // Wire SMPP DLR callback: when smppClient.mjs receives deliver_sm from a supplier,
+        // it updates sms_outbox + sms_logs directly, then forwards DLR here for external push
+        // (webhook + SMPP via dlr_outbox + Java Gateway).
+        if (connectionPoolMgr && typeof connectionPoolMgr.setDlrCallback === 'function') {
+            connectionPoolMgr.setDlrCallback((dlr) => {
+                if (queueManager && queueManager.onDlr) {
+                    queueManager.onDlr(dlr).catch(e =>
+                        console.error('[SMPP-DLR] DLR callback failed:', e.message));
+                }
+            });
+            console.error('[INIT] SMPP DLR callback wired → real-time sms_logs updates + external client DLR push');
+        }
+
+        // ======== REAL-TIME DLR PUSHER ========
+        // Polls dlr_outbox every 5s and pushes DLRs to external clients:
+        //   1. Webhook — immediate push for clients with webhook_url
+        //   2. SMPP — stored for Java Gateway to push deliver_sm to connected clients
         setInterval(async () => {
             try {
-                const httpSuppliers = await pool.query(
-                    `SELECT id, supplier_code, api_url, bind_status, consecutive_failures
-                     FROM suppliers
-                     WHERE connection_type = 'http'
-                       AND status = 'active'
-                       AND (is_deleted IS NULL OR is_deleted = false)
-                       AND api_url IS NOT NULL`
+                const pending = await pool.query(
+                    `SELECT * FROM dlr_outbox WHERE completed_at IS NULL ORDER BY created_at ASC LIMIT 30`
                 );
-                for (const s of httpSuppliers.rows) {
+                if (!pending.rows.length) return;
+
+                for (const dlr of pending.rows) {
+                    let delivered = false;
+                    let smppQueued = false;
                     try {
-                        const ctrl = new AbortController();
-                        const timer = setTimeout(() => ctrl.abort(), 5000);
-                        const resp = await fetch(s.api_url, {
-                            method: 'GET',
-                            signal: ctrl.signal,
-                            headers: { 'User-Agent': 'NET2APP-HealthCheck/1.0' }
-                        });
-                        clearTimeout(timer);
-                        // Always keep suppliers bound — never mark as unbound.
-                        // Health check is informational only: logs reachability
-                        // and resets failure counters on success.
-                        if (resp.ok || resp.status < 500) {
-                            // Reachable — reset failures, ensure bound (only if needed)
+                        // 1. Retry webhook if not yet sent and client has webhook_url
+                        if (!dlr.webhook_sent && dlr.webhook_url) {
+                            try {
+                                await fetch(dlr.webhook_url, {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({
+                                        message_id: dlr.message_id,
+                                        destination: dlr.destination,
+                                        status: dlr.status,
+                                        dlr_receipt: dlr.dlr_receipt,
+                                        timestamp: new Date().toISOString()
+                                    }),
+                                    signal: AbortSignal.timeout(5000)
+                                });
+                                await pool.query(
+                                    'UPDATE dlr_outbox SET webhook_sent = true WHERE id = $1',
+                                    [dlr.id]
+                                ).catch(() => {});
+                                console.error(`[DLR-PUSH] 📤 Webhook retry OK: ${dlr.message_id} → ${dlr.client_code}`);
+                                delivered = true;
+                            } catch (e) {
+                                // webhook still unreachable, retry next cycle
+                            }
+                        }
+
+                        // 2. SMPP DLR push — check if entity has active session via Java Gateway
+                        // Checks both client and supplier sessions.
+                        const dlrAgeMs = Date.now() - new Date(dlr.created_at).getTime();
+                        const smppStale = dlrAgeMs > 60000 && !dlr.smpp_pushed;
+                        const entType = dlr.entity_type || 'client';
+                        const entId = dlr.entity_id || dlr.client_id;
+
+                        if (!dlr.smpp_pushed && !smppStale && entId) {
+                            const sessionR = await pool.query(
+                                `SELECT id FROM smpp_sessions
+                                 WHERE entity_type = $1
+                                   AND entity_id = $2
+                                   AND status = 'bound'
+                                 LIMIT 1`,
+                                [entType, entId]
+                            );
+                            if (sessionR.rows.length > 0) {
+                                smppQueued = true;
+                                console.error(`[DLR-PUSH] 📡 SMPP DLR queued for Java Gateway: ${dlr.message_id} → ${dlr.client_code} (${entType} session active)`);
+                            }
+                        }
+
+                        // If SMPP is stale (>60s) and client has webhook_url, fall back to webhook
+                        if (smppStale && !dlr.webhook_sent && dlr.webhook_url) {
+                            console.error(`[DLR-PUSH] ⏰ SMPP stale after ${Math.round(dlrAgeMs/1000)}s — falling back to webhook: ${dlr.message_id} → ${dlr.client_code}`);
+                            try {
+                                await fetch(dlr.webhook_url, {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({
+                                        message_id: dlr.message_id,
+                                        destination: dlr.destination,
+                                        status: dlr.status,
+                                        dlr_receipt: dlr.dlr_receipt,
+                                        timestamp: new Date().toISOString()
+                                    }),
+                                    signal: AbortSignal.timeout(5000)
+                                });
+                                await pool.query(
+                                    'UPDATE dlr_outbox SET webhook_sent = true WHERE id = $1',
+                                    [dlr.id]
+                                ).catch(() => {});
+                                delivered = true;
+                                console.error(`[DLR-PUSH] 📤 Webhook fallback OK: ${dlr.message_id} → ${dlr.client_code}`);
+                            } catch (e) {
+                                console.error(`[DLR-PUSH] ⚠ Webhook fallback failed for ${dlr.message_id}: ${e.message}`);
+                            }
+                        }
+
+                        // 3. Mark completed if webhook delivered successfully
+                        if (delivered && !dlr.smpp_pushed) {
                             await pool.query(
-                                `UPDATE suppliers SET bind_status = 'bound', consecutive_failures = 0, updated_at = NOW()
-                                 WHERE id = $1 AND (bind_status != 'bound' OR consecutive_failures != 0)`,
+                                'UPDATE dlr_outbox SET completed_at = NOW() WHERE id = $1',
+                                [dlr.id]
+                            ).catch(() => {});
+                            console.error(`[DLR-PUSH] ✅ DLR completed (webhook): ${dlr.message_id}`);
+                        }
+
+                        // 4. Timeout: if DLR is older than 24h and undeliverable, mark complete.
+                        // NEVER set smpp_pushed=true — the Java Gateway handles SMPP delivery
+                        // and polls dlr_outbox WHERE smpp_pushed=false. Setting it prematurely
+                        // would permanently block the SMPP client from ever receiving the DLR.
+                        const ageMs = Date.now() - new Date(dlr.created_at).getTime();
+                        const TIMEOUT_MS = 24 * 60 * 60 * 1000; // 24 hours
+                        if (ageMs > TIMEOUT_MS && !delivered && !smppQueued && !dlr.completed_at) {
+                            // Only set completed_at — leave smpp_pushed=false for Java Gateway
+                            await pool.query(
+                                'UPDATE dlr_outbox SET completed_at = NOW() WHERE id = $1',
+                                [dlr.id]
+                            ).catch(() => {});
+                            console.error(`[DLR-PUSH] ⏰ DLR stale after ${Math.round(ageMs/3600000)}h: ${dlr.message_id} (marked complete, SMPP push still queued for Java Gateway)`);
+                        }
+                    } catch (e) {
+                        console.error(`[DLR-PUSH] ⚠ ${dlr.message_id}: ${e.message}`);
+                    }
+                }
+            } catch (e) {
+                // Silently skip on error, retry next cycle
+            }
+        }, 5000);
+
+        console.error('[INIT] Real-time DLR pusher started — pushes webhooks every 5s, queues SMPP for Java Gateway');
+
+
+        // ======== UNIVERSAL SUPPLIER HEALTH MONITOR ========
+        // Runs every 30s. Checks ALL active suppliers regardless of connection_type.
+        // Updates bind_status (bound/unbound) and consecutive_failures in real time.
+        // Routes skip unbound suppliers (see resolveRoute below).
+        // Auto-blocks at 20 consecutive failures → status='inactive', bind_status='unbound'.
+
+        // ======== AUTO-BLOCK ALERT NOTIFICATION ========
+        // Called when a supplier is auto-blocked at 20 consecutive failures.
+        // Sends: 1) Email via SMTP config  2) Webhook via platform_settings alert_webhook_url  3) In-app notification
+        async function sendAutoBlockAlert(supplier) {
+            try {
+                const now = new Date().toISOString();
+                const alertMsg = `Supplier ${supplier.supplier_code} (${supplier.company_name || supplier.supplier_code}) was AUTO-BLOCKED to status=inactive after ${supplier.consecutive_failures} consecutive failures. Type: ${supplier.connection_type}.`;
+                let emailSent = false, webhookSent = false;
+
+                // 1. Email via SMTP config
+                try {
+                    const smtpR = await pool.query("SELECT * FROM smtp_config WHERE is_active = true AND from_email != '' AND username != '' LIMIT 1");
+                    if (smtpR.rows.length > 0) {
+                        const smtp = smtpR.rows[0];
+                        // Find admin email from platform_settings or users table
+                        const adminR = await pool.query("SELECT value FROM platform_settings WHERE key = 'admin_email' LIMIT 1");
+                        const adminEmail = adminR.rows[0]?.value || smtp.from_email;
+                        const transporter = nodemailer.createTransport({
+                            host: smtp.host,
+                            port: parseInt(smtp.port) || 587,
+                            secure: smtp.encryption === 'ssl',
+                            auth: { user: smtp.username, pass: smtp.password },
+                        });
+                        await transporter.sendMail({
+                            from: `"${smtp.from_name || 'NET2APP'}" <${smtp.from_email}>`,
+                            to: adminEmail,
+                            subject: `🚫 AUTO-BLOCKED: ${supplier.supplier_code}`,
+                            text: `${alertMsg}\n\nTime: ${now}\nSupplier ID: ${supplier.id}\nConnection: ${supplier.connection_type}\n\nAction required: Check connectivity and reactivate from the Suppliers page.`,
+                        });
+                        emailSent = true;
+                        console.error(`[ALERT] 📧 Email sent to ${adminEmail}: ${supplier.supplier_code} auto-blocked`);
+                    }
+                } catch (e) {
+                    console.error(`[ALERT] ⚠ Email failed: ${e.message}`);
+                }
+
+                // 2. Webhook via platform_settings
+                try {
+                    const whR = await pool.query("SELECT value FROM platform_settings WHERE key = 'alert_webhook_url' LIMIT 1");
+                    const whUrl = whR.rows[0]?.value;
+                    if (whUrl) {
+                        await fetch(whUrl, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                event: 'supplier_auto_blocked',
+                                supplier_id: supplier.id,
+                                supplier_code: supplier.supplier_code,
+                                connection_type: supplier.connection_type,
+                                consecutive_failures: supplier.consecutive_failures,
+                                timestamp: now,
+                            }),
+                            signal: AbortSignal.timeout(5000),
+                        });
+                        webhookSent = true;
+                        console.error(`[ALERT] 📡 Webhook sent: ${supplier.supplier_code} auto-blocked`);
+                    }
+                } catch (e) {
+                    console.error(`[ALERT] ⚠ Webhook failed: ${e.message}`);
+                }
+
+                // 3. In-app notification
+                try {
+                    await pool.query(
+                        `INSERT INTO notifications (title, message, type, is_read, created_at)
+                         VALUES ($1, $2, 'alert', false, NOW())`,
+                        [`Supplier Auto-Blocked: ${supplier.supplier_code}`, alertMsg]
+                    );
+                } catch (e) {
+                    console.error(`[ALERT] ⚠ In-app notification failed: ${e.message}`);
+                }
+
+                if (emailSent || webhookSent) {
+                    console.error(`[ALERT] ✅ Auto-block notification for ${supplier.supplier_code}: email=${emailSent} webhook=${webhookSent}`);
+                }
+            } catch (e) {
+                console.error(`[ALERT] ❌ sendAutoBlockAlert failed: ${e.message}`);
+            }
+        }
+
+        setInterval(async () => {
+            try {
+                const allSuppliers = await pool.query(
+                    `SELECT id, supplier_code, company_name, connection_type, is_inbound, api_url,
+                            smpp_host, smpp_port, bind_status, consecutive_failures
+                     FROM suppliers
+                     WHERE status = 'active'
+                       AND (is_deleted IS NULL OR is_deleted = false)`
+                );
+                for (const s of allSuppliers.rows) {
+                    let healthy = false;
+                    try {
+                        const connType = (s.connection_type || '').toLowerCase();
+
+                        if (connType === 'smpp' && s.is_inbound) {
+                            // Inbound SMPP (GSM gateway) — check smpp_sessions for bound + recent activity.
+                            // Java Gateway updates last_activity on every enquire_link and submit_sm.
+                            const sessR = await pool.query(
+                                `SELECT last_activity FROM smpp_sessions
+                                 WHERE entity_type='supplier' AND entity_id=$1
+                                   AND status='bound'
+                                   AND last_activity > NOW() - INTERVAL '120 seconds'
+                                 LIMIT 1`,
                                 [s.id]
                             );
+                            healthy = sessR.rows.length > 0;
+
+                        } else if (connType === 'smpp' && !s.is_inbound) {
+                            // Outbound SMPP — check smpp_sessions (reliable, synced on every bind/unbind).
+                            // Pipeline isConnected can go stale, but smppClient.mjs syncs
+                            // smpp_sessions on every connect/disconnect event.
+                            const sessR = await pool.query(
+                                `SELECT status FROM smpp_sessions
+                                 WHERE entity_type='supplier' AND entity_id=$1
+                                   AND status='bound'
+                                   AND last_activity > NOW() - INTERVAL '120 seconds'
+                                 LIMIT 1`,
+                                [s.id]
+                            );
+                            healthy = sessR.rows.length > 0;
+
+                        } else if (connType === 'http' && s.api_url) {
+                            // HTTP supplier — active means bound (no health ping penalty)
+                            healthy = true;
+
+                        } else if (connType === 'voice_otp') {
+                            // Voice OTP — active means bound (call outcomes / DLR polling handle real status)
+                            healthy = true;
+
+                        } else if (['rcs', 'ott', 'whatsapp', 'telegram'].includes(connType)) {
+                            // RCS/OTT — active means bound (device sessions handle real connectivity)
+                            healthy = true;
+
+                        } else if (['flash_sms', 'whatsapp_business', 'telegram_business'].includes(connType)) {
+                            // Flash SMS / WhatsApp Business / Telegram Business — active means bound
+                            healthy = true;
+
                         } else {
-                            console.error(`[HTTP-HEALTH] ⚠ ${s.supplier_code} returned HTTP ${resp.status} — supplier stays bound`);
+                            // Unknown/unspecified type — treat as HTTP if api_url exists, else skip
+                            if (s.api_url) {
+                                try {
+                                    const ctrl = new AbortController();
+                                    const timer = setTimeout(() => ctrl.abort(), 5000);
+                                    const resp = await fetch(s.api_url, {
+                                        method: 'GET', signal: ctrl.signal,
+                                        headers: { 'User-Agent': 'NET2APP-HealthCheck/1.0' }
+                                    });
+                                    clearTimeout(timer);
+                                    healthy = resp.ok || resp.status < 500;
+                                } catch (err) { /* stays unhealthy */ }
+                            } else {
+                                // No health check mechanism — leave bind_status as-is
+                                continue;
+                            }
+                        }
+
+                        // Apply health result
+                        if (healthy) {
+                            // Reset failures, ensure bound
+                            if (s.bind_status !== 'bound' || s.consecutive_failures > 0) {
+                                await pool.query(
+                                    `UPDATE suppliers SET bind_status='bound',
+                                     consecutive_failures=0, updated_at=NOW() WHERE id=$1`,
+                                    [s.id]
+                                );
+                                console.error(`[HEALTH] ✅ ${s.supplier_code}: Recovered → bound (was ${s.bind_status})`);
+                            }
+                        } else if (connType === 'smpp' || s.is_inbound) {
+                            // SMPP + inbound GSM gateways — never penalize.
+                            // Keep bind_status as-is. The /api/bind/status endpoint
+                            // reflects real-time smpp_sessions state via LEFT JOIN.
+                            // No failure increment, no auto-block.
+                        } else {
+                            // Unhealthy — increment failures atomically
+                            const updR = await pool.query(
+                                `UPDATE suppliers SET
+                                 consecutive_failures = consecutive_failures + 1,
+                                 bind_status = CASE WHEN consecutive_failures + 1 >= 3 THEN 'unbound' ELSE bind_status END,
+                                 updated_at = NOW()
+                                 WHERE id=$1
+                                 RETURNING consecutive_failures, bind_status`,
+                                [s.id]
+                            );
+                            if (updR.rows.length) {
+                                const newFails = parseInt(updR.rows[0].consecutive_failures);
+                                const newBind = updR.rows[0].bind_status;
+                                if (newBind === 'unbound' && s.bind_status === 'bound') {
+                                    console.error(`[HEALTH] ❌ ${s.supplier_code}: Unbound after ${newFails} failures`);
+                                }
+                                // Auto-block at 20 consecutive failures
+                                if (newFails >= 20) {
+                                    await pool.query(
+                                        `UPDATE suppliers SET status='inactive',
+                                         bind_status='unbound', updated_at=NOW() WHERE id=$1 AND status='active'`,
+                                        [s.id]
+                                    );
+                                    console.error(`[HEALTH] 🚫 ${s.supplier_code}: AUTO-BLOCKED — ${newFails} consecutive failures → status=inactive`);
+                                    // Send alert notification to admins (use newFails for correct count)
+                                    sendAutoBlockAlert({...s, consecutive_failures: newFails}).catch(
+                                        e => console.error('[ALERT] Failed to send auto-block notification:', e.message)
+                                    );
+                                }
+                            }
                         }
                     } catch (err) {
-                        console.error(`[HTTP-HEALTH] ⚠ ${s.supplier_code} unreachable: ${err.message} — supplier stays bound`);
+                        // Individual supplier check failed — skip, retry next cycle
                     }
                 }
             } catch (e) {
                 // Silently skip cycle on error, retry next interval
             }
+        }, 30000);
+
+        console.error('[INIT] Universal supplier health monitor started — checks ALL types every 30s, auto-blocks at 20 failures');
+
+        // ======== SMPP MESSAGE RELAY POLLER ========
+        // The Java SMPP Gateway's Database.insertSmsLog() only does a bare INSERT
+        // into sms_logs (no routing, no supplier, no delivery). This poller picks
+        // up unrouted SMPP messages and routes them through the full pipeline:
+        // resolveRoute → applyTranslations → rate/profit check → enqueue.
+        setInterval(async () => {
+            try {
+                const unrouted = await pool.query(
+                    `SELECT * FROM sms_logs
+                     WHERE source = 'smpp'
+                       AND error_code IS NULL
+                       AND status = 'submitted'
+                       AND (supplier_id IS NULL
+                            OR (supplier_id IS NOT NULL AND client_id IS NULL))
+                     ORDER BY submit_time ASC
+                     LIMIT 20`
+                );
+                if (!unrouted.rows.length) return;
+
+                for (const log of unrouted.rows) {
+                    try {
+                        // Reject messages where destination is a server IP.
+                        // Safety net: the Java Gateway now validates this at entry,
+                        // but legacy messages may still exist in the DB.
+                        const dest = String(log.destination || '');
+                        if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(dest)) {
+                            await pool.query(
+                                `UPDATE sms_logs SET error_code = 'INVALID_DEST',
+                                 error_message = 'Destination is server IP, not a phone number',
+                                 status = 'rejected' WHERE id = $1`,
+                                [log.id]
+                            );
+                            console.error(`[SMPP-RELAY] 🚫 ${log.message_id}: Rejected — destination is server IP (${dest})`);
+                            continue;
+                        }
+
+                        let client = null;
+
+                        // INBOUND SUPPLIER ROUTING: When a GSM gateway sends submit_sm TO us,
+                        // we need to find the right client by matching the destination number.
+                        // Look up MCC/MNC → find client with active rate for that MCC/MNC.
+                        if (log.supplier_id && !log.client_id) {
+                            // 1. Look up MCC/MNC from destination number (same logic as resolveRoute)
+                            let dstMcc = '', dstMnc = '', dstOperator = '', dstCountry = '';
+                            try {
+                                const dest = String(log.destination).replace(/^\+/, '');
+                                for (let len = 6; len >= 1; len--) {
+                                    const prefix = dest.substring(0, len);
+                                    const mccR = await pool.query(
+                                        'SELECT mcc, mnc, country, operator FROM mccmnc WHERE calling_code = $1 AND (is_deleted IS NULL OR is_deleted = false) LIMIT 1',
+                                        [prefix]
+                                    );
+                                    if (mccR.rows.length) {
+                                        dstMcc = mccR.rows[0].mcc; dstMnc = mccR.rows[0].mnc;
+                                        dstOperator = mccR.rows[0].operator || '';
+                                        dstCountry = mccR.rows[0].country || '';
+                                        break;
+                                    }
+                                }
+                            } catch (e) { /* MCC lookup failed, dstMcc stays empty */ }
+
+                            // 2. Find a client with an active rate for this MCC/MNC
+                            // Prefer clients with a routing plan, then fall back to any active client with rates
+                            if (dstMcc) {
+                                const clientMatchR = await pool.query(
+                                    `SELECT c.* FROM clients c
+                                     INNER JOIN rates r ON r.entity_type='client' AND r.entity_id=c.id
+                                     WHERE (r.mcc = $1 OR r.mcc = '*') AND r.is_active=true
+                                       AND c.status='active' AND (c.is_deleted IS NULL OR c.is_deleted=false)
+                                     ORDER BY CASE WHEN r.mnc = $2 THEN 0 WHEN r.mnc = '*' THEN 1 ELSE 2 END,
+                                              r.rate ASC
+                                     LIMIT 1`,
+                                    [dstMcc, dstMnc || null]
+                                );
+                                if (clientMatchR.rows.length) {
+                                    client = clientMatchR.rows[0];
+                                    // Update sms_logs with the resolved client for future reference
+                                    await pool.query(
+                                        `UPDATE sms_logs SET client_id = $1, client_code = $2,
+                                         mcc = $3, mnc = $4, operator = $5, country = $6
+                                         WHERE id = $7`,
+                                        [client.id, client.client_code, dstMcc, dstMnc,
+                                         dstOperator, dstCountry, log.id]
+                                    );
+                                    log.client_id = client.id;
+                                    log.client_code = client.client_code;
+                                    console.error(`[SMPP-RELAY] 🔀 Inbound routing: ${log.message_id} → client ${client.client_code} (mcc=${dstMcc} mnc=${dstMnc})`);
+                                }
+                            }
+
+                            if (!client) {
+                                await pool.query(
+                                    `UPDATE sms_logs SET error_code = 'INBOUND_NO_CLIENT',
+                                     error_message = 'No client with rates for destination MCC/MNC',
+                                     status = 'failed' WHERE id = $1`,
+                                    [log.id]
+                                );
+                                console.error(`[SMPP-RELAY] ❌ ${log.message_id}: Inbound — no client matches destination ${log.destination} (mcc=${dstMcc || '?'})`);
+                                await pushInboundSupplierDlr(log, 'INBOUND_NO_CLIENT', 'No client with rates for this destination');
+                                continue;
+                            }
+                        } else {
+                            // Normal client-originated message — look up client by ID
+                            const clientR = await pool.query(
+                                'SELECT * FROM clients WHERE id = $1 AND status = $2 AND (is_deleted IS NULL OR is_deleted = false)',
+                                [log.client_id, 'active']
+                            );
+                            if (!clientR.rows.length) {
+                                await pool.query(
+                                    `UPDATE sms_logs SET error_code = 'CLIENT_NOT_FOUND',
+                                     error_message = 'Client not found or inactive', status = 'failed'
+                                     WHERE id = $1`,
+                                    [log.id]
+                                );
+                                console.error(`[SMPP-RELAY] ❌ ${log.message_id}: Client #${log.client_id} not active`);
+                                await pushInboundSupplierDlr(log, 'CLIENT_NOT_FOUND', 'Client not found or inactive');
+                                continue;
+                            }
+                            client = clientR.rows[0];
+                        }
+
+                        // Resolve route (MCC/MNC → supplier, trunk, supplier_rate)
+                        // Note: resolveRoute does NOT return client_rate — we look that up separately
+                        const route = await resolveRoute(client, log.destination);
+                        if (!route || !route.supplier_id) {
+                            await pool.query(
+                                `UPDATE sms_logs SET error_code = 'NO_ROUTE',
+                                 error_message = 'No matching supplier for destination',
+                                 mcc = $2, mnc = $3, operator = $4, country = $5, status = 'failed'
+                                 WHERE id = $1`,
+                                [log.id, route?.mcc || '', route?.mnc || '', route?.operator || '', route?.country || '']
+                            );
+                            console.error(`[SMPP-RELAY] ❌ ${log.message_id}: No route for ${log.destination}`);
+                            await pushInboundSupplierDlr(log, 'NO_ROUTE', 'No matching supplier for destination');
+                            continue;
+                        }
+
+                        // Look up client rate (resolveRoute only returns supplier_rate)
+                        const clientRateR = await pool.query(
+                            `SELECT rate FROM rates WHERE entity_type='client' AND entity_id=$1
+                             AND (mcc = $2 OR mcc = '*') AND is_active=true
+                             ORDER BY CASE WHEN mnc = $3 THEN 0 WHEN mnc = '*' THEN 1 ELSE 2 END, rate ASC LIMIT 1`,
+                            [log.client_id, route.mcc || null, route.mnc || null]
+                        );
+                        // NO_RATE gate — client must have a rate configured for this MCC/MNC
+                        if (!clientRateR.rows.length || !(clientRateR.rows[0].rate > 0)) {
+                            await pool.query(
+                                `UPDATE sms_logs SET error_code = 'NO_RATE',
+                                 error_message = 'No client rate for this MCC/MNC',
+                                 mcc = $2, mnc = $3, operator = $4, country = $5, status = 'failed'
+                                 WHERE id = $1`,
+                                [log.id, route.mcc || '', route.mnc || '', route.operator || '', route.country || '']
+                            );
+                            console.error(`[SMPP-RELAY] ❌ ${log.message_id}: No client rate for mcc=${route.mcc} mnc=${route.mnc}`);
+                            await pushInboundSupplierDlr(log, 'NO_RATE', 'No client rate for this MCC/MNC');
+                            continue;
+                        }
+                        const clientRate = parseFloat(clientRateR.rows[0].rate);
+                        const supplierRate = parseFloat(route.supplier_rate || 0);
+                        const profit = parseFloat((clientRate - supplierRate).toFixed(6));
+
+                        // Profit gate — skip if client rate ≤ supplier rate (unless both are 0 = default route)
+                        if (profit <= 0 && supplierRate > 0) {
+                            await pool.query(
+                                `UPDATE sms_logs SET error_code = 'NO_PROFIT',
+                                 error_message = 'Client rate ≤ supplier rate',
+                                 mcc = $2, mnc = $3, operator = $4, country = $5,
+                                 route_name = $6, trunk_name = $7, status = 'failed'
+                                 WHERE id = $1`,
+                                [log.id, route.mcc || '', route.mnc || '', route.operator || '', route.country || '',
+                                 route.route_name || '', route.trunk_name || '']
+                            );
+                            console.error(`[SMPP-RELAY] ❌ ${log.message_id}: No profit — client=€${clientRate} ≤ supplier=€${supplierRate}`);
+                            await pushInboundSupplierDlr(log, 'NO_PROFIT', 'Client rate ≤ supplier rate');
+                            continue;
+                        }
+
+                        // Apply translations (number prefix, content replace, SID alias)
+                        const origSender = log.sender_id || client.smpp_username || '';
+                        const translated = await applyTranslations(
+                            log.client_id, route.supplier_id,
+                            log.destination, origSender, log.message
+                        );
+
+                        // Check OTP extract translation blocking: Voice OTP suppliers require numeric codes.
+                        // Text-only messages like "Browser verify test" are rejected before routing.
+                        // Only block for Voice OTP suppliers — standard SMS suppliers don't need OTP extraction.
+                        if (translated.blocked) {
+                            const isVoiceOtpSupplier = route.supplier_id
+                                ? (await pool.query('SELECT connection_type FROM suppliers WHERE id=$1', [route.supplier_id])).rows[0]?.connection_type === 'voice_otp'
+                                : false;
+                            if (isVoiceOtpSupplier) {
+                                await pool.query(
+                                    `UPDATE sms_logs SET error_code = 'OTP_EXTRACT_FAILED',
+                                     error_message = $2, status = 'rejected'
+                                     WHERE id = $1`,
+                                    [log.id, translated.block_reason || 'No numeric OTP code found']
+                                );
+                                console.error(`[SMPP-RELAY] 🚫 ${log.message_id}: OTP EXTRACT FAILED — ${translated.block_reason}`);
+                                await pushInboundSupplierDlr(log, 'OTP_EXTRACT_FAILED', translated.block_reason);
+                                continue;
+                            }
+                            // Non-Voice-OTP supplier: OTP extract failed but that's OK — just ignore
+                            console.error(`[SMPP-RELAY] ⚠ ${log.message_id}: OTP extract failed but supplier is not voice_otp — ignoring`);
+                        }
+
+                        // Check blocking rules (DND, keyword blacklist/whitelist, URL block)
+                        const blockCheck = await checkTranslationsBlock(client.id, route.supplier_id, log.destination, log.message);
+                        if (blockCheck) {
+                            await pool.query(
+                                `UPDATE sms_logs SET error_code = 'BLOCKED',
+                                 error_message = $2, status = 'rejected'
+                                 WHERE id = $1`,
+                                [log.id, blockCheck.reason]
+                            );
+                            console.error(`[SMPP-RELAY] 🚫 ${log.message_id}: BLOCKED — ${blockCheck.reason}`);
+                            await pushInboundSupplierDlr(log, 'BLOCKED', blockCheck.reason);
+                            continue;
+                        }
+
+                        // Enqueue FIRST — if this fails, supplier_id stays NULL and poller retries
+                        if (!queueManager) {
+                            console.error(`[SMPP-RELAY] ⚠ ${log.message_id}: Queue manager not available — will retry next cycle`);
+                            continue; // Don't set error_code — retry when queue is ready
+                        }
+                        const parts = Math.max(1, Math.ceil((translated.message || '').length / 160));
+                        await queueManager.enqueue({
+                                message_id: log.message_id,
+                                client_id: log.client_id,
+                                client_code: log.client_code,
+                                supplier_id: route.supplier_id,
+                                supplier_code: route.supplier_code,
+                                sender_id: translated.sender_id,
+                                destination: translated.destination,
+                                message: translated.message,
+                                message_parts: parts,
+                                client_rate: clientRate,
+                                supplier_rate: supplierRate,
+                                profit,
+                                currency: 'EUR',
+                                mcc: route.mcc || '',
+                                mnc: route.mnc || '',
+                                operator: route.operator || '',
+                                country: route.country || '',
+                                route_name: route.route_name || 'SMPP',
+                                trunk_name: route.trunk_name || 'SMPP',
+                                billing_mode: client.billing_mode || 'dlr',
+                                supplier_billing_mode: supplierBillingMode,
+                                webhook_url: client.webhook_url || '',
+                                source: 'smpp_client',
+                            });
+                        // Submit-mode billing: charge client AND/OR supplier based on their billing_mode.
+                        // Uses unified applyBilling helper — charges submit-mode parties immediately,
+                        // defers DLR-mode parties to DLR confirmation.
+                        const clientBillingMode = client.billing_mode || 'dlr';
+                        const supplierBillingMode = route.supplier_billing_mode || 'dlr';
+                        const clientCost = parseFloat((clientRate * parts).toFixed(6));
+                        const supplierCost = parseFloat((supplierRate * parts).toFixed(6));
+                        await applyBilling({
+                            messageId: log.message_id,
+                            clientId: log.client_id,
+                            supplierId: route.supplier_id,
+                            clientCost, supplierCost,
+                            clientBillingMode, supplierBillingMode,
+                            clientForceDlr: client.force_dlr || false,
+                            supplierForceDlr: route.supplier_force_dlr || false,
+                            isSubmit: true
+                        });
+
+                        // Auto-DLR: if force_dlr is enabled, schedule a fake DELIVRD after timeout.
+                        const hasForceDlr = (client.force_dlr || route.supplier_force_dlr);
+                        if (hasForceDlr) {
+                            const timeoutSec = Math.max(
+                                client.force_dlr ? (parseInt(client.force_dlr_timeout) || 0) : 0,
+                                route.supplier_force_dlr ? (route.supplier_force_dlr_timeout || 0) : 0
+                            );
+                            const scheduleDlr = async () => {
+                                try {
+                                    await pool.query(
+                                        `UPDATE sms_logs SET dlr_status = 'DELIVRD', status = 'delivered', delivery_time = NOW(), dlr_timestamp = NOW(), is_force_dlr = true WHERE message_id = $1 AND dlr_status = 'PENDING'`,
+                                        [log.message_id]
+                                    );
+                                    await pool.query(
+                                        `UPDATE sms_outbox SET dlr_status = 'DELIVRD', status = 'delivered', dlr_confirmed_at = NOW(), completed_at = NOW() WHERE message_id = $1 AND dlr_status = 'PENDING'`,
+                                        [log.message_id]
+                                    ).catch(() => {});
+                                    console.error(`[FORCE-DLR] ⚡ ${log.message_id}: Auto-DLR set to DELIVRD after ${timeoutSec}s (SMPP relay force_dlr override)`);
+                                } catch (e) { /* best-effort */ }
+                            };
+                            setTimeout(scheduleDlr, timeoutSec * 1000);
+                        }
+
+                        // Only AFTER successful enqueue, update sms_logs with routing info
+                        await pool.query(
+                            `UPDATE sms_logs SET
+                             supplier_id = $2, supplier_code = $3,
+                             client_rate = $4, supplier_rate = $5, profit = $6,
+                             mcc = $7, mnc = $8, operator = $9, country = $10,
+                             route_name = $11, trunk_name = $12,
+                             sender_id = $13, destination = $14, message = $15,
+                             original_sender_id = $16, original_destination = $17, original_message = $18,
+                             message_parts = $19, billing_mode_snapshot = $20,
+                             supplier_billing_mode_snapshot = $21
+                             WHERE id = $1`,
+                            [
+                                log.id,
+                                route.supplier_id, route.supplier_code,
+                                clientRate, supplierRate, profit,
+                                route.mcc || '', route.mnc || '', route.operator || '', route.country || '',
+                                route.route_name || 'SMPP', route.trunk_name || 'SMPP',
+                                translated.sender_id, translated.destination, translated.message,
+                                origSender, log.destination, log.message,
+                                clientBillingMode, supplierBillingMode
+                            ]
+                        );
+                        console.error(`[SMPP-RELAY] ✅ ${log.message_id}: Routed → ${route.supplier_code} (client=€${clientRate} supplier=€${supplierRate} profit=€${profit})`);
+                        // Collect real sender IDs for the caller ID pool (origSender = pre-translation)
+                        if (origSender) callerIdPool.collectSenderId(origSender);
+                    } catch (e) {
+                        console.error(`[SMPP-RELAY] ⚠ ${log.message_id}: ${e.message}`);
+                        // Don't set error_code — retry next cycle
+                    }
+                }
+            } catch (e) {
+                console.error('[SMPP-RELAY] Poller cycle error:', e.message);
+            }
+        }, 5000);
+
+        console.error('[INIT] SMPP message relay poller started — routes unrouted SMPP messages through full pipeline every 5s');
+
+        // Seed the caller ID pool from existing SMS logs (real sender numbers)
+        callerIdPool.collectFromRecentLogs(pool).catch(e => console.error('[INIT] CallerID pool seeding failed:', e.message));
+
+        // ======== RETROACTIVE BILLING SAFETY NET ========
+        // Catches DELIVRD messages where is_billed=false (race condition,
+        // poller gap, or Java gateway DLR that bypassed billing).
+        // Deducts client + supplier balance and sets is_billed=true.
+        setInterval(async () => {
+            try {
+                const unbilled = await pool.query(
+                    `SELECT sl.*, o.supplier_id as outbox_supplier_id
+                     FROM sms_logs sl
+                     LEFT JOIN sms_outbox o ON o.message_id = sl.message_id
+                     WHERE sl.dlr_status = 'DELIVRD'
+                       AND sl.is_billed = false
+                       AND (sl.is_client_billed = false OR sl.is_supplier_billed = false)
+                       AND sl.client_rate > 0
+                       AND sl.client_id IS NOT NULL
+                       AND sl.delivery_time IS NOT NULL
+                     ORDER BY sl.delivery_time ASC
+                     LIMIT 20`
+                );
+                if (!unbilled.rows.length) return;
+
+                for (const log of unbilled.rows) {
+                    try {
+                        // Atomic claim FIRST — only one poller cycle wins, prevents double billing
+                        const claimed = await pool.query(
+                            `UPDATE sms_logs SET is_billed = true
+                             WHERE message_id = $1 AND is_billed = false AND (is_client_billed = false OR is_supplier_billed = false)
+                             RETURNING id`,
+                            [log.message_id]
+                        );
+                        if (!claimed.rows.length) continue; // another cycle already claimed it
+
+                        const parts = parseInt(log.message_parts || 1);
+                        const clientCost = parseFloat(((log.client_rate || 0) * parts).toFixed(6));
+                        const supplierCost = parseFloat(((log.supplier_rate || 0) * parts).toFixed(6));
+                        const clientBillingMode = log.billing_mode_snapshot || 'dlr';
+                        const supplierBillingMode = log.supplier_billing_mode_snapshot || 'dlr';
+
+                        // Deduct balances via unified helper — if any deduction fails, roll back
+                        try {
+                            await applyBilling({
+                                messageId: log.message_id,
+                                clientId: log.client_id,
+                                supplierId: log.supplier_id || log.outbox_supplier_id,
+                                clientCost, supplierCost,
+                                clientBillingMode, supplierBillingMode,
+                                isSubmit: false,
+                                dlrStatus: 'DELIVRD'
+                            });
+                            console.error(`[RETRO-BILL] ✅ ${log.message_id}: Retroactively billed via unified helper`);
+                        } catch (deductErr) {
+                            // Rollback the claim so next cycle retries the billing
+                            await pool.query(
+                                'UPDATE sms_logs SET is_billed = false WHERE message_id = $1',
+                                [log.message_id]
+                            ).catch(() => {});
+                            console.error(`[RETRO-BILL] ❌ ${log.message_id}: Deduction failed, claim rolled back: ${deductErr.message}`);
+                        }
+                    } catch (e) {
+                        console.error(`[RETRO-BILL] ⚠ ${log.message_id}: ${e.message}`);
+                    }
+                }
+            } catch (e) {
+                console.error('[RETRO-BILL] Poller error:', e.message);
+            }
+        }, 10000);
+
+        console.error('[INIT] Retroactive billing safety net started — catches unbilled DELIVRD messages every 10s');
+
+        // ======== DAILY BILLING AUDIT ========
+        // Runs every 24h. Flags messages where status='failed' but is_billed=true
+        // (billing anomaly — failed messages should never have been billed).
+        // Auto-corrects: refunds client balance, clears billing flags, logs the incident.
+        // Runs on first boot after 60s, then every 24h thereafter.
+        setTimeout(async function dailyBillingAudit() {
+            try {
+                const anomalies = await pool.query(
+                    `SELECT id, message_id, client_id, client_code, supplier_id, supplier_code,
+                            client_rate, supplier_rate, message_parts, status, is_supplier_billed
+                     FROM sms_logs
+                     WHERE status IN ('failed', 'rejected')
+                       AND is_billed = true
+                       AND client_id IS NOT NULL
+                       AND client_rate > 0
+                       AND (refund_amount IS NULL OR refund_amount = 0)
+                       AND submit_time > NOW() - INTERVAL '30 days'
+                     ORDER BY id`
+                );
+                if (anomalies.rows.length === 0) {
+                    console.error(`[BILLING-AUDIT] ✅ Clean — no billing anomalies detected (${new Date().toISOString().slice(0,10)})`);
+                } else {
+                    console.error(`[BILLING-AUDIT] 🚨 ${anomalies.rows.length} BILLING ANOMALIES FOUND — auto-correcting...`);
+                    let totalRefund = 0;
+                    for (const log of anomalies.rows) {
+                        try {
+                            const cost = parseFloat(((log.client_rate || 0) * (parseInt(log.message_parts) || 1)).toFixed(6));
+                            await pool.query(
+                                'UPDATE clients SET balance = balance + $1, updated_at = NOW() WHERE id = $2',
+                                [cost, log.client_id]
+                            );
+                    await pool.query(
+                        `UPDATE sms_logs SET is_billed = false,
+                         is_client_billed = false, is_supplier_billed = false,
+                         refund_amount = $2 WHERE id = $1`,
+                        [log.id, cost]
+                    );
+                    // Also refund supplier if they were billed
+                    if (log.is_supplier_billed && log.supplier_id && (log.supplier_rate || 0) > 0) {
+                        const suppCost = parseFloat(((log.supplier_rate || 0) * (parseInt(log.message_parts) || 1)).toFixed(6));
+                        await pool.query(
+                            'UPDATE suppliers SET balance = balance + $1, updated_at = NOW() WHERE id = $2',
+                            [suppCost, log.supplier_id]
+                        );
+                        console.error(`[BILLING-AUDIT] ↩ Supplier refunded: supplier=${log.supplier_code || log.supplier_id} | €${suppCost.toFixed(4)}`);
+                    }
+                            totalRefund += cost;
+                            console.error(`[BILLING-AUDIT] ↩ Refunded: ${log.message_id} | client=${log.client_code} | €${cost.toFixed(4)} | status=${log.status}`);
+                        } catch (e) {
+                            console.error(`[BILLING-AUDIT] ❌ Failed to refund ${log.message_id}: ${e.message}`);
+                        }
+                    }
+                    // In-app alert notification
+                    try {
+                        await pool.query(
+                            `INSERT INTO notifications (title, message, type, is_read, created_at)
+                             VALUES ($1, $2, 'alert', false, NOW())`,
+                            ['Billing Audit: Anomalies Detected',
+                             `${anomalies.rows.length} messages were billed despite having failed/rejected status. €${totalRefund.toFixed(4)} refunded. See server logs for details.`]
+                        );
+                    } catch (e) { /* notifications table may not exist */ }
+                    console.error(`[BILLING-AUDIT] ✅ Auto-corrected ${anomalies.rows.length} anomalies — total refunded: €${totalRefund.toFixed(4)}`);
+                }
+            } catch (e) {
+                console.error('[BILLING-AUDIT] ❌ Audit cycle failed:', e.message);
+            }
+            // Schedule next run in 24h
+            setTimeout(dailyBillingAudit, 86400000);
         }, 60000);
 
-        console.error('[INIT] HTTP supplier health check started — pings api_url every 60s, updates bind_status');
+        console.error('[INIT] Daily billing audit started — first run in 60s, then every 24h');
+
+        // ======== RETROACTIVE DLR PUSHER ========
+        // Safety net: catches external client messages that have a DLR status
+        // (DELIVRD/UNDELIV/FAILED) but NO dlr_outbox entry. This can happen when:
+        //  - deliverToSupplier fails and onDlr wasn't called (race condition)
+        //  - DLR poller set UNDELIV but onDlr callback threw before INSERT
+        //  - Server was restarted between DLR arrival and onDlr callback
+        // Runs every 30s — pushes any orphaned external DLRs to dlr_outbox
+        // so the Java Gateway can deliver_sm to connected SMPP clients.
+        setInterval(async () => {
+            try {
+                console.error('[RETRO-DLR] 🔍 Scanning for orphaned external DLRs...');
+                const orphaned = await pool.query(
+                    `SELECT sl.message_id, sl.client_id, sl.client_code, sl.destination,
+                            sl.sender_id, sl.dlr_status, sl.source, sl.submit_time
+                     FROM sms_logs sl
+                     WHERE sl.source = ANY($1::varchar[])
+                       AND sl.dlr_status IS NOT NULL
+                       AND sl.dlr_status NOT IN ('PENDING')
+                       AND sl.client_id IS NOT NULL
+                       AND sl.message_id NOT IN (SELECT message_id FROM dlr_outbox)
+                       AND sl.submit_time > NOW() - INTERVAL '7 days'
+                     ORDER BY sl.submit_time DESC
+                     LIMIT 30`,
+                    [EXTERNAL_DLR_SOURCES]
+                );
+                // Also catch supplier-originated orphaned DLRs (client_id is null)
+                const orphanedSupp = await pool.query(
+                    `SELECT sl.message_id, sl.supplier_id, sl.supplier_code, sl.destination,
+                            sl.sender_id, sl.dlr_status, sl.source, sl.submit_time
+                     FROM sms_logs sl
+                     WHERE sl.supplier_id IS NOT NULL
+                       AND sl.client_id IS NULL
+                       AND sl.dlr_status IS NOT NULL
+                       AND sl.dlr_status NOT IN ('PENDING')
+                       AND sl.message_id NOT IN (SELECT message_id FROM dlr_outbox)
+                       AND sl.submit_time > NOW() - INTERVAL '7 days'
+                     ORDER BY sl.submit_time DESC
+                     LIMIT 30`
+                );
+                console.error(`[RETRO-DLR] Found ${orphaned.rows.length} client + ${orphanedSupp.rows.length} supplier orphaned external DLR(s)`);
+                if (!orphaned.rows.length && !orphanedSupp.rows.length) return;
+
+                let pushed = 0;
+                for (const log of orphaned.rows) {
+                    try {
+                        const receipt = `id:${log.message_id} sub:001 dlvrd:${log.dlr_status === 'DELIVRD' ? '001' : '000'} submit date:${new Date(log.submit_time || Date.now()).toISOString().slice(0,16).replace(/[-:T]/g,'')} done date:${new Date().toISOString().slice(0,16).replace(/[-:T]/g,'')} stat:${log.dlr_status} err:000 text:${log.dlr_status === 'DELIVRD' ? 'Delivery success' : 'Delivery failed'}`;
+                        await pool.query(
+                            `INSERT INTO dlr_outbox (message_id, entity_type, entity_id, client_id, client_code, destination, sender_id, status, dlr_receipt, submit_time)
+                             VALUES ($1,'client',$2,$2,$3,$4,$5,$6,$7,$8)
+                             ON CONFLICT (message_id) DO NOTHING`,
+                            [log.message_id, log.client_id, log.client_code, log.destination,
+                             log.sender_id || '', log.dlr_status, receipt, log.submit_time]
+                        );
+                        pushed++;
+                    } catch (e) {
+                        console.error(`[RETRO-DLR] ⚠ Failed to insert ${log.message_id}:`, e.message);
+                    }
+                }
+                for (const log of orphanedSupp.rows) {
+                    try {
+                        const receipt = `id:${log.message_id} sub:001 dlvrd:${log.dlr_status === 'DELIVRD' ? '001' : '000'} submit date:${new Date(log.submit_time || Date.now()).toISOString().slice(0,16).replace(/[-:T]/g,'')} done date:${new Date().toISOString().slice(0,16).replace(/[-:T]/g,'')} stat:${log.dlr_status} err:000 text:${log.dlr_status === 'DELIVRD' ? 'Delivery success' : 'Delivery failed'}`;
+                        await pool.query(
+                            `INSERT INTO dlr_outbox (message_id, entity_type, entity_id, client_code, destination, sender_id, status, dlr_receipt, submit_time)
+                             VALUES ($1,'supplier',$2,$3,$4,$5,$6,$7,$8)
+                             ON CONFLICT (message_id) DO NOTHING`,
+                            [log.message_id, log.supplier_id, log.supplier_code, log.destination,
+                             log.sender_id || '', log.dlr_status, receipt, log.submit_time]
+                        );
+                        pushed++;
+                    } catch (e) {
+                        console.error(`[RETRO-DLR] ⚠ Failed to insert supplier ${log.message_id}:`, e.message);
+                    }
+                }
+                if (pushed > 0) {
+                    console.error(`[RETRO-DLR] 📝 Caught up: ${pushed} orphaned external DLR(s) pushed to dlr_outbox for SMPP delivery`);
+                }
+            } catch (e) {
+                console.error('[RETRO-DLR] Poller error:', e.message);
+            }
+        }, 30000);
+
+        console.error('[INIT] Retroactive DLR pusher started — catches orphaned external DLRs every 30s');
+
+        // ======== SUBMIT TIMEOUT REPORTER ========
+        // Finds messages from inbound suppliers (GSM gateways) that have been stuck
+        // in 'submitted' status too long (no route found, queue backed up, etc.)
+        // and writes EXPIRED DLR to dlr_outbox so the Java DlrPusher can deliver_sm
+        // back to the GSM gateway with proper stat:EXPIRED and timing info.
+        setInterval(async () => {
+            try {
+                // Use each supplier's configured dlr_timeout (seconds, default 300 = 5 min).
+                // Join with suppliers table so each gateway can have its own expiry window.
+                const DEFAULT_TIMEOUT_SECS = 300;
+                const stale = await pool.query(
+                    `SELECT sl.message_id, sl.supplier_id, sl.supplier_code, sl.sender_id,
+                            sl.destination, sl.submit_time, sl.status,
+                            GREATEST(COALESCE(NULLIF(s.dlr_timeout, 0), ${DEFAULT_TIMEOUT_SECS}), 30) as timeout_secs
+                     FROM sms_logs sl
+                     JOIN suppliers s ON s.id = sl.supplier_id
+                     WHERE sl.source = 'smpp'
+                       AND sl.supplier_id IS NOT NULL
+                       AND sl.status = 'submitted'
+                       AND sl.submit_time < NOW() - (GREATEST(COALESCE(NULLIF(s.dlr_timeout, 0), ${DEFAULT_TIMEOUT_SECS}), 30) * INTERVAL '1 second')
+                       AND sl.message_id NOT IN (
+                         SELECT message_id FROM dlr_outbox WHERE entity_type = 'supplier'
+                       )
+                     ORDER BY sl.submit_time ASC
+                     LIMIT 50`
+                );
+                if (!stale.rows.length) return;
+
+                for (const log of stale.rows) {
+                    try {
+                        const timeoutSecs = parseInt(log.timeout_secs) || DEFAULT_TIMEOUT_SECS;
+                        const timeoutLabel = timeoutSecs >= 60
+                            ? `${Math.round(timeoutSecs / 60)}min`
+                            : `${timeoutSecs}s`;
+                        const doneDate = new Date();
+                        const sdf = (d) => d.toISOString().slice(2,16).replace(/[-:T]/g,'');
+                        const receipt = `id:${log.message_id} sub:001 dlvrd:000 submit date:${sdf(new Date(log.submit_time))} done date:${sdf(doneDate)} stat:EXPIRED err:000 text:Submit timeout after ${timeoutLabel}`;
+
+                        await pool.query(
+                            `INSERT INTO dlr_outbox (message_id, entity_type, entity_id, client_code, destination, sender_id, status, dlr_receipt, submit_time)
+                             VALUES ($1,'supplier',$2,$3,$4,$5,'EXPIRED',$6,$7)
+                             ON CONFLICT (message_id) DO NOTHING`,
+                            [log.message_id, log.supplier_id, log.supplier_code, log.destination,
+                             log.sender_id || '', receipt, log.submit_time]
+                        );
+
+                        // Also update sms_logs to reflect the expiry
+                        await pool.query(
+                            `UPDATE sms_logs SET status='failed', dlr_status='EXPIRED',
+                             error_code='SUBMIT_TIMEOUT',
+                             error_message='Submit timeout after ${timeoutLabel} (dlr_timeout=${timeoutSecs}s)',
+                             delivery_time=NOW() WHERE message_id=$1 AND status='submitted'`,
+                            [log.message_id]
+                        );
+                        console.error(`[TIMEOUT] ⏰ ${log.message_id}: EXPIRED — inbound supplier ${log.supplier_code}, stuck ${timeoutLabel}+ (dlr_timeout=${timeoutSecs}s)`);
+                    } catch (e) {
+                        console.error(`[TIMEOUT] ⚠ ${log.message_id}: ${e.message}`);
+                    }
+                }
+                if (stale.rows.length > 0) {
+                    console.error(`[TIMEOUT] 📝 ${stale.rows.length} stale inbound message(s) reported as EXPIRED for deliver_sm push`);
+                }
+            } catch (e) {
+                console.error('[TIMEOUT] Poller error:', e.message);
+            }
+        }, 60000);
+
+        console.error('[INIT] Submit timeout reporter started — checks stale inbound messages every 60s, reports EXPIRED after 5min');
+
+        // ======== HELPER: Push failed DLR to inbound supplier ========
+        // Called by the SMPP relay poller when an inbound supplier's message
+        // fails validation (NO_ROUTE, NO_RATE, NO_PROFIT, CLIENT_NOT_FOUND).
+        // Writes to dlr_outbox so the Java DlrPusher can deliver_sm back.
+        async function pushInboundSupplierDlr(log, errorCode, errorMsg) {
+            if (!log.supplier_id) return; // Not from an inbound supplier
+            try {
+                const doneDate = new Date();
+                const sdf = (d) => d.toISOString().slice(2,16).replace(/[-:T]/g,'');
+                const receipt = `id:${log.message_id} sub:001 dlvrd:000 submit date:${sdf(new Date(log.submit_time || Date.now()))} done date:${sdf(doneDate)} stat:UNDELIV err:000 text:${errorCode}: ${errorMsg}`;
+
+                await pool.query(
+                    `INSERT INTO dlr_outbox (message_id, entity_type, entity_id, client_code, destination, sender_id, status, dlr_receipt, submit_time)
+                     VALUES ($1,'supplier',$2,$3,$4,$5,'UNDELIV',$6,$7)
+                     ON CONFLICT (message_id) DO NOTHING`,
+                    [log.message_id, log.supplier_id, log.supplier_code || 'unknown', log.destination,
+                     log.sender_id || '', receipt, log.submit_time]
+                );
+                console.error(`[SMPP-RELAY] 📤 Inbound supplier ${log.supplier_code}: ${log.message_id} → UNDELIV (${errorCode}) queued for deliver_sm`);
+            } catch (e) {
+                console.error(`[SMPP-RELAY] ⚠ Failed to queue inbound DLR for ${log.message_id}: ${e.message}`);
+            }
+        }
 
         // ============================================================
         // SMPP ESME SERVER — handled by Java 21 SMPP Gateway
@@ -404,7 +1650,10 @@ const JWT_SECRET = process.env.JWT_SECRET || 'net2app-hub-secret-key-2024';
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 const COOKIE_OPTIONS = {
     httpOnly: true,
-    secure: IS_PRODUCTION,          // HTTPS-only in production, HTTP in development
+    // Only set secure:true when behind HTTPS. The site currently runs on HTTP (port 80)
+    // via nginx reverse proxy. Browsers refuse to send secure cookies over HTTP,
+    // which breaks all API calls (401 → redirect loop).
+    secure: false,
     sameSite: 'lax',
     maxAge: 24 * 60 * 60 * 1000, // 24 hours
     path: '/',
@@ -487,7 +1736,7 @@ app.post('/api/auth/change-password', auth, async (req, res) => {
 app.post('/api/auth/logout', auth, async (req, res) => {
     try {
         // Clear the httpOnly cookie (must match the same domain/path as when set)
-        res.clearCookie('token', { httpOnly: true, secure: IS_PRODUCTION, sameSite: 'lax', path: '/' });
+        res.clearCookie('token', { httpOnly: true, secure: false, sameSite: 'lax', path: '/' });
         res.json({ success: true, message: 'Logged out successfully' });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -752,7 +2001,7 @@ app.post('/api/suppliers', auth, async (req, res) => {
                 api_connector_id, voice_otp_config_id, voice_otp_mode,
                 whatsapp_device_ids, telegram_device_ids,
                 dst_sip_address, reconnect_schedule, rate_per_second, audio_codec, capacity,
-                balance, credit_limit, currency,
+                balance, credit_limit, currency, billing_mode,
                 bind_status, consecutive_failures, force_dlr, status,
                 created_at, updated_at
             ) VALUES (
@@ -765,7 +2014,7 @@ app.post('/api/suppliers', auth, async (req, res) => {
                 $25,$26,
                 $27,$28,$29,$30,$31,
                 $32,$33,$34,
-                $35,$36,$37,$38,
+                $35,$36,$37,$38,$39,
                 NOW(), NOW()
             ) RETURNING *`,
             [
@@ -803,6 +2052,7 @@ app.post('/api/suppliers', auth, async (req, res) => {
                 b.balance || 0,
                 b.credit_limit || 0,
                 b.currency || 'EUR',
+                b.billing_mode || 'dlr',
                 b.bind_status || 'unbound',
                 b.consecutive_failures || 0,
                 b.force_dlr !== undefined ? b.force_dlr : false,
@@ -820,7 +2070,7 @@ app.put('/api/suppliers/:id', auth, async (req, res) => {
         const { id } = req.params;
         const fields = req.body;
         // Build dynamic SET clause for any field passed
-        const allowed = ['supplier_code','company_name','contact_person','email','phone','connection_type','smpp_host','smpp_port','smpp_username','smpp_password','system_id','smpp_version','smpp_system_type','smpp_bind_type','smpp_addr_ton','smpp_addr_npi','smpp_addr_range','is_inbound','api_url','api_key','api_method','api_connector_id','voice_otp_config_id','voice_otp_mode','whatsapp_device_ids','telegram_device_ids','dst_sip_address','reconnect_schedule','rate_per_second','audio_codec','capacity','balance','credit_limit','currency','bind_status','consecutive_failures','force_dlr','status'];
+        const allowed = ['supplier_code','company_name','contact_person','email','phone','connection_type','smpp_host','smpp_port','smpp_username','smpp_password','system_id','smpp_version','smpp_system_type','smpp_bind_type','smpp_addr_ton','smpp_addr_npi','smpp_addr_range','is_inbound','api_url','api_key','api_method','api_connector_id','voice_otp_config_id','voice_otp_mode','whatsapp_device_ids','telegram_device_ids','dst_sip_address','reconnect_schedule','rate_per_second','audio_codec','capacity','balance','credit_limit','currency','billing_mode','bind_status','consecutive_failures','force_dlr','status','max_queue_size','dlr_timeout'];
         const setParts = [];
         const values = [];
         let idx = 1;
@@ -902,7 +2152,7 @@ app.post('/api/suppliers/bulk', auth, async (req, res) => {
                         is_inbound, api_url, api_key, api_method,
                         api_connector_id, voice_otp_config_id,
                         whatsapp_device_ids, telegram_device_ids,
-                        balance, credit_limit, currency,
+                        balance, credit_limit, currency, billing_mode,
                         bind_status, consecutive_failures, force_dlr, status,
                         created_at, updated_at
                     ) VALUES (
@@ -913,8 +2163,8 @@ app.post('/api/suppliers/bulk', auth, async (req, res) => {
                         $18,$19,$20,$21,
                         $22,$23,
                         $24,$25,
-                        $26,$27,$28,
-                        $29,$30,$31,$32,
+                        $26,$27,$28,$29,
+                        $30,$31,$32,$33,
                         NOW(), NOW()
                     ) RETURNING *`,
                     [
@@ -929,7 +2179,7 @@ app.post('/api/suppliers/bulk', auth, async (req, res) => {
                         row.api_url || '', row.api_key || '', row.api_method || 'POST',
                         row.api_connector_id || null, row.voice_otp_config_id || null,
                         row.whatsapp_device_ids || null, row.telegram_device_ids || null,
-                        parseFloat(row.balance) || 0, parseFloat(row.credit_limit) || 0, row.currency || 'EUR',
+                        parseFloat(row.balance) || 0, parseFloat(row.credit_limit) || 0, row.currency || 'EUR', row.billing_mode || 'dlr',
                         row.bind_status || 'unbound', parseInt(row.consecutive_failures) || 0, row.force_dlr !== 'false',
                         row.status || 'active'
                     ]
@@ -969,7 +2219,7 @@ app.get('/api/clients/:id/usage', auth, async (req, res) => {
         else if (period === 'month') { dateFilter = "AND submit_time >= date_trunc('month', CURRENT_DATE)"; }
         else if (period) { dateFilter = `AND submit_time >= CURRENT_DATE - INTERVAL '${parseInt(period)} days'`; }
         const smsResult = await pool.query(
-            `SELECT COUNT(*) as total_sms, SUM(client_rate * message_parts) as total_revenue, COUNT(*) FILTER (WHERE status = 'delivered') as delivered
+            `SELECT COUNT(*) as total_sms, SUM(client_rate * message_parts) FILTER (WHERE is_billed = true) as total_revenue, COUNT(*) FILTER (WHERE status = 'delivered') as delivered
              FROM sms_logs WHERE client_id = $1 ${dateFilter}`, [id]
         );
         const clientResult = await pool.query('SELECT * FROM clients WHERE id = $1', [id]);
@@ -1041,7 +2291,7 @@ app.get('/api/suppliers/:id/usage', auth, async (req, res) => {
         else if (period === 'month') { dateFilter = "AND submit_time >= date_trunc('month', CURRENT_DATE)"; }
         else if (period) { dateFilter = `AND submit_time >= CURRENT_DATE - INTERVAL '${parseInt(period)} days'`; }
         const smsResult = await pool.query(
-            `SELECT COUNT(*) as total_sms, SUM(supplier_rate * message_parts) as total_cost, COUNT(*) FILTER (WHERE status = 'delivered') as delivered
+            `SELECT COUNT(*) as total_sms, SUM(supplier_rate * message_parts) FILTER (WHERE dlr_status = 'DELIVRD') as total_cost, COUNT(*) FILTER (WHERE status = 'delivered') as delivered
              FROM sms_logs WHERE supplier_id = $1 ${dateFilter}`, [id]
         );
         const supplierResult = await pool.query('SELECT * FROM suppliers WHERE id = $1', [id]);
@@ -1083,18 +2333,30 @@ app.post('/api/suppliers/:id/bind', auth, async (req, res) => {
         const s = supR.rows[0];
 
         if (s.is_inbound) {
-            // Inbound supplier: session state is managed by the Java SMPP gateway.
-            // We do NOT modify smpp_sessions — the gateway owns the real connection state.
-            // Just return current state for the frontend to display.
+            // Inbound supplier: sync suppliers table to match real smpp_sessions state.
+            // The Java Gateway manages the actual TCP connection. We just reflect reality
+            // and reset any stale failure counters so the UI shows the correct state.
             const sessR = await pool.query(
                 `SELECT status FROM smpp_sessions WHERE entity_type = 'supplier' AND entity_id = $1`,
                 [id]
             );
             const realStatus = sessR.rows.length > 0 ? sessR.rows[0].status : 'unbound';
+            // Sync suppliers.bind_status to match real session state + reset failures
+            await pool.query(
+                `UPDATE suppliers SET bind_status = $1, consecutive_failures = 0, updated_at = NOW()
+                 WHERE id = $2`,
+                [realStatus, id]
+            );
+            // Insert bind_history for audit trail (use real session status)
+            await pool.query(
+                `INSERT INTO bind_history (entity_type, entity_id, system_id, ip_address, port, bind_mode, status, created_at)
+                 VALUES ('supplier', $1, $2, $3, $4, 'transceiver', $5, NOW())`,
+                [id, s.smpp_username || 'unknown', s.smpp_host || null, s.smpp_port || 2775, realStatus]
+            );
             return res.json({
                 success: true,
                 data: { id: Number(id), supplier_code: s.supplier_code, bind_status: realStatus },
-                message: 'Inbound supplier — session state managed by SMPP gateway. Current: ' + realStatus
+                message: `Inbound supplier synced — session=${realStatus}, failures reset`
             });
         } else {
             // Outbound supplier: update static bind_status + active_smpp_sessions
@@ -1265,16 +2527,17 @@ app.post('/api/api-connectors', auth, async (req, res) => {
         const result = await pool.query(
             `INSERT INTO api_connectors (name, type, provider, base_url, send_url, api_key, api_secret, region, description,
              username, password, phone_number_id, business_account_id, bot_token,
+             waba_version, webhook_verify_token, telegram_webhook_url,
              dlr_url, http_method, connector_type,
              is_active, created_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW()) RETURNING *`,
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,NOW()) RETURNING *`,
             [b.name || '', b.type || 'http', b.provider || b.type || 'http',
              b.base_url || '', b.base_url || '', b.api_key || '', b.api_secret || '',
              b.region || '', b.description || '',
-             b.username || '', b.password || '',
-             b.phone_number_id || '', b.business_account_id || '',
-             b.bot_token || '',
-             b.dlr_url || '', b.http_method || 'POST', b.connector_type || b.type || 'http',
+             b.username || '', b.password || '',              b.phone_number_id || '', b.business_account_id || '',
+              b.bot_token || '',
+              b.waba_version || 'v18.0', b.webhook_verify_token || '', b.telegram_webhook_url || '',
+              b.dlr_url || '', b.http_method || 'POST', b.connector_type || b.type || 'http',
              b.is_active !== false]
         );
         res.json({ success: true, data: result.rows[0] });
@@ -1286,7 +2549,7 @@ app.put('/api/api-connectors/:id', auth, async (req, res) => {
         const { id } = req.params;
         const fields = req.body;
         const allowed = ['name','type','provider','base_url','send_url','api_key','api_secret','region','description',
-            'username','password','phone_number_id','business_account_id','bot_token','dlr_url','http_method','connector_type','is_active'];
+            'username','password','phone_number_id','business_account_id','bot_token','waba_version','webhook_verify_token','telegram_webhook_url','dlr_url','http_method','connector_type','is_active'];
         const setParts = []; const values = []; let idx = 1;
         for (const key of allowed) {
             if (fields[key] !== undefined) { setParts.push(`${key} = $${idx++}`); values.push(fields[key]); }
@@ -1336,12 +2599,12 @@ app.post('/api/api-connectors/bulk', auth, async (req, res) => {
             if (!name) { errors.push({ line: li + 1, error: 'Missing name' }); continue; }
 
             try {
-                const ins = await pool.query(
-                    `INSERT INTO api_connectors (name, type, provider, base_url, send_url, api_key, api_secret, region, description,
-                     username, password, phone_number_id, business_account_id, bot_token,
-                     dlr_url, http_method, connector_type,
-                     is_active, created_at)
-                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW()) RETURNING *`,
+                const ins = await pool.query(                     `INSERT INTO api_connectors (name, type, provider, base_url, send_url, api_key, api_secret, region, description,
+                      username, password, phone_number_id, business_account_id, bot_token,
+                      waba_version, webhook_verify_token, telegram_webhook_url,
+                      dlr_url, http_method, connector_type,
+                      is_active, created_at)
+                      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,NOW()) RETURNING *`,
                     [
                         name,
                         row.type || 'http',
@@ -1357,6 +2620,7 @@ app.post('/api/api-connectors/bulk', auth, async (req, res) => {
                         row.phone_number_id || '',
                         row.business_account_id || '',
                         row.bot_token || '',
+                        row.waba_version || 'v18.0', row.webhook_verify_token || '', row.telegram_webhook_url || '',
                         row.dlr_url || '', row.http_method || 'POST', row.connector_type || row.type || 'http',
                         row.is_active !== 'false' && row.is_active !== false,
                     ]
@@ -1578,7 +2842,16 @@ app.delete('/api/route-plans/:id', auth, async (req, res) => {
 // ==================== RATES ====================
 app.get('/api/rates', auth, async (req, res) => {
     try {
-        const result = await pool.query('SELECT * FROM rates WHERE (is_active IS NULL OR is_active = true) ORDER BY id');
+        const activeOnly = req.query.active_only === 'true';
+        const entityType = req.query.entity_type || '';
+        const entityId = req.query.entity_id || '';
+        let q = 'SELECT * FROM rates WHERE 1=1';
+        const params = []; let i = 1;
+        if (activeOnly) { q += ' AND is_active = true'; }
+        if (entityType) { q += ` AND entity_type = $${i++}`; params.push(entityType); }
+        if (entityId) { q += ` AND entity_id = $${i++}`; params.push(entityId); }
+        q += ' ORDER BY id';
+        const result = await pool.query(q, params);
         res.json({ success: true, data: result.rows });
     } catch (error) {
         res.status(500).json({ error: 'Internal server error' });
@@ -1599,12 +2872,37 @@ app.get('/api/rates/:id', auth, async (req, res) => {
 app.post('/api/rates', auth, async (req, res) => {
     try {
         const { entity_type, entity_id, mcc, mnc, country, operator, rate, currency, effective_from, is_active } = req.body;
-        const result = await pool.query(
-            `INSERT INTO rates (entity_type, entity_id, mcc, mnc, country, operator, rate, currency, effective_from, is_active, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW()) RETURNING *`,
-            [entity_type || 'client', entity_id || '0', mcc || '', mnc || '*', country || '', operator || 'All', rate || 0, currency || 'EUR', effective_from || new Date().toISOString().split('T')[0], is_active !== false]
+        const et = entity_type || 'client';
+        const eid = entity_id || '0';
+        const m = mcc || '';
+        const n = mnc || '*';
+        const today = new Date().toISOString().split('T')[0];
+        const activeFlag = is_active !== false;
+
+        // Auto-deactivate any existing active rates for same entity+mcc+mnc
+        if (activeFlag) {
+            await pool.query(
+                `UPDATE rates SET is_active = false, effective_to = $1, updated_at = NOW()
+                 WHERE entity_type = $2 AND entity_id = $3 AND mcc = $4 AND mnc = $5 AND is_active = true`,
+                [today, et, eid, m, n]
+            );
+        }
+
+        // Get previous rate for version tracking
+        const prevR = await pool.query(
+            `SELECT rate, version FROM rates WHERE entity_type = $1 AND entity_id = $2 AND mcc = $3 AND mnc = $4
+             ORDER BY version DESC LIMIT 1`,
+            [et, eid, m, n]
         );
-        res.json({ success: true, data: result.rows[0] });
+        const prevRate = prevR.rows.length > 0 ? parseFloat(prevR.rows[0].rate) : null;
+        const newVersion = prevR.rows.length > 0 ? (parseInt(prevR.rows[0].version) || 1) + 1 : 1;
+
+        const result = await pool.query(
+            `INSERT INTO rates (entity_type, entity_id, mcc, mnc, country, operator, rate, currency, effective_from, is_active, version, previous_rate, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW()) RETURNING *`,
+            [et, eid, m, n, country || '', operator || 'All', rate || 0, currency || 'EUR', effective_from || today, activeFlag, newVersion, prevRate]
+        );
+        res.json({ success: true, data: result.rows[0], previous_rate: prevRate, version: newVersion });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -1614,7 +2912,7 @@ app.put('/api/rates/:id', auth, async (req, res) => {
     try {
         const { id } = req.params;
         const fields = req.body;
-        const allowed = ['entity_type','entity_id','mcc','mnc','country','operator','rate','currency','effective_from','effective_to','is_active'];
+        const allowed = ['entity_type','entity_id','mcc','mnc','country','operator','rate','currency','effective_from','effective_to','is_active','previous_rate','version'];
         const setParts = []; const values = []; let idx = 1;
         for (const key of allowed) {
             if (fields[key] !== undefined) { setParts.push(`${key} = $${idx++}`); values.push(fields[key]); }
@@ -1642,6 +2940,151 @@ app.delete('/api/rates/:id', auth, async (req, res) => {
         res.status(500).json({ error: 'Internal server error' });
     }
 });
+
+// Rate history: get all versions for a specific entity+destination
+app.get('/api/rates/history', auth, async (req, res) => {
+    try {
+        const { entity_type, entity_id, mcc, mnc } = req.query;
+        if (!entity_type || !entity_id) return res.status(400).json({ error: 'entity_type and entity_id are required' });
+        let q = 'SELECT * FROM rates WHERE entity_type = $1 AND entity_id = $2';
+        const params = [entity_type, entity_id]; let i = 3;
+        if (mcc) { q += ` AND mcc = $${i++}`; params.push(mcc); }
+        if (mnc) { q += ` AND mnc = $${i++}`; params.push(mnc); }
+        q += ' ORDER BY version DESC, created_at DESC';
+        const result = await pool.query(q, params);
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Ensure previous_rate column exists (migration)
+(async () => {
+    await pool.query('ALTER TABLE rates ADD COLUMN IF NOT EXISTS previous_rate DECIMAL(10,6)').catch(() => {});
+    await pool.query('ALTER TABLE rates ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP').catch(() => {});
+})().catch(() => {});
+
+// ======== DUAL BILLING SYSTEM MIGRATION ========
+// Adds supplier billing_mode + dual billing flags for per-party billing tracking.
+// Supports 4 combinations: client/supplier each independently 'submit' or 'dlr'.
+// - is_client_billed: true when client balance was deducted
+// - is_supplier_billed: true when supplier balance was deducted  
+// - is_billed: composite flag = both parties billed (backward compat)
+(async () => {
+    await pool.query('ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS billing_mode VARCHAR(20) DEFAULT \'dlr\'').catch(() => {});
+    await pool.query('ALTER TABLE sms_logs ADD COLUMN IF NOT EXISTS is_client_billed BOOLEAN DEFAULT false').catch(() => {});
+    await pool.query('ALTER TABLE sms_logs ADD COLUMN IF NOT EXISTS is_supplier_billed BOOLEAN DEFAULT false').catch(() => {});
+    await pool.query('ALTER TABLE sms_logs ADD COLUMN IF NOT EXISTS supplier_billing_mode_snapshot VARCHAR(20)').catch(() => {});
+    await pool.query('ALTER TABLE sms_outbox ADD COLUMN IF NOT EXISTS supplier_billing_mode VARCHAR(20) DEFAULT \'dlr\'').catch(() => {});
+    await pool.query('ALTER TABLE clients ADD COLUMN IF NOT EXISTS force_dlr_timeout INTEGER DEFAULT 0').catch(() => {});
+    await pool.query('ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS force_dlr_timeout INTEGER DEFAULT 0').catch(() => {});
+})().catch(() => {});
+
+// ======== UNIVERSAL BILLING HELPER ========
+// Charges client and/or supplier based on their independent billing_mode.
+// At submit (isSubmit=true): charges parties whose billing_mode='submit'.
+// At DLR (isSubmit=false): charges remaining parties whose billing_mode='dlr' on DELIVRD.
+// forceDlr flags: if true, override billing_mode to 'submit' at submit time (charge immediately).
+// Uses ATOMIC CLAIM-FIRST pattern to prevent double-billing:
+//   1. Atomically claim the billing flag (is_client_billed / is_supplier_billed)
+//   2. If claim succeeds, deduct balance
+//   3. If deduction fails, rollback the claim
+async function applyBilling({ messageId, clientId, supplierId, clientCost, supplierCost, clientBillingMode, supplierBillingMode, isSubmit, dlrStatus, clientForceDlr = false, supplierForceDlr = false }) {
+    try {
+        clientBillingMode = clientBillingMode || 'dlr';
+        supplierBillingMode = supplierBillingMode || 'dlr';
+        
+        // ── Force DLR does NOT override billing_mode ──
+        // Force DLR only schedules a fake DELIVRD after timeout — it must not
+        // change billing behavior. Clients with billing_mode='dlr' should only
+        // be charged on real (or force-simulated) DELIVRD, never on submit.
+        // Otherwise failed messages get billed immediately with no refund path.
+        
+        let clientBilledNow = false, supplierBilledNow = false;
+        
+        // ── Client billing (atomic claim-first) ──
+        const shouldBillClient = isSubmit
+            ? clientBillingMode === 'submit'
+            : (clientBillingMode === 'dlr' && dlrStatus === 'DELIVRD');
+        
+        if (shouldBillClient && clientCost > 0 && clientId) {
+            // Step 1: Atomically claim billing — only one caller wins
+            const claimed = await pool.query(
+                'UPDATE sms_logs SET is_client_billed = true WHERE message_id = $1 AND is_client_billed = false RETURNING id',
+                [messageId]
+            );
+            if (claimed.rows.length > 0) {
+                // Step 2: Deduct balance (safe — we own the claim)
+                try {
+                    await pool.query(
+                        'UPDATE clients SET balance = GREATEST(0, balance - $1), updated_at = NOW() WHERE id = $2',
+                        [clientCost, clientId]
+                    );
+                    clientBilledNow = true;
+                    console.error(`[BILLING] 💰 ${messageId}: Client #${clientId} billed €${clientCost} (${isSubmit ? 'submit' : 'DLR'}, mode=${clientBillingMode})`);
+                } catch (deductErr) {
+                    // Step 3: Rollback claim on deduction failure
+                    await pool.query(
+                        'UPDATE sms_logs SET is_client_billed = false WHERE message_id = $1',
+                        [messageId]
+                    ).catch(() => {});
+                    console.error(`[BILLING] ❌ ${messageId}: Client deduction failed, claim rolled back: ${deductErr.message}`);
+                }
+            }
+        }
+        
+        // ── Supplier billing (atomic claim-first) ──
+        const shouldBillSupplier = isSubmit
+            ? supplierBillingMode === 'submit'
+            : (supplierBillingMode === 'dlr' && dlrStatus === 'DELIVRD');
+        
+        if (shouldBillSupplier && supplierCost > 0 && supplierId) {
+            const claimed = await pool.query(
+                'UPDATE sms_logs SET is_supplier_billed = true WHERE message_id = $1 AND is_supplier_billed = false RETURNING id',
+                [messageId]
+            );
+            if (claimed.rows.length > 0) {
+                try {
+                    await pool.query(
+                        'UPDATE suppliers SET balance = GREATEST(0, balance - $1), updated_at = NOW() WHERE id = $2',
+                        [supplierCost, supplierId]
+                    );
+                    supplierBilledNow = true;
+                    console.error(`[BILLING] 💰 ${messageId}: Supplier #${supplierId} billed €${supplierCost} (${isSubmit ? 'submit' : 'DLR'}, mode=${supplierBillingMode})`);
+                } catch (deductErr) {
+                    await pool.query(
+                        'UPDATE sms_logs SET is_supplier_billed = false WHERE message_id = $1',
+                        [messageId]
+                    ).catch(() => {});
+                    console.error(`[BILLING] ❌ ${messageId}: Supplier deduction failed, claim rolled back: ${deductErr.message}`);
+                }
+            }
+        }
+        
+        // ── Update composite is_billed flag (backward compat) ──
+        // Both parties must be billed (or supplier doesn't exist)
+        if (clientBilledNow || supplierBilledNow) {
+            // Re-read flags to get accurate state after claims
+            const flagsR = await pool.query(
+                'SELECT is_client_billed, is_supplier_billed FROM sms_logs WHERE message_id = $1',
+                [messageId]
+            ).catch(() => ({ rows: [] }));
+            const clientDone = flagsR.rows[0]?.is_client_billed || (shouldBillClient && clientBilledNow);
+            const supplierDone = flagsR.rows[0]?.is_supplier_billed || (shouldBillSupplier && supplierBilledNow) || !supplierId;
+            if (clientDone && supplierDone) {
+                await pool.query(
+                    'UPDATE sms_logs SET is_billed = true WHERE message_id = $1 AND is_billed = false',
+                    [messageId]
+                ).catch(() => {});
+            }
+        }
+        
+        return { clientBilled: clientBilledNow, supplierBilled: supplierBilledNow };
+    } catch (e) {
+        console.error('[BILLING] ❌ applyBilling failed for ' + messageId + ': ' + e.message);
+        return { clientBilled: false, supplierBilled: false };
+    }
+}
 
 // Bulk delete rates (soft delete)
 app.post('/api/rates/bulk-delete', auth, async (req, res) => {
@@ -1683,15 +3126,23 @@ app.post('/api/rates/notify', auth, async (req, res) => {
 // Workers process the outbox with retry, rate limiting, and DLQ.
 
 // Fast route resolution helper (cached per-request)
+const DEBUG_ROUTE = process.env.DEBUG_ROUTE === 'true';
+const DEBUG_SMS_SEND = process.env.DEBUG_SMS_SEND === 'true';
+
 async function resolveRoute(client, destination) {
-    let supplier_id = null, supplier_code = null, supplier_rate = null;
+    // Mask last 4 digits of destination for privacy in logs
+    const maskedDest = String(destination).slice(0, -4) + '****';
+    const debugId = `[ROUTE:${client.client_code || client.id}→${maskedDest}]`;
+    const dbg = (...args) => { if (DEBUG_ROUTE) console.error(...args); };
+    if (DEBUG_ROUTE) dbg(`${debugId} Starting route resolution (raw dest: ${destination})`);
+    let supplier_id = null, supplier_code = null, supplier_rate = null, supplier_billing_mode = 'dlr', supplier_force_dlr = false, supplier_force_dlr_timeout = 0;
     let route_name = null, trunk_name = null, mcc = '', mnc = '', operator = '', country = '';
     let voice_otp_config_id = null;  // resolved from route > trunk > supplier
 
     // Try to find MCC/MNC and operator/country
     try {
         const dest = String(destination).replace(/^\+/, '');
-        for (let len = 5; len >= 1; len--) {
+        for (let len = 6; len >= 1; len--) {
             const prefix = dest.substring(0, len);
             const mccR = await pool.query(
                 'SELECT mcc, mnc, country, operator FROM mccmnc WHERE calling_code = $1 AND (is_deleted IS NULL OR is_deleted = false) LIMIT 1',
@@ -1701,86 +3152,248 @@ async function resolveRoute(client, destination) {
                 mcc = mccR.rows[0].mcc; mnc = mccR.rows[0].mnc;
                 operator = mccR.rows[0].operator || '';
                 country = mccR.rows[0].country || '';
+                dbg(`${debugId} MCC/MNC found via prefix '${prefix}': mcc=${mcc} mnc=${mnc} operator=${operator} country=${country}`);
                 break;
             }
         }
-    } catch (e) { /* non-critical */ }
+        if (!mcc) dbg(`${debugId} ⚠ No MCC/MNC found for destination`);
+    } catch (e) { dbg(`${debugId} MCC lookup error:`, e.message); }
 
+    let hadRoutePlan = false;
     if (client.routing_plan_id) {
+        hadRoutePlan = true;
+        dbg(`${debugId} Looking up route plan ID=${client.routing_plan_id}`);
         const planR = await pool.query('SELECT * FROM route_plans WHERE id = $1', [client.routing_plan_id]);
-        if (planR.rows.length && planR.rows[0].route_ids?.length > 0) {
+        if (!planR.rows.length) {
+            dbg(`${debugId} ⚠ Route plan ${client.routing_plan_id} not found`);
+        } else if (!planR.rows[0].route_ids?.length) {
+            dbg(`${debugId} ⚠ Route plan '${planR.rows[0].plan_name}' has no route_ids`);
+        } else {
+            dbg(`${debugId} Route plan '${planR.rows[0].plan_name}' → route_ids=${JSON.stringify(planR.rows[0].route_ids)}`);
             const routesR = await pool.query('SELECT * FROM routes WHERE id = ANY($1::int[]) AND is_active = true ORDER BY id', [planR.rows[0].route_ids]);
+            dbg(`${debugId} Found ${routesR.rows.length} active route(s): ${routesR.rows.map(r => r.route_name).join(', ') || 'none'}`);
             for (const route of routesR.rows) {
-                if (route.trunk_ids?.length > 0) {
-                    const trunksR = await pool.query('SELECT * FROM trunks WHERE id = ANY($1::int[]) AND is_active = true ORDER BY priority ASC', [route.trunk_ids]);
-                    for (const trunk of trunksR.rows) {
-                        const allowed = trunk.mccmnc_allowed || ['*'];
-                        const matches = allowed.some(p => p === '*' || (mcc && mcc.startsWith(p.replace('*', ''))));
-                        if (matches && trunk.supplier_id) {
-                            const supR = await pool.query('SELECT * FROM suppliers WHERE id = $1 AND status = $2 AND (is_deleted IS NULL OR is_deleted = false)', [trunk.supplier_id, 'active']);
-                            if (supR.rows.length) {
-                                route_name = route.route_name;
-                                trunk_name = trunk.trunk_name;
-                                supplier_id = supR.rows[0].id;
-                                supplier_code = supR.rows[0].supplier_code;
-                                // Voice OTP config priority: route > trunk > supplier
-                                voice_otp_config_id = route.voice_otp_config_id
-                                    || trunk.voice_otp_config_id
-                                    || supR.rows[0].voice_otp_config_id
-                                    || null;
-                                const supRateR = await pool.query(
-                                    "SELECT rate FROM rates WHERE entity_type='supplier' AND entity_id=$1 AND (mcc = $2 OR mcc = '*') AND is_active=true ORDER BY CASE WHEN mnc = '*' THEN 0 ELSE 1 END, rate ASC LIMIT 1",
-                                    [supplier_id, mcc || null]
-                                );
-                                if (supRateR.rows.length) supplier_rate = parseFloat(supRateR.rows[0].rate);
-                                break;
+                if (!route.trunk_ids?.length) {
+                    dbg(`${debugId}   Route '${route.route_name}' has no trunk_ids — skipping`);
+                    continue;
+                }
+                dbg(`${debugId}   Route '${route.route_name}' → trunk_ids=${JSON.stringify(route.trunk_ids)}`);
+                const trunksR = await pool.query('SELECT * FROM trunks WHERE id = ANY($1::int[]) AND is_active = true ORDER BY priority ASC', [route.trunk_ids]);
+                for (const trunk of trunksR.rows) {
+                    const allowed = trunk.mccmnc_allowed || ['*'];
+                    const matches = allowed.some(p => p === '*' || (mcc && mcc.startsWith(p.replace('*', ''))));
+                    dbg(`${debugId}     Trunk '${trunk.trunk_name}' (prio=${trunk.priority}) allowed=${JSON.stringify(allowed)} mcc=${mcc} match=${matches}`);
+                    if (matches && trunk.supplier_id) {
+                        const supR = await pool.query('SELECT * FROM suppliers WHERE id = $1 AND status = $2 AND bind_status = $3 AND (is_deleted IS NULL OR is_deleted = false)', [trunk.supplier_id, 'active', 'bound']);
+                        if (supR.rows.length) {
+                            route_name = route.route_name;
+                            trunk_name = trunk.trunk_name;
+                            supplier_id = supR.rows[0].id;
+                            supplier_code = supR.rows[0].supplier_code;
+                            supplier_billing_mode = supR.rows[0].billing_mode || 'dlr';
+                            supplier_force_dlr = supR.rows[0].force_dlr || false;
+                            supplier_force_dlr_timeout = parseInt(supR.rows[0].force_dlr_timeout) || 0;
+                            dbg(`${debugId}     ✅ Supplier: ${supplier_code} (ID=${supplier_id})`);
+                            // Voice OTP config priority: route > trunk > supplier
+                            voice_otp_config_id = route.voice_otp_config_id
+                                || trunk.voice_otp_config_id
+                                || supR.rows[0].voice_otp_config_id
+                                || null;
+                            if (voice_otp_config_id) dbg(`${debugId}     Voice OTP config ID=${voice_otp_config_id}`);
+                            const supRateR = await pool.query(
+                                "SELECT rate FROM rates WHERE entity_type='supplier' AND entity_id=$1 AND (mcc = $2 OR mcc = '*') AND is_active=true ORDER BY CASE WHEN mnc = '*' THEN 0 ELSE 1 END, rate ASC LIMIT 1",
+                                [supplier_id, mcc || null]
+                            );
+                            if (supRateR.rows.length) {
+                                supplier_rate = parseFloat(supRateR.rows[0].rate);
+                                dbg(`${debugId}     Supplier rate: €${supplier_rate}`);
+                            } else {
+                                dbg(`${debugId}     ⚠ No supplier rate found for mcc=${mcc}`);
                             }
+                            break;
+                        } else {
+                            dbg(`${debugId}     ⚠ Supplier ${trunk.supplier_id} not found or inactive`);
                         }
                     }
                 }
                 if (supplier_id) break;
             }
         }
+    } else {
+        dbg(`${debugId} ⚠ Client has no routing_plan_id`);
     }
 
-    // Fallback
-    if (!supplier_id) {
+    // Fallback — only when client has NO routing plan configured.
+    // If a route plan was configured but didn't match, return NO_ROUTE rather
+    // than silently routing through an unrelated supplier (e.g. OTT → SMPP).
+    if (!supplier_id && !hadRoutePlan) {
+        dbg(`${debugId} ⚠ No supplier found via route chain — trying fallback`);
         const fallbackR = await pool.query(
-            `SELECT * FROM suppliers WHERE status = $1 AND (is_deleted IS NULL OR is_deleted = false)
+            `SELECT * FROM suppliers WHERE status = $1 AND bind_status = $2 AND (is_deleted IS NULL OR is_deleted = false)
              ORDER BY id LIMIT 1`,
-            ['active']
+            ['active', 'bound']
         );
         if (fallbackR.rows.length) {
             supplier_id = fallbackR.rows[0].id;
             supplier_code = fallbackR.rows[0].supplier_code;
+            supplier_billing_mode = fallbackR.rows[0].billing_mode || 'dlr';
+            supplier_force_dlr = fallbackR.rows[0].force_dlr || false;
+            supplier_force_dlr_timeout = parseInt(fallbackR.rows[0].force_dlr_timeout) || 0;
             route_name = 'fallback';
             trunk_name = 'fallback';
+            dbg(`${debugId} ✅ Fallback supplier: ${supplier_code} (ID=${supplier_id})`);
             // Query supplier rate for fallback path too
             const supRateR = await pool.query(
                 "SELECT rate FROM rates WHERE entity_type='supplier' AND entity_id=$1 AND (mcc = $2 OR mcc = '*') AND is_active=true ORDER BY rate ASC LIMIT 1",
                 [supplier_id, mcc || null]
             );
-            if (supRateR.rows.length) supplier_rate = parseFloat(supRateR.rows[0].rate);
+            if (supRateR.rows.length) {
+                supplier_rate = parseFloat(supRateR.rows[0].rate);
+                dbg(`${debugId} Fallback supplier rate: €${supplier_rate}`);
+            }
+        } else {
+            dbg(`${debugId} ❌ No active fallback supplier found`);
         }
     }
 
-    return { supplier_id, supplier_code, supplier_rate, route_name, trunk_name, mcc, mnc, operator, country, voice_otp_config_id, billing_mode: client.billing_mode || 'dlr' };
+    const result = { supplier_id, supplier_code, supplier_rate, supplier_billing_mode, supplier_force_dlr, supplier_force_dlr_timeout, route_name, trunk_name, mcc, mnc, operator, country, voice_otp_config_id, billing_mode: client.billing_mode || 'dlr' };
+    dbg(`${debugId} ✅ RESOLVED: supplier=${supplier_code || 'NONE'} route=${route_name} trunk=${trunk_name} rate=€${supplier_rate || 0} mcc=${mcc} mnc=${mnc}`);
+    return result;
 }
 
+// ==================== E.164 DESTINATION NORMALIZATION ====================
+// Fixes malformed numbers (missing country code) before routing.
+// Examples: "01615069178" -> "8801615069178", "5069178" -> "8801615069178"
+function normalizeDestination(dest) {
+    if (!dest || typeof dest !== 'string') return dest;
+    let num = dest.replace(/^\+/, '').replace(/[^0-9]/g, '');
+    // Bangladesh: "01XXXXXXXXX" (11-13 digits) -> "8801XXXXXXXXX"
+    // Guarded to 11-13 digit range to avoid matching non-BD "01" prefixes
+    if (num.startsWith('01') && num.length >= 11 && num.length <= 13) {
+        num = '880' + num.substring(1);
+    }
+    // Note: short numbers (< 11 digits) cannot be reliably normalized.
+    // They will fail at resolveRoute's MCC lookup with NO_RATE/NO_SUPPLIER.
+    return num;
+}
+
+// ==================== SMS ROUTE SIMULATOR ====================
+// Simulates routing for a client + destination — returns ALL possible routes
+// with rates, profit margins, and warnings for negative-profit routes.
+app.post('/api/sms/simulate', auth, async (req, res) => {
+    try {
+        const { client_id, destination } = req.body;
+        if (!client_id || !destination) return res.status(400).json({ error: 'client_id and destination are required' });
+        const dest = String(destination).replace(/^\+/, '').replace(/^(00)+/, '');
+        
+        // 1. Look up MCC/MNC
+        let mcc = '', mnc = '', country = '', operator = '';
+        for (let len = 6; len >= 1; len--) {
+            const prefix = dest.substring(0, len);
+            const mccR = await pool.query('SELECT mcc, mnc, country, operator FROM mccmnc WHERE calling_code=$1 AND (is_deleted IS NULL OR is_deleted=false) LIMIT 1', [prefix]);
+            if (mccR.rows.length) { mcc = mccR.rows[0].mcc; mnc = mccR.rows[0].mnc; country = mccR.rows[0].country; operator = mccR.rows[0].operator; break; }
+        }
+        
+        // 2. Find all matching client rates
+        const clientRates = await pool.query(
+            `SELECT r.*, c.client_code, c.company_name FROM rates r
+             JOIN clients c ON c.id=r.entity_id AND c.status='active'
+             WHERE r.entity_type='client' AND r.entity_id=$3 AND (r.mcc=$1 OR r.mcc='*') AND r.is_active=true
+             ORDER BY CASE WHEN r.mnc=$2 THEN 0 WHEN r.mnc='*' THEN 1 ELSE 2 END, r.rate ASC`,
+            [mcc || null, mnc || null, client_id]
+        );
+        
+        // 3. Find all supplier rates via routes and trunks
+        // routes.trunk_ids is an INTEGER[] column linking routes → trunks
+        // Join: find routes where this trunk's ID is in the route's trunk_ids array
+        const supplierRoutes = await pool.query(
+            `SELECT DISTINCT s.id as supplier_id, s.supplier_code, s.company_name, s.connection_type, s.bind_status,
+                    r.rate as supplier_rate, r.mcc as rate_mcc, r.mnc as rate_mnc,
+                    ro.route_name, t.trunk_name
+             FROM rates r
+             JOIN suppliers s ON s.id=r.entity_id AND s.status='active' AND (s.is_deleted IS NULL OR s.is_deleted=false)
+             LEFT JOIN trunks t ON t.supplier_id=s.id AND t.is_active=true
+             LEFT JOIN routes ro ON t.id = ANY(ro.trunk_ids) AND ro.is_active=true
+             WHERE r.entity_type='supplier' AND (r.mcc=$1 OR r.mcc='*') AND r.is_active=true
+               AND s.connection_type IN ('smpp','http','voice_otp','rcs','ott','whatsapp','telegram','flash_sms')
+             ORDER BY r.rate ASC`,
+            [mcc || null]
+        );
+        
+        // 4. Build results matrix: every client rate × every supplier route
+        const results = [];
+        for (const cr of clientRates.rows) {
+            for (const sr of supplierRoutes.rows) {
+                const cRate = parseFloat(cr.rate || 0);
+                const sRate = parseFloat(sr.supplier_rate || 0);
+                const profit = parseFloat((cRate - sRate).toFixed(6));
+                results.push({
+                    client_code: cr.client_code, client_name: cr.company_name,
+                    client_rate: cRate, client_mcc: cr.mcc, client_mnc: cr.mnc,
+                    supplier_code: sr.supplier_code, supplier_name: sr.company_name,
+                    supplier_rate: sRate, supplier_mcc: sr.rate_mcc, supplier_type: sr.connection_type,
+                    supplier_bind: sr.bind_status, route_name: sr.route_name || 'Direct',
+                    trunk_name: sr.trunk_name || '—',
+                    profit, viable: profit > 0,
+                    warning: profit <= 0 ? 'Supplier rate ≥ client rate — no profit margin' : null,
+                });
+            }
+        }
+        results.sort((a, b) => b.profit - a.profit);
+        
+        res.json({
+            success: true, data: {
+                destination, mcc, mnc, country, operator,
+                client_count: clientRates.rows.length, supplier_count: supplierRoutes.rows.length,
+                total_combinations: results.length,
+                viable: results.filter(r => r.viable).length,
+                warnings: results.filter(r => !r.viable).length,
+                routes: results,
+            }
+        });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ==================== SMS SEND (full pipeline) ====================
 app.post('/api/sms/send', auth, async (req, res) => {
     try {
-        const { client_id, destination, sender_id, message, idempotency_key, source: customSource } = req.body;
-        if (!client_id || !destination || !message) return res.status(400).json({ error: 'client_id, destination, and message are required' });
+        const { client_id, destination: rawDest, sender_id, message, idempotency_key, source: customSource } = req.body;
+        if (!client_id || !rawDest || !message) return res.status(400).json({ error: 'client_id, destination, and message are required' });
+
+        // Debug helper — controlled by DEBUG_SMS_SEND=true env var
+        const sendDbg = (...args) => { if (DEBUG_SMS_SEND) console.error(...args); };
+
+        // E.164 normalization — fix malformed numbers before routing
+        const destination = normalizeDestination(rawDest);
+        if (destination !== rawDest) {
+            console.error('[SMS] Destination normalized: "' + rawDest + '" -> "' + destination + '"');
+        }
+
+        sendDbg('[SMS-SEND] ═══ REQUEST ═══ client=' + client_id + ' dest=' + destination + ' sender=' + (sender_id || 'N/A') + ' msgLen=' + (message || '').length);
 
         // 1. Look up client
         const clientR = await pool.query('SELECT * FROM clients WHERE id = $1 AND status = $2 AND (is_deleted IS NULL OR is_deleted = false)', [client_id, 'active']);
-        if (!clientR.rows.length) return res.status(400).json({ error: 'Client not found or inactive' });
+        if (!clientR.rows.length) {
+            sendDbg('[SMS-SEND] ❌ GATE 1/7: AUTH — Client #' + client_id + ' not found or inactive');
+            // Log the rejection so it appears in SMS Logs with a valid reason.
+            // Use NULL for client_id to avoid FK violation (client doesn't exist).
+            const rejId = genNumericMsgId('2');
+            pool.query(
+                `INSERT INTO sms_logs (message_id, client_id, destination, sender_id, message, status, error_code, error_message, source, submit_time, original_sender_id, original_message, original_destination)
+                 VALUES ($1,NULL,$2,$3,$4,'failed',$5,$6,$7,NOW(),$8,$9,$10)`,
+                [rejId, rawDest || '', sender_id || '', message || '', 'CLIENT_NOT_FOUND', 'Client not found or inactive', customSource || 'external_api', sender_id || '', message || '', rawDest || '']
+            ).catch((err) => { console.error('[SMS-SEND] Failed to insert CLIENT_NOT_FOUND log:', err.message); });
+            res.set('Content-Type', 'application/json');
+            return res.status(400).send(JSON.stringify({ error: 'Client not found or inactive', message_id: rejId }));
+        }
         const c = clientR.rows[0];
+        sendDbg('[SMS-SEND] ✅ GATE 1/7: AUTH — Client "' + c.client_code + '" (id=' + c.id + ') balance=' + (c.balance || 0) + ' credit=' + (c.credit_limit || 0));
 
         // 2. Fast route resolution (must come BEFORE rate lookup — route.mcc/route.mnc needed)
         const route = await resolveRoute(c, destination);
         if (!route.supplier_id) {
-            const rejId = 'REJ' + Date.now() + Math.random().toString(36).substr(2, 6);
+            sendDbg('[SMS-SEND] ❌ GATE 2/7: ROUTE — No active supplier found for ' + c.client_code + ' → ' + destination);
+            const rejId = genNumericMsgId('2'); // REJECTED: pure numeric ID
             await pool.query(
                 `INSERT INTO sms_logs (message_id, client_id, client_code, destination, sender_id, message, status, error_code, error_message, source, submit_time, original_sender_id, original_message, original_destination)
                  VALUES ($1,$2,$3,$4,$5,$6,'failed',$7,$8,$9,NOW(),$10,$11,$12)`,
@@ -1788,6 +3401,7 @@ app.post('/api/sms/send', auth, async (req, res) => {
             ).catch(() => {});
             return res.status(400).json({ success: false, error: 'No active supplier found', code: 'NO_SUPPLIER' });
         }
+        sendDbg('[SMS-SEND] ✅ GATE 2/7: ROUTE — supplier=' + route.supplier_code + ' mcc=' + (route.mcc || '?') + ' mnc=' + (route.mnc || '?') + ' rate=€' + (route.supplier_rate || 0));
 
         // 3. Get and validate client rate — MNC-aware: exact MNC > wildcard > MCC-only, lowest first
         const clientRateR = await pool.query(
@@ -1798,7 +3412,8 @@ app.post('/api/sms/send', auth, async (req, res) => {
         );
         const clientRate = clientRateR.rows.length ? parseFloat(clientRateR.rows[0].rate) : null;
         if (!clientRate || clientRate <= 0) {
-            const rejId = 'REJ' + Date.now() + Math.random().toString(36).substr(2, 6);
+            sendDbg('[SMS-SEND] ❌ GATE 3/7: CLIENT_RATE — No rate for client=' + c.client_code + ' mcc=' + (route.mcc || '?') + ' mnc=' + (route.mnc || '?'));
+            const rejId = genNumericMsgId('2'); // REJECTED: pure numeric ID
             await pool.query(
                 `INSERT INTO sms_logs (message_id, client_id, client_code, destination, sender_id, message, status, error_code, error_message, source, submit_time, original_sender_id, original_message, original_destination)
                  VALUES ($1,$2,$3,$4,$5,$6,'failed',$7,$8,$9,NOW(),$10,$11,$12)`,
@@ -1806,10 +3421,12 @@ app.post('/api/sms/send', auth, async (req, res) => {
             ).catch(() => {});
             return res.status(400).json({ success: false, error: 'Client rate not found', code: 'NO_RATE' });
         }
+        sendDbg('[SMS-SEND] ✅ GATE 3/7: CLIENT_RATE — €' + clientRate);
 
         // 4. Validate supplier rate
         if (!(route.supplier_rate > 0)) {
-            const rejId = 'REJ' + Date.now() + Math.random().toString(36).substr(2, 6);
+            sendDbg('[SMS-SEND] ❌ GATE 4/7: SUPPLIER_RATE — No rate for supplier=' + route.supplier_code + ' mcc=' + (route.mcc || '?') + ' mnc=' + (route.mnc || '?'));
+            const rejId = genNumericMsgId('2'); // REJECTED: pure numeric ID
             await pool.query(
                 `INSERT INTO sms_logs (message_id, client_id, client_code, supplier_id, supplier_code, destination, sender_id, message, status, error_code, error_message, source, submit_time, original_sender_id, original_message, original_destination)
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'failed',$9,$10,$11,NOW(),$12,$13,$14)`,
@@ -1817,12 +3434,14 @@ app.post('/api/sms/send', auth, async (req, res) => {
             ).catch(() => {});
             return res.status(400).json({ success: false, error: 'Supplier rate not found', code: 'NO_SUPPLIER_RATE' });
         }
+        sendDbg('[SMS-SEND] ✅ GATE 4/7: SUPPLIER_RATE — €' + route.supplier_rate);
 
         // 5. Profit check
         const parts = Math.max(1, Math.ceil((message || '').length / 160));
         const profit = parseFloat((clientRate - route.supplier_rate).toFixed(6));
         if (profit <= 0) {
-            const rejId = 'REJ' + Date.now() + Math.random().toString(36).substr(2, 6);
+            sendDbg('[SMS-SEND] ❌ GATE 5/7: PROFIT — client=€' + clientRate + ' supplier=€' + route.supplier_rate + ' profit=€' + profit + ' (BLOCKED)');
+            const rejId = genNumericMsgId('2'); // REJECTED: pure numeric ID
             await pool.query(
                 `INSERT INTO sms_logs (message_id, client_id, client_code, supplier_id, supplier_code, destination, sender_id, message, status, error_code, error_message, client_rate, supplier_rate, source, submit_time, original_sender_id, original_message, original_destination)
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'failed',$9,$10,$11,$12,$13,NOW(),$14,$15,$16)`,
@@ -1835,6 +3454,7 @@ app.post('/api/sms/send', auth, async (req, res) => {
                 details: { client_rate: clientRate, supplier_rate: route.supplier_rate, profit }
             });
         }
+        sendDbg('[SMS-SEND] ✅ GATE 5/7: PROFIT — client=€' + clientRate + ' supplier=€' + route.supplier_rate + ' profit=€' + profit + ' (OK)');
 
         // 6. Balance + Credit check (ALL billing modes)
         const cost = parseFloat((clientRate * parts).toFixed(6));
@@ -1843,7 +3463,8 @@ app.post('/api/sms/send', auth, async (req, res) => {
         const available = balance + credit;
 
         if (available <= 0 || available < cost) {
-            const rejId = 'REJ' + Date.now() + Math.random().toString(36).substr(2, 6);
+            sendDbg('[SMS-SEND] ❌ GATE 6/7: BALANCE — available=€' + available + ' needed=€' + cost + ' (INSUFFICIENT)');
+            const rejId = genNumericMsgId('2'); // REJECTED: pure numeric ID
             await pool.query(
                 `INSERT INTO sms_logs (message_id, client_id, client_code, supplier_id, supplier_code, destination, sender_id, message, status, error_code, error_message, client_rate, supplier_rate, source, submit_time, original_sender_id, original_message, original_destination)
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'failed',$9,$10,$11,$12,$13,NOW(),$14,$15,$16)`,
@@ -1856,22 +3477,31 @@ app.post('/api/sms/send', auth, async (req, res) => {
                 details: { available: Number(available), needed: Number(cost) }
             });
         }
+        sendDbg('[SMS-SEND] ✅ GATE 6/7: BALANCE — available=€' + available + ' needed=€' + cost + ' (SUFFICIENT)');
 
-        // 7. Deduct from credit first, then balance
-        if (credit >= cost) {
-            credit = parseFloat((credit - cost).toFixed(6));
-        } else {
-            const remainder = parseFloat((cost - credit).toFixed(6));
-            credit = 0;
-            balance = parseFloat((balance - remainder).toFixed(6));
-        }
-        await pool.query(
-            'UPDATE clients SET balance = $1, credit_limit = $2, updated_at = NOW() WHERE id = $3',
-            [balance, credit, client_id]
-        );
+        // 7. Submit-mode billing via unified applyBilling helper.
+        // Charges client AND/OR supplier immediately if their billing_mode='submit'.
+        // DLR-mode parties are deferred to DLR confirmation (charged on DELIVRD).
+        sendDbg('[SMS-SEND] 💳 BILLING: client mode=' + (c.billing_mode || 'dlr') + ' supplier mode=' + (route.supplier_billing_mode || 'dlr'));
+        const clientBillingMode = c.billing_mode || 'dlr';
+        const supplierBillingMode = route.supplier_billing_mode || 'dlr';
+        const clientSubmitCost = parseFloat((clientRate * parts).toFixed(6));
+        const supplierSubmitCost = parseFloat((route.supplier_rate * parts).toFixed(6));
+        // Billing will be applied AFTER enqueue so sms_logs row exists with billing_mode_snapshots
+        // Store for deferred billing call (includes force_dlr flags + timeout for auto-DLR)
+        const billingContext = {
+            clientBillingMode, supplierBillingMode,
+            clientSubmitCost, supplierSubmitCost,
+            client_id, supplier_id: route.supplier_id,
+            clientForceDlr: c.force_dlr || false,
+            supplierForceDlr: route.supplier_force_dlr || false,
+            clientForceDlrTimeout: parseInt(c.force_dlr_timeout) || 0,
+            supplierForceDlrTimeout: route.supplier_force_dlr_timeout || 0
+        };
 
         // 6. Generate message_id and enqueue for async processing
-        const msgId = 'MSG' + Date.now() + Math.random().toString(36).substr(2, 6);
+        const isInternal = INTERNAL_SOURCES.includes(customSource || '');
+        const msgId = genNumericMsgId(isInternal ? '1' : '0'); // prefix=1 for internal, 0 for external
 
         // Rate limit check (don't block, just warn)
         let rateLimited = false;
@@ -1886,8 +3516,74 @@ app.post('/api/sms/send', auth, async (req, res) => {
         const origMessage = message;
         const translated = await applyTranslations(client_id, route.supplier_id, destination, origSenderId, message);
 
-        // Enqueue to async queue manager
+        // Check OTP extract translation blocking: Voice OTP suppliers require numeric codes.
+        // Text-only messages like "Browser verify test" are rejected before routing.
+        // Only block for Voice OTP suppliers — standard SMS suppliers don't need OTP extraction.
+        if (translated.blocked) {
+            const isVoiceOtpSupplier = route.supplier_id
+                ? (await pool.query('SELECT connection_type FROM suppliers WHERE id=$1', [route.supplier_id])).rows[0]?.connection_type === 'voice_otp'
+                : false;
+            if (isVoiceOtpSupplier) {
+                await pool.query(
+                    `INSERT INTO sms_logs (message_id, client_id, client_code, supplier_id, supplier_code, destination, sender_id, message, status, error_code, error_message, source, submit_time, original_sender_id, original_message, original_destination)
+                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'rejected',$9,$10,$11,NOW(),$12,$13,$14)`,
+                    [msgId, client_id, c.client_code, route.supplier_id, route.supplier_code, destination, sender_id || '', message, 'OTP_EXTRACT_FAILED', translated.block_reason || 'No numeric OTP code found', customSource || 'external_api', origSenderId || '', origMessage, origDestination]
+                ).catch(() => {});
+                // DLR push for failed OTP extract
+                if (queueManager && queueManager.onDlr) {
+                    queueManager.onDlr({
+                        client_id, message_id: msgId, destination,
+                        sender_id: sender_id || '', status: 'REJECTED',
+                        client_code: c.client_code || '', queued_at: new Date().toISOString(),
+                        source: customSource || 'external_api'
+                    }).catch(() => {});
+                }
+                return res.status(403).json({ error: 'OTP extraction failed', reason: translated.block_reason, message_id: msgId });
+            }
+            // Non-Voice-OTP supplier: OTP extract failed but that's OK — just log and continue
+            console.error(`[SMS-SEND] ⚠ ${msgId}: OTP extract failed but supplier is not voice_otp — ignoring block_reason=${translated.block_reason}`);
+        }
+
+        // Check blocking rules (DND, keyword blacklist/whitelist, URL block)
+        const blockCheck = await checkTranslationsBlock(c.id, route.supplier_id, destination, message);
+        if (blockCheck) {
+            await pool.query(
+                `INSERT INTO sms_logs (message_id, client_id, client_code, supplier_id, supplier_code, destination, sender_id, message, status, error_code, error_message, source, submit_time, original_sender_id, original_message, original_destination)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'rejected',$9,$10,$11,NOW(),$12,$13,$14)`,
+                [msgId, client_id, c.client_code, route.supplier_id, route.supplier_code, destination, sender_id || '', message, 'BLOCKED', blockCheck.reason, customSource || 'external_api', origSenderId || '', origMessage, origDestination]
+            ).catch(() => {});
+            // DLR push for blocked messages (immediate feedback to external client)
+            if (queueManager && queueManager.onDlr) {
+                queueManager.onDlr({
+                    client_id, message_id: msgId, destination,
+                    sender_id: sender_id || '', status: 'REJECTED',
+                    client_code: c.client_code || '', queued_at: new Date().toISOString(),
+                    source: customSource || 'external_api'
+                }).catch(() => {});
+            }
+            return res.status(403).json({ error: 'Message blocked', reason: blockCheck.reason, message_id: msgId });
+        }
+
+        // Enqueue to async queue manager AND insert into sms_logs immediately
+        // so the log appears in SMS Logs page right away (not just after worker processing).
+        // The queue worker will UPDATE this row on delivery/DLR.
+        const logInsert = await pool.query(
+            `INSERT INTO sms_logs (message_id, client_id, client_code, sender_id, destination, message, message_parts,
+             client_rate, supplier_rate, profit, currency, status, dlr_status, submit_time,
+             supplier_id, supplier_code, route_name, trunk_name, mcc, mnc, operator, country,
+             original_sender_id, original_message, original_destination,
+             billing_mode_snapshot, supplier_billing_mode_snapshot, source)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'submitted','PENDING',NOW(),$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+             RETURNING id`,
+            [msgId, client_id, c.client_code, translated.sender_id, translated.destination, translated.message, parts,
+             clientRate, route.supplier_rate, profit, c.currency || 'EUR',
+             route.supplier_id, route.supplier_code, route.route_name, route.trunk_name, route.mcc, route.mnc, route.operator || '', route.country || '',
+             origSenderId, origMessage, origDestination,
+             c.billing_mode || 'dlr', route.supplier_billing_mode || 'dlr', customSource || 'external_api']
+        );
+
         if (queueManager) {
+            sendDbg('[SMS-SEND] ✅ GATE 7/7: ENQUEUED — msgId=' + msgId + ' → supplier=' + route.supplier_code + ' profit=€' + profit + (rateLimited ? ' (RATE-LIMITED)' : ''));
             await queueManager.enqueue({
                 message_id: msgId,
                 client_id,
@@ -1913,28 +3609,73 @@ app.post('/api/sms/send', auth, async (req, res) => {
                 country: route.country || '',
                 voice_otp_config_id: route.voice_otp_config_id || null,
                 billing_mode: c.billing_mode || 'dlr',
+                supplier_billing_mode: route.supplier_billing_mode || 'dlr',
                 webhook_url: c.webhook_url || '',
                 idempotency_key: idempotency_key || null,
                 source: customSource || 'external_api',
             });
         } else {
-            // Fallback: direct insert to sms_logs if queue not ready
-            await pool.query(
-                `INSERT INTO sms_logs (message_id, client_id, client_code, sender_id, destination, message, message_parts,
-                 client_rate, supplier_rate, profit, currency, status, submit_time,
-                 supplier_id, supplier_code, route_name, trunk_name, mcc, mnc, billing_mode_snapshot)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'submitted',NOW(),$12,$13,$14,$15,$16,$17,$18)`,
-                [msgId, client_id, c.client_code, translated.sender_id, translated.destination, translated.message, parts,
-                 clientRate, route.supplier_rate, profit, c.currency || 'EUR',
-                 route.supplier_id, route.supplier_code, route.route_name, route.trunk_name, route.mcc, route.mnc,
-                 c.billing_mode || 'dlr']
-            );
+            // Fallback: queue not ready, but log is already inserted above
+            console.error('[SMS-SEND] ⚠ Queue manager not available — sms_logs inserted but not enqueued: ' + msgId);
         }
 
-        // 7. Instant response — message is queued, not yet delivered
+        // 8. Apply submit-mode billing (after sms_logs insert + enqueue so row exists).
+        // Force DLR entries bypass the billing_mode gate — they always charge immediately.
+        const hasSubmitBilling = billingContext.clientBillingMode === 'submit'
+                             || billingContext.supplierBillingMode === 'submit'
+                             || billingContext.clientForceDlr
+                             || billingContext.supplierForceDlr;
+        console.error('[DIAG] hasSubmitBilling=%s clientMode=%s suppMode=%s clientFD=%s suppFD=%s',
+            hasSubmitBilling, billingContext.clientBillingMode, billingContext.supplierBillingMode,
+            billingContext.clientForceDlr, billingContext.supplierForceDlr);
+        if (hasSubmitBilling) {
+            await applyBilling({
+                messageId: msgId,
+                clientId: billingContext.client_id,
+                supplierId: billingContext.supplier_id,
+                clientCost: billingContext.clientSubmitCost,
+                supplierCost: billingContext.supplierSubmitCost,
+                clientBillingMode: billingContext.clientBillingMode,
+                supplierBillingMode: billingContext.supplierBillingMode,
+                clientForceDlr: billingContext.clientForceDlr,
+                supplierForceDlr: billingContext.supplierForceDlr,
+                isSubmit: true
+            });
+        }
+
+        // 9. Auto-DLR: if force_dlr is enabled, schedule a fake DELIVRD after force_dlr_timeout seconds.
+        //    timeout=0 means instant (setImmediate). Charges immediately regardless of billing_mode.
+        if (billingContext.clientForceDlr || billingContext.supplierForceDlr) {
+            const timeoutSec = Math.max(
+                billingContext.clientForceDlr ? billingContext.clientForceDlrTimeout : 0,
+                billingContext.supplierForceDlr ? billingContext.supplierForceDlrTimeout : 0
+            );
+            const scheduleDlr = async () => {
+                try {
+                    await pool.query(
+                        `UPDATE sms_logs SET dlr_status = 'DELIVRD', status = 'delivered', delivery_time = NOW(), dlr_timestamp = NOW(), is_force_dlr = true WHERE message_id = $1 AND dlr_status = 'PENDING'`,
+                        [msgId]
+                    );
+                    await pool.query(
+                        `UPDATE sms_outbox SET dlr_status = 'DELIVRD', status = 'delivered', dlr_confirmed_at = NOW(), completed_at = NOW() WHERE message_id = $1 AND dlr_status = 'PENDING'`,
+                        [msgId]
+                    ).catch(() => {});
+                    console.error(`[FORCE-DLR] ⚡ ${msgId}: Auto-DLR set to DELIVRD after ${timeoutSec}s (force_dlr override, client=${billingContext.clientForceDlr}, supplier=${billingContext.supplierForceDlr})`);
+                } catch (e) { /* best-effort */ }
+            };
+            if (timeoutSec <= 0) {
+                setTimeout(scheduleDlr, 0);
+            } else {
+                setTimeout(scheduleDlr, timeoutSec * 1000);
+            }
+        }
+
+        // 10. Instant response — message is queued, not yet delivered
+        const logId = logInsert?.rows?.[0]?.id;
         res.json({
             success: true,
             data: {
+                id: logId,
                 message_id: msgId,
                 status: 'queued',
                 destination,
@@ -1944,6 +3685,7 @@ app.post('/api/sms/send', auth, async (req, res) => {
                 billing_mode: c.billing_mode,
                 route_name: route.route_name,
                 trunk_name: route.trunk_name,
+                supplier_code: route.supplier_code,
                 rate_limited: rateLimited
             },
             message: rateLimited ? 'Queued (client approaching TPS limit)' : 'Queued for delivery'
@@ -1959,10 +3701,19 @@ app.post('/api/sms/send/http', async (req, res) => {
         const clientR = await pool.query('SELECT * FROM clients WHERE api_key = $1 AND api_enabled = true AND status = $2 AND (is_deleted IS NULL OR is_deleted = false)', [apiKey, 'active']);
         if (!clientR.rows.length) return res.status(401).json({ error: 'Invalid API key' });
         req.body.client_id = clientR.rows[0].id;
-        // Forward to the main send endpoint
-        const mainHandler = app._router.stack.find(l => l.route?.path === '/api/sms/send' && l.route?.methods?.post);
-        if (mainHandler) return mainHandler.handle(req, res);
-        res.status(500).json({ error: 'Send endpoint unavailable' });
+        req.body.source = req.body.source || 'external_api';
+        // Generate short-lived internal JWT to call the main send endpoint (which requires auth)
+        const internalToken = jwt.sign({ id: 1, username: 'system', role: 'super_admin' }, JWT_SECRET, { expiresIn: '30s' });
+        const response = await fetch(`http://127.0.0.1:${PORT}/api/sms/send`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${internalToken}`,
+            },
+            body: JSON.stringify(req.body),
+        });
+        const result = await response.json();
+        res.status(response.status).json(result);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -2039,74 +3790,33 @@ app.get('/api/sms/logs/:id', auth, async (req, res) => {
 
 // Send a test SMS
 app.post('/api/sms/test', auth, async (req, res) => {
+    // Forward to the full /api/sms/send pipeline so test messages actually:
+    // 1) pass all 7 validation gates (auth, route, rate, profit, balance),
+    // 2) get enqueued to sms_outbox with connector_transaction_id,
+    // 3) get submitted to the supplier via HTTP/SMPP connector, and
+    // 4) get polled for DLR every 5s (up to 3 min timeout).
+    //
+    // Previously this endpoint only INSERT-ed into sms_logs with status='sent'
+    // and never actually called the supplier — zero DLR, zero delivery.
     try {
-        const { destination, message, sender_id, client_id, supplier_id } = req.body;
-        if (!destination || !message) return res.status(400).json({ error: 'destination and message are required' });
-        const messageId = `TEST_${Date.now()}_${Math.random().toString(36).substr(2, 8)}`;
-
-        // Look up supplier info if supplier_id provided
-        let supplierCode = null;
-        let supplierName = null;
-        if (supplier_id) {
-            try {
-                const sRes = await pool.query('SELECT supplier_code, company_name FROM suppliers WHERE id = $1', [supplier_id]);
-                if (sRes.rows.length > 0) {
-                    supplierCode = sRes.rows[0].supplier_code;
-                    supplierName = sRes.rows[0].company_name;
-                }
-            } catch { /* ignore lookup errors */ }
-        }
-
-        // Real rate lookup: client_rate from client rates, supplier_rate from supplier rates
-        let clientRate = 0;
-        let supplierRate = 0;
-        try {
-            if (client_id) {
-                const cr = await pool.query(
-                    "SELECT rate FROM rates WHERE entity_type='client' AND entity_id=$1 AND is_active=true ORDER BY rate ASC LIMIT 1",
-                    [client_id]
-                );
-                if (cr.rows.length > 0) clientRate = parseFloat(cr.rows[0].rate);
-            }
-            if (supplier_id) {
-                const sr = await pool.query(
-                    "SELECT rate FROM rates WHERE entity_type='supplier' AND entity_id=$1 AND is_active=true ORDER BY rate ASC LIMIT 1",
-                    [supplier_id]
-                );
-                if (sr.rows.length > 0) supplierRate = parseFloat(sr.rows[0].rate);
-            }
-        } catch { /* rate lookup failures are non-critical */ }
-        // Capture original values before translation
-        const origSid = sender_id || 'TEST';
-        const origMsg = message;
-        const origDest = destination;
-
-        // Apply translations (OTP extract, number prefix, SID random, etc.)
-        let transSid = origSid;
-        let transMsg = origMsg;
-        let transDest = origDest;
-        try {
-            const translated = await applyTranslations(
-                client_id || null, supplier_id || null, destination, origSid, origMsg
-            );
-            if (translated) {
-                transSid = translated.sender_id || origSid;
-                transMsg = translated.message || origMsg;
-                transDest = translated.destination || origDest;
-            }
-        } catch (_) { /* best-effort */ }
-
-        const profit = parseFloat((clientRate - supplierRate).toFixed(6));
-
-        const result = await pool.query(
-            `INSERT INTO sms_logs (message_id, destination, sender_id, message, status, client_id, supplier_id, supplier_code, client_rate, supplier_rate, profit, currency, source, submit_time, original_sender_id, original_message, original_destination)
-             VALUES ($1,$2,$3,$4,'sent',$5,$6,$7,$8,$9,$10,'EUR','test_sms',NOW(),$11,$12,$13) RETURNING *`,
-            [messageId, transDest, transSid, transMsg, client_id || null, supplier_id || null, supplierCode, clientRate, supplierRate, profit, origSid, origMsg, origDest]
-        );
-        // No fake DLR — real DLR is handled by the HTTP DLR poll or SMPP DLR handler
-        res.json({ success: true, data: result.rows[0], supplier: supplierName, message: 'Test SMS sent successfully' });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
+        const authHeader = req.headers.authorization || '';
+        const response = await fetch(`http://127.0.0.1:${PORT}/api/sms/send`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': authHeader,
+            },
+            body: JSON.stringify({
+                ...req.body,
+                source: 'test_sms',  // tag so sms_logs.source shows test_sms
+                idempotency_key: `TEST_${Date.now()}_${Math.random().toString(36).substr(2, 8)}`,
+            }),
+            signal: AbortSignal.timeout(30000),
+        });
+        const data = await response.json();
+        res.status(response.status).json(data);
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
     }
 });
 
@@ -2244,6 +3954,44 @@ app.get('/api/queue/stats', auth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ==================== DASHBOARD PROFIT WIDGET ====================
+// Returns today's revenue, cost, and profit per client for the real-time profit widget.
+app.get('/api/dashboard/profit', auth, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT
+                COALESCE(c.id, sl.client_id) as client_id,
+                COALESCE(c.client_code, 'unknown') as client_code,
+                COALESCE(c.company_name, 'Unknown') as company_name,
+                COUNT(*) as total_sms,
+                SUM(CASE WHEN sl.is_billed = true THEN 1 ELSE 0 END) as billed_sms,
+                SUM(CASE WHEN sl.status = 'delivered' THEN 1 ELSE 0 END) as delivered,
+                SUM(CASE WHEN sl.status = 'failed' THEN 1 ELSE 0 END) as failed,
+                ROUND(SUM(CASE WHEN sl.is_billed = true THEN sl.client_rate * sl.message_parts ELSE 0 END)::numeric, 4) as revenue,
+                ROUND(SUM(CASE WHEN sl.dlr_status = 'DELIVRD' THEN sl.supplier_rate * sl.message_parts ELSE 0 END)::numeric, 4) as cost,
+                ROUND(SUM(CASE WHEN sl.is_billed = true THEN sl.profit ELSE 0 END)::numeric, 4) as profit
+            FROM sms_logs sl
+            LEFT JOIN clients c ON c.id = sl.client_id
+            WHERE sl.submit_time::date = CURRENT_DATE
+              AND sl.client_id IS NOT NULL
+            GROUP BY COALESCE(c.id, sl.client_id), COALESCE(c.client_code, 'unknown'), COALESCE(c.company_name, 'Unknown')
+            ORDER BY profit DESC
+        `);
+
+        const totals = result.rows.reduce((acc, r) => ({
+            total_sms: acc.total_sms + Number(r.total_sms),
+            billed_sms: acc.billed_sms + Number(r.billed_sms),
+            delivered: acc.delivered + Number(r.delivered),
+            failed: acc.failed + Number(r.failed),
+            revenue: acc.revenue + Number(r.revenue),
+            cost: acc.cost + Number(r.cost),
+            profit: parseFloat((Number(acc.revenue) + Number(r.revenue) - Number(acc.cost) - Number(r.cost)).toFixed(4)),
+        }), { total_sms: 0, billed_sms: 0, delivered: 0, failed: 0, revenue: 0, cost: 0, profit: 0 });
+
+        res.json({ success: true, data: { clients: result.rows, totals } });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Reprocess dead letter queue
 app.post('/api/queue/reprocess-dlq', auth, async (req, res) => {
     try {
@@ -2355,9 +4103,12 @@ app.post('/api/invoices/generate', auth, async (req, res) => {
         const smsAgg = await pool.query(
             `SELECT
                 COUNT(*) as total_sms,
-                SUM(${rateCol} * message_parts) as total_amount,
-                COUNT(*) FILTER (WHERE status = 'delivered') as delivered_sms,
-                COUNT(*) FILTER (WHERE status = 'failed') as failed_sms
+                SUM(CASE WHEN is_billed = true THEN ${rateCol} * message_parts ELSE 0 END) as total_amount,
+                SUM(CASE WHEN dlr_status = 'DELIVRD' THEN supplier_rate * message_parts ELSE 0 END) as supplier_cost,
+                SUM(CASE WHEN status = 'delivered' THEN 1 ELSE 0 END) as delivered_sms,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed_sms,
+                SUM(CASE WHEN is_billed = true AND billing_mode_snapshot = 'submit' THEN ${rateCol} * message_parts ELSE 0 END) as submit_charge,
+                SUM(CASE WHEN is_billed = true AND (billing_mode_snapshot IS NULL OR billing_mode_snapshot = 'dlr') THEN ${rateCol} * message_parts ELSE 0 END) as dlr_charge
              FROM sms_logs
              WHERE ${idCol} = $1
                AND submit_time >= $2
@@ -2369,6 +4120,14 @@ app.post('/api/invoices/generate', auth, async (req, res) => {
         const agg = smsAgg.rows[0];
         const totalSms = parseInt(agg.total_sms) || 0;
         const totalAmount = parseFloat(agg.total_amount) || 0;
+        const supplierCost = parseFloat(agg.supplier_cost) || 0;
+        const deliveredSms = parseInt(agg.delivered_sms) || 0;
+        const failedSms = parseInt(agg.failed_sms) || 0;
+        const submitCharge = parseFloat(agg.submit_charge) || 0;
+        const dlrCharge = parseFloat(agg.dlr_charge) || 0;
+        // Net profit for invoice: revenue (totalAmount) minus supplier cost on DELIVRD
+        const netProfit = parseFloat((totalAmount - supplierCost).toFixed(4));
+        const billingSummary = `Submit-mode: €${submitCharge.toFixed(4)} | DLR-mode: €${dlrCharge.toFixed(4)} | Total billed: €${totalAmount.toFixed(4)}`;
 
         if (totalSms === 0) {
             return res.status(400).json({ error: 'No SMS data found for this period. Invoice not generated.' });
@@ -2385,19 +4144,21 @@ app.post('/api/invoices/generate', auth, async (req, res) => {
         const invNum = `INV-${new Date().getFullYear()}-${String(seq.rows[0].next).padStart(4, '0')}`;
         const dueDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
-        // Create invoice with real data
+        // Create invoice with real data including delivery breakdown and billing mode summary
         const invR = await pool.query(
             `INSERT INTO invoices (invoice_number, entity_type, entity_id, entity_name,
              invoice_to_name, invoice_to_email,
              invoice_by_name, invoice_by_email,
-             period_start, period_end, total_sms, total_amount, tax_amount, tax_rate, grand_total,
-             currency, status, due_date, notes, created_at)
-             VALUES ($1,$2,$3,$4,$5,$6,'NET2APP Hub','billing@net2app.com',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW()) RETURNING *`,
+             period_start, period_end, total_sms, delivered_sms, failed_sms,
+             total_amount, submit_charge, dlr_charge, tax_amount, tax_rate, grand_total,
+             currency, status, due_date, notes, billing_mode_summary, created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,'NET2APP Hub','billing@net2app.com',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,NOW()) RETURNING *`,
             [invNum, entity_type, entity_id, entityName,
              entityName, entityEmail,
              period_start, period_end,
-             totalSms, totalAmount, taxAmount, taxRate, grandTotal,
-             entity.currency || 'EUR', 'draft', dueDate, notes || 'Auto-generated from SMS logs']
+             totalSms, deliveredSms, failedSms,
+             totalAmount, submitCharge, dlrCharge, taxAmount, taxRate, grandTotal,
+             entity.currency || 'EUR', 'draft', dueDate, notes || 'Auto-generated from SMS logs', billingSummary]
         );
 
         res.json({
@@ -2405,11 +4166,16 @@ app.post('/api/invoices/generate', auth, async (req, res) => {
             data: invR.rows[0],
             summary: {
                 total_sms: totalSms,
-                delivered: parseInt(agg.delivered_sms) || 0,
-                failed: parseInt(agg.failed_sms) || 0,
+                delivered: deliveredSms,
+                failed: failedSms,
                 total_amount: totalAmount,
+                supplier_cost: supplierCost,
+                net_profit: netProfit,
+                submit_charge: submitCharge,
+                dlr_charge: dlrCharge,
                 tax_amount: taxAmount,
                 grand_total: grandTotal,
+                billing_mode_summary: billingSummary,
                 tax_rate: taxRate
             }
         });
@@ -2686,6 +4452,25 @@ async function applyTranslations(clientId, supplierId, destination, senderId, me
     return input;
 }
 
+// Blocking Rules: checks active blocking rules (DND, keyword, URL) against a message.
+// Returns {blocked:true, reason} if message should be rejected, or null if it passes.
+async function checkTranslationsBlock(clientId, supplierId, destination, message) {
+    try {
+        const blockR = await pool.query(
+            `SELECT * FROM translations WHERE is_active = true 
+             AND translation_type IN ('number_blacklist','keyword_blacklist','keyword_whitelist','url_block')
+             AND (apply_to = 'both' OR (apply_to = 'client' AND apply_entity_id = $1) OR (apply_to = 'supplier' AND apply_entity_id = $2) OR apply_entity_id = 'all')
+             ORDER BY priority ASC`,
+            [String(clientId || ''), String(supplierId || '')]
+        );
+        if (!blockR.rows.length) return null;
+        return checkBlocks(blockR.rows, { destination, message, sender_id: '' });
+    } catch (e) {
+        console.error('[Blocks] Engine error:', e.message);
+        return null; // If blocking check fails, allow message through (fail-open)
+    }
+}
+
 // GET all translations
 app.get('/api/translations', auth, async (req, res) => {
     try {
@@ -2709,15 +4494,15 @@ app.post('/api/translations', auth, async (req, res) => {
              client_id, supplier_id, route_id, mcc, mnc,
              name, description, subtype, priority, apply_to, apply_entity_id, is_active,
              strip_prefix_digits, add_prefix_text, match_content, replace_content,
-             is_otp_extract, otp_length_min, otp_length_max,
+             is_otp_extract, otp_length_min, otp_length_max, otp_strict_mode,
              template_data, sid_match_type, mccmnc_list, created_at)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
-                     $16,$17,$18,$19,$20,$21,$22,$23,$24,$25,NOW()) RETURNING *`,
+                     $16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,NOW()) RETURNING *`,
             [b.translation_type, b.source_pattern || '', b.target_value || '',
              b.client_id || null, b.supplier_id || null, b.route_id || null, b.mcc || null, b.mnc || null,
              b.name || '', b.description || '', b.subtype || '', b.priority || 1, b.apply_to || 'client', b.apply_entity_id || 'all', b.is_active !== false,
              b.strip_prefix_digits || 0, b.add_prefix_text || '', b.match_content || '', b.replace_content || '',
-             b.is_otp_extract || false, b.otp_length_min || 4, b.otp_length_max || 8,
+             b.is_otp_extract || false, b.otp_length_min || 4, b.otp_length_max || 8, b.otp_strict_mode !== undefined ? b.otp_strict_mode : true,
              b.template_data ? JSON.stringify(b.template_data) : '[]', b.sid_match_type || 'exact', b.mccmnc_list || null]
         );
         res.json({ success: true, data: result.rows[0] });
@@ -2733,7 +4518,7 @@ app.put('/api/translations/:id', auth, async (req, res) => {
             'client_id','supplier_id','route_id','mcc','mnc',
             'name','description','subtype','priority','apply_to','apply_entity_id','is_active',
             'strip_prefix_digits','add_prefix_text','match_content','replace_content',
-            'is_otp_extract','otp_length_min','otp_length_max',
+            'is_otp_extract','otp_length_min','otp_length_max','otp_strict_mode',
             'template_data','sid_match_type','mccmnc_list'];
         const setParts = []; const values = []; let idx = 1;
         for (const key of allowed) {
@@ -2958,6 +4743,10 @@ app.get('/api/translations/sample/:type', auth, async (req, res) => {
         sid_alias: 'name,source_pattern,target_value,sid_match_type,priority,is_active,apply_to,apply_entity_id\nMask TC*,TECHCORP,TC-MSG,wildcard,1,true,both,all',
         sid_random: 'name,target_value,priority,is_active,apply_to,apply_entity_id\nRandom SID Pool,SID1|SID2|SID3|SID4|SID5,1,true,both,all',
         random_content: 'name,target_value,is_otp_extract,otp_length_min,otp_length_max,priority,is_active,apply_to,apply_entity_id\nRandom OTP 1,Your OTP code is {{OTP}}. Valid for 5 min.,true,4,8,1,true,both,all',
+        number_blacklist: 'name,source_pattern,subtype,priority,is_active,apply_to,apply_entity_id\nBlock 88017*,88017,prefix,1,true,both,all\nBlock exact number,8801712345678,exact,2,true,both,all',
+        keyword_blacklist: 'name,match_content,priority,is_active,apply_to,apply_entity_id\nBlock spam words,spam,scam,fraud,1,true,both,all',
+        keyword_whitelist: 'name,match_content,priority,is_active,apply_to,apply_entity_id\nOnly OTP messages,code,otp,verification,1,true,both,all',
+        url_block: 'name,source_pattern,priority,is_active,apply_to,apply_entity_id\nBlock all URLs,,1,true,both,all',
     };
     const type = req.params.type;
     if (!samples[type]) return res.status(404).json({ error: `Unknown type: ${type}` });
@@ -2997,6 +4786,8 @@ app.post('/api/translations/replay', auth, async (req, res) => {
                     sender_id: translated.sender_id !== input.sender_id,
                     message: translated.message !== input.message,
                 },
+                blocked: translated.blocked || false,
+                block_reason: translated.block_reason || null,
             },
         });
     } catch (e) {
@@ -3142,8 +4933,8 @@ app.post('/api/voice-otp/configs', auth, async (req, res) => {
               primary_language_code, secondary_language_code,
               primary_greeting_text, primary_retry_text,
               secondary_greeting_text, secondary_retry_text,
-              greeting_text, retry_text, is_active, created_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW()) RETURNING *`,
+              greeting_text, retry_text, retry_count, play_count, is_active, created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW()) RETURNING *`,
             [
                 b.language,
                 b.primary_language_code || b.language_code || 'en',
@@ -3156,6 +4947,8 @@ app.post('/api/voice-otp/configs', auth, async (req, res) => {
                 b.secondary_retry_text || '',
                 b.primary_greeting_text || b.greeting_text || '',
                 b.primary_retry_text || b.retry_text || '',
+                b.retry_count ?? 4,
+                b.play_count ?? 1,
                 b.is_active !== false,
             ]
         );
@@ -3172,7 +4965,8 @@ app.put('/api/voice-otp/configs/:id', auth, async (req, res) => {
             'secondary_greeting_text','secondary_retry_text',
             'greeting_text','retry_text','greeting_audio_url','secondary_greeting_audio_url',
             'audio_files','secondary_audio_files','audio_0_9',
-            'sip_host','sip_port','sip_username','sip_password','caller_id','is_active','sip_e164','audio_codec'];
+            'sip_host','sip_port','sip_username','sip_password','caller_id','is_active','sip_e164','audio_codec',
+            'retry_count','play_count'];
         const setParts = []; const values = []; let idx = 1;
         for (const key of allowed) {
             if (req.body[key] !== undefined) { setParts.push(`${key} = $${idx++}`); values.push(req.body[key]); }
@@ -3373,9 +5167,86 @@ app.put('/api/voice-otp/sip-servers', auth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// POST — ping a SIP server host and return latency, TTL, and packet loss
+// Uses OS `ping` command: 4 packets, 2-second timeout
+app.post('/api/voice-otp/sip-ping', auth, async (req, res) => {
+    try {
+        const { host } = req.body || {};
+        if (!host) return res.status(400).json({ error: 'host is required' });
+
+        // Sanitize host to prevent command injection
+        const safeHost = host.replace(/[^a-zA-Z0-9.\-:]/g, '');
+        if (!safeHost || safeHost.length > 255) {
+            return res.status(400).json({ error: 'Invalid host' });
+        }
+
+        const result = await new Promise((resolve) => {
+            execFile('ping', ['-c', '4', '-W', '2', safeHost], { timeout: 12000 }, (err, stdout, stderr) => {
+                if (err && !stdout) {
+                    // ping failed entirely (host unreachable, no route, etc.)
+                    resolve({
+                        host: safeHost,
+                        latency_ms: null,
+                        min_ms: null,
+                        max_ms: null,
+                        ttl: null,
+                        packets_sent: 4,
+                        packets_received: 0,
+                        packet_loss_pct: 100,
+                        alive: false,
+                        error: err.message || 'Ping failed',
+                    });
+                    return;
+                }
+
+                const output = stdout || '';
+
+                // Parse ping statistics
+                // Linux ping output format:
+                // 4 packets transmitted, 4 received, 0% packet loss, time 3003ms
+                // rtt min/avg/max/mdev = 10.123/15.456/20.789/3.456 ms
+                let packetsSent = 4, packetsReceived = 0, lossPct = 100;
+                let minMs = null, avgMs = null, maxMs = null, ttl = null;
+
+                const txMatch = output.match(/(\d+)\s+packets?\s+transmitted/i);
+                const rxMatch = output.match(/(\d+)\s+(packets?\s+)?received/i);
+                const lossMatch = output.match(/(\d+(?:\.\d+)?)%\s+packet\s+loss/i);
+                const rttMatch = output.match(/rtt\s+min\/avg\/max\/mdev\s*=\s*([\d.]+)\/([\d.]+)\/([\d.]+)\/([\d.]+)\s*ms/i);
+                const ttlMatch = output.match(/ttl=(\d+)/i);
+
+                if (txMatch) packetsSent = parseInt(txMatch[1]);
+                if (rxMatch) packetsReceived = parseInt(rxMatch[1]);
+                if (lossMatch) lossPct = parseFloat(lossMatch[1]);
+                if (rttMatch) {
+                    minMs = parseFloat(rttMatch[1]);
+                    avgMs = parseFloat(rttMatch[2]);
+                    maxMs = parseFloat(rttMatch[3]);
+                }
+                if (ttlMatch) ttl = parseInt(ttlMatch[1]);
+
+                resolve({
+                    host: safeHost,
+                    latency_ms: avgMs,
+                    min_ms: minMs,
+                    max_ms: maxMs,
+                    ttl,
+                    packets_sent: packetsSent,
+                    packets_received: packetsReceived,
+                    packet_loss_pct: lossPct,
+                    alive: packetsReceived > 0,
+                });
+            });
+        });
+
+        res.json({ success: true, data: result });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 
 // Send Voice OTP — initiate SIP call via Asterisk bridge
-app.post('/api/voice-otp/send', auth, async (req, res) => {
+// Shared Voice OTP send logic — used by both /api/voice-otp/send and /api/voice-otp/test.
+// Extracted into a named function to eliminate all forwarding/HTTP-hop issues.
+async function handleVoiceOtpSend(req, res) {
     try {
         const { destination, otp_code, config_id, client_id, supplier_id } = req.body;
         if (!destination) return res.status(400).json({ error: 'destination is required' });
@@ -3387,28 +5258,70 @@ app.post('/api/voice-otp/send', auth, async (req, res) => {
             if (cr.rows.length) config = cr.rows[0];
         }
         if (!config) {
-            // Try to match by destination prefix (first 1-4 digits of destination)
             for (let len = 4; len >= 1; len--) {
                 const prefix = String(destination).substring(0, len);
                 const cr = await pool.query(
-                    'SELECT * FROM voice_otp_configs WHERE $1 = ANY(string_to_array(country_prefix, ',')) AND is_active = true ORDER BY id LIMIT 1',
+                    `SELECT * FROM voice_otp_configs
+                     WHERE (',' || replace(replace(country_prefix, ' ', ''), '+', '') || ',') LIKE '%,' || $1 || ',%'
+                     AND is_active = true ORDER BY id LIMIT 1`,
                     [prefix]
                 );
                 if (cr.rows.length) { config = cr.rows[0]; break; }
             }
         }
         if (!config) {
-            // Fallback to first active config
             const cr = await pool.query('SELECT * FROM voice_otp_configs WHERE is_active = true ORDER BY id LIMIT 1');
             if (cr.rows.length) config = cr.rows[0];
         }
         if (!config) return res.status(400).json({ error: 'No active voice OTP config found' });
 
-        // 2. Extract OTP from message (4-8 digits)
+        // 1.5 Apply translations (OTP extract, number prefix, SID alias, content replace)
+        // Voice OTP calls should respect the same translation rules as SMS.
+        const origMessage = req.body.message || '';
+        const origSenderId = req.body.sender_id || '';
+        let translationApplied = false;
+        let translationResult = null;
+        let translationBlockReason = null;
+        try {
+            const translated = await applyTranslations(
+                client_id || null, supplier_id || null,
+                destination, origSenderId, origMessage
+            );
+            // Check if any translation actually modified the message/sender/destination
+            if (translated && (
+                translated.message !== origMessage ||
+                translated.sender_id !== origSenderId ||
+                translated.destination !== destination
+            )) {
+                translationApplied = true;
+                translationResult = translated;
+            }
+            // Check for OTP extract blocking (strict mode, no numeric code found)
+            if (translated && translated.blocked) {
+                translationBlockReason = translated.block_reason || 'No numeric OTP code found';
+                return res.status(400).json({
+                    error: 'OTP_EXTRACT_FAILED',
+                    message: translationBlockReason,
+                    translation_applied: true,
+                    block_reason: translationBlockReason
+                });
+            }
+        } catch (e) {
+            console.error('[VoiceOTP] Translation error:', e.message);
+        }
+
+        // 2. Extract OTP from message or auto-generate
+        // If translation already extracted OTP (message is now just digits), use it.
         let finalOtp = otp_code;
-        if (!finalOtp && req.body.message) {
-            const m = String(req.body.message).match(/\b\d{4,8}\b/);
-            if (m) finalOtp = m[0];
+        const messageForOtp = (translationResult && translationResult.message) || origMessage;
+        if (!finalOtp && messageForOtp) {
+            // If translation extracted the OTP (e.g., message is now just "123456"), use directly
+            if (translationApplied && /^\d{4,8}$/.test(String(messageForOtp).trim())) {
+                finalOtp = String(messageForOtp).trim();
+            } else {
+                const m = String(messageForOtp).match(/\b\d{4,8}\b/);
+                if (m) finalOtp = m[0];
+            }
         }
         if (!finalOtp) {
             finalOtp = String(Math.floor(100000 + Math.random() * 900000));
@@ -3416,14 +5329,82 @@ app.post('/api/voice-otp/send', auth, async (req, res) => {
 
         // 3. Build call ID and insert log
         const callId = `VOICE_${Date.now()}_${Math.random().toString(36).substr(2, 8)}`;
+        const finalDest = (translationResult && translationResult.destination) || destination;
         const logResult = await pool.query(
-            `INSERT INTO voice_otp_logs (call_id, destination, otp_code, language, status, retry_count, max_retries, client_id, created_at)
-             VALUES ($1,$2,$3,$4,'initiated',0,$5,$6,NOW()) RETURNING *`,
-            [callId, destination, finalOtp, config.language || 'en', (req.body.max_retries || config.retry_count || 4), client_id || null]
+            `INSERT INTO voice_otp_logs (call_id, destination, otp_code, extracted_otp, language, status, retry_count, max_retries, client_id, supplier_id, created_at)
+             VALUES ($1,$2,$3,$4,$5,'initiated',0,$6,$7,$8,NOW()) RETURNING *`,
+            [callId, finalDest, finalOtp, (translationApplied ? finalOtp : null), config.language || 'en', (req.body.max_retries || config.retry_count || 4), client_id || null, supplier_id || null]
         );
 
+        // Also insert into sms_logs so Voice OTP calls appear in the SMS Logs page.
+        // Uses the same callId as message_id so DLR updates (below) can find it.
+        // Look up supplier, MCC/MNC, operator, and rates so the SMS Log shows full detail.
+        let supplierInfo = null, mccInfo = null, clientCode = null, clientRate = null, supplierRate = null;
+        try {
+            // Look up supplier if provided
+            if (supplier_id) {
+                const sr = await pool.query(
+                    'SELECT id, supplier_code, company_name, connection_type FROM suppliers WHERE id = $1', [supplier_id]
+                );
+                if (sr.rows.length) supplierInfo = sr.rows[0];
+            }
+            // Look up client code
+            if (client_id) {
+                const cc = await pool.query('SELECT client_code FROM clients WHERE id = $1', [client_id]);
+                if (cc.rows.length) clientCode = cc.rows[0].client_code;
+            }
+            // Look up MCC/MNC/Operator/Country from destination
+            const destNum = String(destination).replace(/^\+/, '');
+            for (let len = 6; len >= 1; len--) {
+                const prefix = destNum.substring(0, len);
+                const mr = await pool.query(
+                    'SELECT mcc, mnc, country, operator FROM mccmnc WHERE calling_code = $1 AND (is_deleted IS NULL OR is_deleted = false) LIMIT 1',
+                    [prefix]
+                );
+                if (mr.rows.length) { mccInfo = mr.rows[0]; break; }
+            }
+            // Look up client rate for this MCC
+            if (client_id && mccInfo) {
+                const cr = await pool.query(
+                    `SELECT rate FROM rates WHERE entity_type='client' AND entity_id=$1
+                     AND (mcc=$2 OR mcc='*') AND is_active=true
+                     ORDER BY CASE WHEN mnc=$3 THEN 0 WHEN mnc='*' THEN 1 ELSE 2 END, rate ASC LIMIT 1`,
+                    [client_id, mccInfo.mcc, mccInfo.mnc || null]
+                );
+                if (cr.rows.length) clientRate = parseFloat(cr.rows[0].rate);
+            }
+            // Look up supplier rate for this MCC
+            if (supplier_id && mccInfo) {
+                const sr2 = await pool.query(
+                    `SELECT rate FROM rates WHERE entity_type='supplier' AND entity_id=$1
+                     AND (mcc=$2 OR mcc='*') AND is_active=true
+                     ORDER BY CASE WHEN mnc=$3 THEN 0 WHEN mnc='*' THEN 1 ELSE 2 END, rate ASC LIMIT 1`,
+                    [supplier_id, mccInfo.mcc, mccInfo.mnc || null]
+                );
+                if (sr2.rows.length) supplierRate = parseFloat(sr2.rows[0].rate);
+            }
+        } catch (e) { /* best-effort enrichment */ }
+        const profit = (clientRate && supplierRate) ? parseFloat((clientRate - supplierRate).toFixed(6)) : null;
+        // Use translated message/sender if translation was applied
+        const finalMessage = (translationResult && translationResult.message) || req.body.message || finalOtp;
+        const finalSenderId = (translationResult && translationResult.sender_id) || req.body.sender_id || '';
+        const smsLogInsert = await pool.query(
+            `INSERT INTO sms_logs (message_id, client_id, client_code, supplier_id, supplier_code,
+             destination, sender_id, message, status, source, submit_time,
+             mcc, mnc, operator, country, client_rate, supplier_rate, profit, currency,
+             original_sender_id, original_message, original_destination)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'submitted','voice_otp',NOW(),
+                     $9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING id`,
+            [callId, client_id || null, clientCode,
+             supplierInfo?.id || null, supplierInfo?.supplier_code || null,
+             finalDest, finalSenderId, finalMessage,
+             mccInfo?.mcc || null, mccInfo?.mnc || null,
+             mccInfo?.operator || null, mccInfo?.country || null,
+             clientRate, supplierRate, profit, 'EUR',
+             origSenderId, origMessage, destination]
+        ).catch(() => null); // best-effort — don't block call initiation
+
         // 4. Get SIP settings
-        // ── Multi-SIP server selection: fetch sip_servers and match by MCC/MNC ──
         const sipServerR = await pool.query("SELECT value FROM platform_settings WHERE key = 'sip_servers'");
         let sipServers = [];
         if (sipServerR.rows.length && sipServerR.rows[0].value) {
@@ -3432,11 +5413,10 @@ app.post('/api/voice-otp/send', auth, async (req, res) => {
         }
         if (!Array.isArray(sipServers)) sipServers = [];
 
-        // Try to find destination's MCC for SIP server matching
         let destMcc = "";
         try {
             const destNum = String(destination).replace(/^\+/, "");
-            for (let len = 4; len >= 1; len--) {
+            for (let len = 6; len >= 1; len--) {
                 const prefix = destNum.substring(0, len);
                 const mccR = await pool.query(
                     "SELECT mcc FROM mccmnc WHERE calling_code = $1 AND (is_deleted IS NULL OR is_deleted = false) LIMIT 1",
@@ -3446,87 +5426,125 @@ app.post('/api/voice-otp/send', auth, async (req, res) => {
             }
         } catch (e) { /* non-critical */ }
 
-        // Select best matching SIP server
         let selectedServer = sipServers.length > 0 ? sipServers[0] : null;
         if (destMcc && sipServers.length > 1) {
             for (const srv of sipServers) {
                 const allowed = (srv.mccmnc_allowed || "").split(",").map(s => s.trim()).filter(Boolean);
-                if (allowed.includes(destMcc) || allowed.includes("*")) {
-                    selectedServer = srv;
-                    break;
-                }
+                if (allowed.includes(destMcc) || allowed.includes("*")) { selectedServer = srv; break; }
             }
         }
 
-        // Legacy fallback: global platform_settings for backward compat
         const sipR = await pool.query(
             "SELECT key, value FROM platform_settings WHERE key IN ('sip_host','sip_port','sip_username','sip_password','sip_caller_id','sip_e164','audio_codec')"
         );
         const sip = {};
         for (const row of sipR.rows) { sip[row.key] = row.value; }
 
-        // 5. Use selected multi-server or fall back to legacy single-server
         const sipHost = (selectedServer && selectedServer.host) || sip.sip_host || "127.0.0.1";
         const sipPort = (selectedServer && selectedServer.port) || parseInt(sip.sip_port) || 5060;
         const sipUser = (selectedServer && selectedServer.username) || sip.sip_username || "";
         const sipPass = (selectedServer && selectedServer.password) || sip.sip_password || "";
-        const callerId = (selectedServer && selectedServer.caller_id) || sip.sip_caller_id || "";
+        const callerId = ((selectedServer && selectedServer.is_e164 !== false) ? (selectedServer.caller_id || sip.sip_caller_id) : '') || '';
+        const destPrefix = (selectedServer && selectedServer.destination_prefix) || '';
+        // Use translated destination as base, then apply SIP prefix if configured
+        const sipDest = destPrefix ? destPrefix + String(finalDest).replace(/^\+/, '') : finalDest;
+        if (destPrefix) console.error(`[voice-otp] Prepending prefix ${destPrefix} → ${sipDest}`);
 
-        // 6. Originate SIP call via Asterisk bridge
+        // 5. Originate SIP call via Asterisk bridge
         try {
             const ac = require('./asterisk-bridge.cjs');
-            const callOpts = {
-                callId,
-                destination,
-                sipHost,
-                sipPort,
-                sipUsername: sipUser,
-                sipPassword: sipPass,
-                callerId,
-                greetingAudio: config.greeting_audio_url || null,
-                digitAudio: config.audio_0_9 || null,
-                otpCode: finalOtp,
-                timeout: (req.body.timeout || 30) * 1000,
-            };
-
-            // Fire and forget — DLR comes back via callback
-            ac.originateCall(callOpts).then((callResult) => {
-                pool.query(
-                    `UPDATE voice_otp_logs SET status = $1, dlr_status = $2, duration = $3, completed_at = NOW()
-                     WHERE call_id = $4`,
-                    [callResult.status || 'completed', callResult.dlr || 'DELIVRD', callResult.duration || 0, callId]
-                ).catch(() => {});
-            }).catch(async () => {
+            const callOpts = { callId, destination: sipDest, sipHost, sipPort, sipUsername: sipUser, sipPassword: sipPass, callerId: callerId || callerIdPool.pickCallerId(sipDest) || '', greetingAudio: config.greeting_audio_url || null, digitAudio: config.audio_0_9 || null, otpCode: finalOtp, timeout: (req.body.timeout || 30) * 1000 };
+            ac.originateCall(callOpts).then(async (callResult) => {
+                const finalStatus = callResult.status || 'unknown';
+                const finalDlr = callResult.dlr || 'UNKNOWN';
+                const finalDuration = callResult.duration || 0;
+                await pool.query(`UPDATE voice_otp_logs SET status=$1,dlr_status=$2,duration=$3,completed_at=NOW() WHERE call_id=$4`,
+                    [finalStatus, finalDlr, finalDuration, callId]
+                ).catch(()=>{});
+                // Also update sms_logs with delivery result so it shows in SMS Logs page
                 await pool.query(
-                    `UPDATE voice_otp_logs SET status = 'failed', dlr_status = 'FAILED', completed_at = NOW()
-                     WHERE call_id = $1`, [callId]
-                );
+                    `UPDATE sms_logs SET dlr_status=$1, status=$2, delivery_time=NOW(), dlr_timestamp=NOW()
+                     WHERE message_id=$3`,
+                    [finalDlr, finalDlr === 'DELIVRD' ? 'delivered' : 'failed', callId]
+                ).catch(()=>{});
+                // Push DLR to dlr_outbox so SMPP clients (e.g. TriAngle) receive delivery notification
+                if (client_id) {
+                    try {
+                        const clientR = await pool.query('SELECT client_code, webhook_url FROM clients WHERE id=$1', [client_id]);
+                        const clientCode = clientR.rows[0]?.client_code || '';
+                        const webhookUrl = clientR.rows[0]?.webhook_url || '';
+                        const receipt = `id:${callId} sub:001 dlvrd:${finalDlr === 'DELIVRD' ? '001' : '000'} submit date:${new Date().toISOString().slice(0,16).replace(/[-:T]/g,'')} done date:${new Date().toISOString().slice(0,16).replace(/[-:T]/g,'')} stat:${finalDlr} err:000 text:${finalDlr === 'DELIVRD' ? 'Delivery success' : 'Delivery failed'}`;
+                        await pool.query(
+                            `INSERT INTO dlr_outbox (message_id, entity_type, entity_id, client_id, client_code, destination, sender_id, status, dlr_receipt, submit_time, webhook_url)
+                             VALUES ($1,'client',$2,$2,$3,$4,'',$5,$6,NOW(),$7)
+                             ON CONFLICT (message_id) DO UPDATE SET status=EXCLUDED.status, dlr_receipt=EXCLUDED.dlr_receipt`,
+                            [callId, client_id, clientCode, sipDest, finalDlr, receipt, webhookUrl]
+                        );
+                        console.error(`[voice-otp] 📝 DLR pushed to outbox: ${callId} → ${finalDlr} (client=${clientCode})`);
+                    } catch (e) {
+                        console.error(`[voice-otp] ⚠ DLR outbox push failed for ${callId}: ${e.message}`);
+                    }
+                }
+            }).catch(async () => {
+                await pool.query(`UPDATE voice_otp_logs SET status='failed',dlr_status='FAILED',completed_at=NOW() WHERE call_id=$1`, [callId]);
+                // Also update sms_logs on bridge error
+                await pool.query(
+                    `UPDATE sms_logs SET dlr_status='FAILED', status='failed', error_code='BRIDGE_ERROR',
+                     error_message='Asterisk bridge error' WHERE message_id=$1`, [callId]
+                ).catch(()=>{});
+                // Push FAILED DLR to outbox even on error
+                if (client_id) {
+                    try {
+                        const clientR = await pool.query('SELECT client_code, webhook_url FROM clients WHERE id=$1', [client_id]);
+                        const receipt = `id:${callId} sub:001 dlvrd:000 submit date:${new Date().toISOString().slice(0,16).replace(/[-:T]/g,'')} done date:${new Date().toISOString().slice(0,16).replace(/[-:T]/g,'')} stat:FAILED err:000 text:Bridge error`;
+                        await pool.query(
+                            `INSERT INTO dlr_outbox (message_id, entity_type, entity_id, client_id, client_code, destination, sender_id, status, dlr_receipt, submit_time, webhook_url)
+                             VALUES ($1,'client',$2,$2,$3,$4,'','FAILED',$5,NOW(),$6)
+                             ON CONFLICT (message_id) DO UPDATE SET status='FAILED', dlr_receipt=EXCLUDED.dlr_receipt`,
+                            [callId, client_id, clientR.rows[0]?.client_code || '', sipDest, receipt, clientR.rows[0]?.webhook_url || '']
+                        );
+                    } catch (e) { /* best-effort */ }
+                }
             });
         } catch (bridgeErr) {
             console.warn('[voice-otp] Asterisk bridge error:', bridgeErr.message);
-            // Simulate success for testing without Asterisk
-            setTimeout(async () => {
-                await pool.query(
-                    `UPDATE voice_otp_logs SET status = 'completed', dlr_status = 'DELIVRD', duration = 8000, completed_at = NOW()
-                     WHERE call_id = $1`, [callId]
-                );
-            }, 2000);
+            // Bridge error = call FAILED. Do NOT fake DELIVRD — that triggers false DLR billing.
+            setTimeout(async () => { await pool.query(`UPDATE voice_otp_logs SET status='failed',dlr_status='FAILED',error_message=$2,completed_at=NOW() WHERE call_id=$1`, [callId, bridgeErr.message]); }, 2000);
+            // Also update sms_logs on bridge load error
+            pool.query(`UPDATE sms_logs SET dlr_status='FAILED', status='failed', error_code='BRIDGE_ERROR',
+                        error_message=$1 WHERE message_id=$2`,
+                       [bridgeErr.message, callId]).catch(()=>{});
         }
 
-        res.json({ success: true, data: logResult.rows[0], message: `Voice OTP call initiated: ${callId}` });
+        // Add translation info and extracted OTP to log entry for frontend display
+        const responseData = { ...logResult.rows[0] };
+        if (translationApplied) {
+            responseData.translation_applied = true;
+            responseData.original_message = origMessage;
+            responseData.message = finalMessage;
+            responseData.extracted_otp = finalOtp;
+            responseData.sender_id = finalSenderId;
+        }
+        res.json({
+            success: true,
+            data: responseData,
+            message: `Voice OTP call initiated: ${callId}`,
+            translation_applied: translationApplied || false,
+            original_message: translationApplied ? origMessage : null,
+            extracted_otp: finalOtp
+        });
     } catch (e) { res.status(500).json({ error: e.message }); }
-});
+}
 
-// Test call - same as send but with auto-generated OTP
+app.post('/api/voice-otp/send', auth, handleVoiceOtpSend);
+
+// Test call — thin wrapper: generates OTP then forwards body to send handler
+// No internal HTTP calls, no Express router forwarding — just delegates to
+// the same async function that /api/voice-otp/send uses.
+// Defined AFTER /api/voice-otp/send so handleVoiceOtpSend is in scope.
 app.post('/api/voice-otp/test', auth, async (req, res) => {
-    return app._router.stack.find(layer => layer.route && layer.route.path === '/api/voice-otp/send' && layer.route.methods.post)
-        ?.handle(req, res);
-    try {
-        req.body.otp_code = req.body.otp_code || String(Math.floor(100000 + Math.random() * 900000));
-        // Forward to send endpoint
-        return app._router.stack.find(l => l.route?.path === '/api/voice-otp/send' && l.route?.methods?.post)?.handle?.(req, res)
-            || res.status(500).json({ error: 'Send endpoint not available' });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    req.body.otp_code = req.body.otp_code || String(Math.floor(100000 + Math.random() * 900000));
+    return handleVoiceOtpSend(req, res);
 });
 
 // Call logs
@@ -3728,7 +5746,7 @@ app.put('/api/ott-devices/:id', auth, async (req, res) => {
     try {
         const { id } = req.params;
         const fields = req.body;
-        const allowed = ['device_name','device_type','phone_number','session_status','qr_code','last_active','supplier_id'];
+        const allowed = ['device_name','device_type','phone_number','session_status','qr_code','last_active','supplier_id','proxy_config','session_data','pairing_token','proxy_node'];
         const setParts = []; const values = []; let idx = 1;
         for (const key of allowed) {
             if (fields[key] !== undefined) { setParts.push(`${key} = $${idx++}`); values.push(fields[key]); }
@@ -3777,7 +5795,7 @@ app.put('/api/ott/devices/:id', auth, async (req, res) => {
     try {
         const { id } = req.params;
         const fields = req.body;
-        const allowed = ['device_name','device_type','phone_number','session_status','qr_code','last_active','supplier_id'];
+        const allowed = ['device_name','device_type','phone_number','session_status','qr_code','last_active','supplier_id','proxy_config','session_data','pairing_token','proxy_node'];
         const setParts = []; const values = []; let idx = 1;
         for (const key of allowed) {
             if (fields[key] !== undefined) { setParts.push(`${key} = $${idx++}`); values.push(fields[key]); }
@@ -3800,21 +5818,81 @@ app.delete('/api/ott/devices/:id', auth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Get QR code for device pairing
+// Get QR code for device pairing (REAL Baileys WhatsApp / Telegram pairing)
 app.get('/api/ott/devices/:id/qr', auth, async (req, res) => {
     try {
         const { id } = req.params;
         const result = await pool.query('SELECT * FROM ott_devices WHERE id = $1', [id]);
         if (result.rows.length === 0) return res.status(404).json({ error: 'OTT device not found' });
         const device = result.rows[0];
-        // Generate or return existing QR code
+
         let qrCode = device.qr_code;
-        if (!qrCode) {
-            // Generate a mock QR-like pairing token
-            qrCode = `PAIR:${device.device_type}:${device.id}:${Date.now()}`;
-            await pool.query('UPDATE ott_devices SET qr_code = $1 WHERE id = $2', [qrCode, id]);
+        let pairingToken = device.pairing_token;
+
+        // Try real Baileys QR generation for WhatsApp
+        if (device.device_type === 'whatsapp' && (!qrCode || device.session_status === 'qr_pending')) {
+            try {
+                const ottMgr = await import('./src/services/ottDeviceManager.mjs');
+                const result = await ottMgr.startWhatsAppPairing(
+                    String(device.id),
+                    device.phone_number,
+                    device.proxy_node || null
+                );
+                if (result.qr) {
+                    qrCode = result.qr;
+                    pairingToken = `wa_${id}_${Date.now()}`;
+                    await pool.query(
+                        `UPDATE ott_devices SET qr_code=$1, pairing_token=$2, session_status='qr_pending', proxy_node=COALESCE(proxy_node,$3) WHERE id=$4`,
+                        [qrCode, pairingToken, result.proxyNode || null, id]
+                    );
+                    console.log(`[OTT-QR] ✅ Real Baileys QR generated for device ${id}`);
+                }
+            } catch (baileyErr) {
+                console.error(`[OTT-QR] Baileys QR failed for device ${id}: ${baileyErr.message}`);
+                // Fall back to stored/mock QR
+                if (!qrCode) {
+                    qrCode = `PAIR:${device.device_type}:${device.id}:${Date.now()}`;
+                    await pool.query('UPDATE ott_devices SET qr_code=$1 WHERE id=$2', [qrCode, id]);
+                }
+            }
         }
-        res.json({ success: true, data: { qr: qrCode } });
+
+        // For Telegram, generate pairing token
+        if (device.device_type === 'telegram' && (!pairingToken || device.session_status === 'qr_pending')) {
+            try {
+                const ottMgr = await import('./src/services/ottDeviceManager.mjs');
+                const result = await ottMgr.startTelegramPairing(
+                    String(device.id),
+                    device.phone_number,
+                    device.proxy_node || null
+                );
+                pairingToken = result.pairingToken;
+                await pool.query(
+                    `UPDATE ott_devices SET pairing_token=$1, session_status='qr_pending' WHERE id=$2`,
+                    [pairingToken, id]
+                );
+            } catch (tgErr) {
+                console.error(`[OTT-QR] Telegram pairing failed for device ${id}: ${tgErr.message}`);
+                pairingToken = `tg_${id}_${Date.now()}`;
+            }
+        }
+
+        if (!qrCode) {
+            qrCode = `PAIR:${device.device_type}:${device.id}:${Date.now()}`;
+            await pool.query('UPDATE ott_devices SET qr_code=$1 WHERE id=$2', [qrCode, id]);
+        }
+
+        res.json({
+            success: true,
+            data: {
+                qr: qrCode,
+                pairing_token: pairingToken,
+                device_type: device.device_type,
+                instructions: device.device_type === 'whatsapp'
+                    ? 'Open WhatsApp on your phone → Settings → Linked Devices → Scan QR code'
+                    : 'Use the pairing token with your Telegram client to authenticate',
+            }
+        });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -3841,6 +5919,57 @@ app.post('/api/ott/devices/:id/disconnect', auth, async (req, res) => {
         );
         if (result.rows.length === 0) return res.status(404).json({ error: 'OTT device not found' });
         res.json({ success: true, data: result.rows[0], message: 'Device disconnected' });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ==================== OTT PROXY MANAGEMENT ====================
+// Get proxy pool status
+app.get('/api/ott/proxy/status', auth, async (req, res) => {
+    try {
+        const ottMgr = await import('./src/services/ottDeviceManager.mjs');
+        const pool = ottMgr.getProxyPool();
+        res.json({ success: true, data: { pool, count: pool.length } });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Test a proxy node
+app.post('/api/ott/proxy/test', auth, async (req, res) => {
+    try {
+        const { host, port } = req.body || {};
+        if (!host) return res.status(400).json({ error: 'host is required' });
+        const ottMgr = await import('./src/services/ottDeviceManager.mjs');
+        const result = await ottMgr.testProxyNode(host, port || 3128);
+        res.json({ success: true, data: result });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Add proxy node
+app.post('/api/ott/proxy/add', auth, async (req, res) => {
+    try {
+        const { host, port } = req.body || {};
+        if (!host) return res.status(400).json({ error: 'host is required' });
+        const ottMgr = await import('./src/services/ottDeviceManager.mjs');
+        const pool = ottMgr.addProxyNode(host, port || 3128);
+        res.json({ success: true, data: { pool, count: pool.length } });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get device connection status (from in-memory registry)
+app.get('/api/ott/devices/:id/status', auth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const ottMgr = await import('./src/services/ottDeviceManager.mjs');
+        const status = ottMgr.getDeviceStatus(id);
+        res.json({ success: true, data: status });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get all active device statuses
+app.get('/api/ott/devices/status/all', auth, async (req, res) => {
+    try {
+        const ottMgr = await import('./src/services/ottDeviceManager.mjs');
+        const statuses = ottMgr.getAllDeviceStatuses();
+        res.json({ success: true, data: statuses });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -3958,7 +6087,7 @@ app.post('/api/channels/send', auth, async (req, res) => {
         if (!channel) return res.status(400).json({ error: 'channel is required (rcs, flash_sms, whatsapp, telegram, http)' });
         if (!destination || !message) return res.status(400).json({ error: 'destination and message are required' });
 
-        const messageId = 'CH_' + channel.toUpperCase() + '_' + Date.now() + '_' + Math.random().toString(36).substr(2, 8);
+        const messageId = genNumericMsgId('7'); // CHANNEL: pure numeric ID for WhatsApp/Telegram/RCS
 
         switch (channel) {
             case 'rcs':
@@ -4157,6 +6286,153 @@ app.post('/api/api-connectors/:id/test', auth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ==================== ASTERISK STATUS ====================
+app.get('/api/bind/asterisk-status', auth, async (req, res) => {
+    try {
+        const status = { running: false, version: '', ami_connected: false, ami_users: 0, sip_peers: 0, sip_online: 0, sip_offline: 0, service_active: false };
+        let bridge = null;
+        try { bridge = require('./asterisk-bridge.cjs'); } catch (e) { /* not loaded */ }
+        status.ami_connected = bridge?.isConnected ? bridge.isConnected() : false;
+        // Query Asterisk via the existing AMI connection (async, non-blocking)
+        if (bridge?.sendCommand) {
+            try {
+                const versionResult = await bridge.sendCommand('core show version');
+                if (versionResult) {
+                    const match = versionResult.match(/Asterisk\s+([\d.]+)/);
+                    if (match) { status.version = match[0]; status.running = true; }
+                }
+                const sipResult = await bridge.sendCommand('sip show peers');
+                if (sipResult) {
+                    const peerMatch = sipResult.match(/(\d+)\s+sip peers.*?(\d+)\s+online.*?(\d+)\s+offline/i);
+                    if (peerMatch) {
+                        status.sip_peers = parseInt(peerMatch[1]) || 0;
+                        status.sip_online = parseInt(peerMatch[2]) || 0;
+                        status.sip_offline = parseInt(peerMatch[3]) || 0;
+                    }
+                }
+            } catch (e) { /* AMI command failed, keep defaults */ }
+        }
+        // Fallback: CLI if AMI not available
+        if (!status.running) {
+            try {
+                const { execSync } = require('child_process');
+                const verOut = execSync('asterisk -V 2>/dev/null || echo ""', { timeout: 2000 }).toString().trim();
+                if (verOut) { status.version = verOut; status.running = true; }
+            } catch (e) { /* nop */ }
+        }
+        // Service status from systemctl
+        try {
+            const { execSync } = require('child_process');
+            status.service_active = execSync('systemctl is-active asterisk 2>/dev/null || echo "inactive"', { timeout: 2000 }).toString().trim() === 'active';
+        } catch (e) { /* nop */ }
+        if (bridge) status.ami_users = status.ami_connected ? 1 : 0;
+        res.json({ success: true, data: status });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ==================== SIP PEER REGISTRATION MONITOR ====================
+// Returns detailed SIP peer info from PJSIP: status, latency (RTT), and last registration time.
+app.get('/api/bind/sip-peers', auth, async (req, res) => {
+    try {
+        const peers = [];
+        const { execSync } = require('child_process');
+        const asteriskCmd = 'sudo asterisk -rx';
+
+        // 1. Get PJSIP contacts (has Status, RTT, Contact URI, Endpoint)
+        let contactsRaw = '';
+        try {
+            contactsRaw = execSync(`${asteriskCmd} "pjsip show contacts" 2>/dev/null`, { timeout: 5000 }).toString();
+        } catch (e) { /* CLI failed */ }
+
+        // Try AMI if CLI failed
+        if (!contactsRaw) {
+            try {
+                const bridge = require('./asterisk-bridge.cjs');
+                if (bridge.isConnected?.()) {
+                    contactsRaw = await bridge.sendCommand('pjsip show contacts', 3000);
+                }
+            } catch (e) { /* AMI failed */ }
+        }
+
+        // 2. Get PJSIP registrations (has last registration time)
+        let regsRaw = '';
+        try {
+            regsRaw = execSync(`${asteriskCmd} "pjsip show registrations" 2>/dev/null`, { timeout: 5000 }).toString();
+        } catch (e) { /* CLI failed */ }
+
+        // Parse contacts: format like:
+        //   Contact:  <Aor/ContactUri..............................> <Hash....> <Status> <RTT(ms)..>
+        //   Contact:  outbound-aor/sip:198.27.80.229:5060            4d94f0b25b NonQual         nan
+        const contactMap = new Map(); // aor → { contactUri, status, rtt }
+        if (contactsRaw) {
+            const lines = contactsRaw.split('\n');
+            for (const line of lines) {
+                const m = line.match(/^\s*Contact:\s+(\S+)\/(\S+)\s+(\S+)\s+(\S+)\s+(\S+)/);
+                if (m && !m[1].startsWith('<')) {
+                    const aor = m[1];
+                    const contactUri = m[2];
+                    const status = m[4];
+                    const rtt = m[5] === 'nan' || m[5] === 'NaN' ? null : parseFloat(m[5]);
+                    contactMap.set(aor, { contactUri, status, rtt });
+                }
+            }
+        }
+
+        // Parse registrations: format like:
+        //   <Registration/ServerURI..............................>  <Auth..........>  <Status.......>
+        if (regsRaw) {
+            const lines = regsRaw.split('\n');
+            for (const line of lines) {
+                const regMatch = line.match(/^\s*(\S+)\s*\/\s*(\S+)\s+(\S+)\s+(\S+)\s*(.*)$/);
+                if (regMatch && regMatch[3] !== 'Auth' && !regMatch[1].startsWith('<')) {
+                    const regName = regMatch[1];
+                    const serverUri = regMatch[2];
+                    const auth = regMatch[3];
+                    const status = regMatch[4];
+                    const registeredAt = regMatch[5]?.trim() || null;
+                    const baseName = regName.replace(/-reg$/, '');
+                    const aor = `${baseName}-aor`;
+                    const contact = contactMap.get(aor) || {};
+
+                    peers.push({
+                        name: baseName,
+                        endpoint: `${baseName}-ep`,
+                        aor,
+                        server_uri: serverUri,
+                        contact_uri: contact.contactUri || `${aor}/${serverUri}`,
+                        status: contact.status || status || 'Unknown',
+                        rtt_ms: contact.rtt !== undefined ? contact.rtt : null,
+                        registered: status === 'Registered',
+                        registered_at: registeredAt,
+                        auth_name: auth,
+                    });
+                }
+            }
+        }
+
+        // If no registrations, still include contacts-only peers
+        if (peers.length === 0 && contactMap.size > 0) {
+            for (const [aor, info] of contactMap) {
+                const baseName = aor.replace(/-aor$/, '');
+                peers.push({
+                    name: baseName,
+                    endpoint: `${baseName}-ep`,
+                    aor,
+                    server_uri: '',
+                    contact_uri: info.contactUri,
+                    status: info.status,
+                    rtt_ms: info.rtt,
+                    registered: info.status === 'Avail',
+                    registered_at: null,
+                    auth_name: '',
+                });
+            }
+        }
+
+        res.json({ success: true, data: peers });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ==================== CLIENT BIND STATUS (ESME — real session data from smpp_sessions) ====================
 // Returns client bind status with real ESME session data (system_id, IP, connected_at, bind_mode, etc.)
 app.get('/api/bind/clients', auth, async (req, res) => {
@@ -4196,20 +6472,18 @@ app.get('/api/bind/status', auth, async (req, res) => {
                     COALESCE(sess.connected_at, client_sess.connected_at) as connected_at,
                     COALESCE(sess.ip_address, client_sess.ip_address) as ip_address,
                     COALESCE(sess.status, client_sess.status) as session_status,
-                    COALESCE(sess.bind_mode, client_sess.bind_mode) as bind_mode,
-                    CASE 
-         WHEN client_sess.id IS NOT NULL AND client_sess.status = 'bound' THEN 'connected'
-         WHEN sess.id IS NOT NULL AND sess.status = 'bound' THEN 'connected'
-         WHEN s.bind_status = 'bound' THEN 'connected'
-         ELSE 'disconnected' 
-       END as session_state
+                    COALESCE(sess.bind_mode, client_sess.bind_mode) as bind_mode,                    CASE 
+          WHEN client_sess.id IS NOT NULL AND client_sess.status = 'bound' THEN 'connected'
+          WHEN sess.id IS NOT NULL AND sess.status = 'bound' THEN 'connected'
+          WHEN s.bind_status = 'bound' AND s.status = 'active' THEN 'connected'
+          ELSE 'disconnected' 
+        END as session_state
              FROM suppliers s
              LEFT JOIN active_smpp_sessions sess ON s.id = sess.entity_id AND sess.entity_type = 'supplier'
              LEFT JOIN smpp_sessions client_sess ON client_sess.entity_type = 'client'
                AND client_sess.status = 'bound'
                AND client_sess.system_id = s.smpp_username
-               AND s.is_inbound = true
-             WHERE s.connection_type IN ('smpp', 'http', 'ott_whatsapp', 'ott_telegram')
+               AND s.is_inbound = true              WHERE s.connection_type IN ('smpp', 'http', 'voice_otp', 'ott_whatsapp', 'ott_telegram', 'rcs', 'flash_sms', 'whatsapp_business', 'telegram_business', 'ott')
                ${showDeleted ? '' : "AND s.status = 'active' AND (s.is_deleted IS NULL OR s.is_deleted = false)"}
              ORDER BY s.id`
         );
@@ -4317,6 +6591,35 @@ app.use((req, res) => {
     if (!req.path.startsWith('/api')) {
         res.sendFile(path.join(__dirname, 'dist', 'index.html'));
     }
+});
+
+// ==================== GLOBAL ERROR HANDLER ====================
+// Catches ALL unhandled errors (malformed JSON, body-parser SyntaxError,
+// uncaught async errors, etc.) and returns a proper JSON response instead
+// of crashing the Node.js process. Without this, every malformed request
+// body (e.g. `{invalid`) would cause body-parser to throw a SyntaxError
+// that crashes the entire server (38+ PM2 restarts observed).
+app.use((err, req, res, next) => {
+    // Log the error for debugging
+    console.error('[ERROR-HANDLER]', err.stack || err.message || err);
+
+    // Body-parser SyntaxError from express.json() — malformed JSON in request body
+    if (err.type === 'entity.parse.failed' || err instanceof SyntaxError) {
+        return res.status(400).json({ error: 'Malformed JSON in request body' });
+    }
+
+    // Payload too large
+    if (err.type === 'entity.too.large') {
+        return res.status(413).json({ error: 'Request body too large' });
+    }
+
+    // JWT errors from auth middleware
+    if (err.name === 'JsonWebTokenError' || err.name === 'TokenExpiredError') {
+        return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+
+    // Generic 500 for everything else
+    res.status(500).json({ error: 'Internal server error' });
 });
 
 app.listen(PORT, '0.0.0.0', () => {

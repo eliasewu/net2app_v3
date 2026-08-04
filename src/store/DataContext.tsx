@@ -79,7 +79,7 @@ export const DataProvider:React.FC<{children:ReactNode}> = ({children}) => {
         routingApi.getRoutePlans(),
         smsApi.getLogs({ limit: 100 }).catch(() => ({ success: false, data: null })),
         api.get('/rates').catch(() => ({ success: false, data: null })),
-        api.get('/mccmnc?limit=500').catch(() => ({ success: false, data: null })),
+        api.get('/mccmnc?limit=100000').catch(() => ({ success: false, data: null })),
         api.get('/invoices').catch(() => ({ success: false, data: null })),
         api.get('/payments').catch(() => ({ success: false, data: null })),
         api.get('/campaigns').catch(() => ({ success: false, data: null })),
@@ -116,10 +116,8 @@ export const DataProvider:React.FC<{children:ReactNode}> = ({children}) => {
           setRoutePlans(pd.data);
         }
         if (smsRes.success && (md as any)?.data) {
-        if (smsRes.success && (md as any)?.data) {
           setSMSLogs((md as any).data);
           if (typeof (md as any).total === 'number') setSMSTotal((md as any).total);
-        }
         }
         const rd2: any = ratesRes.data;
         if (ratesRes.success && rd2?.data) { setRates(rd2.data); }
@@ -290,7 +288,10 @@ export const DataProvider:React.FC<{children:ReactNode}> = ({children}) => {
   const updateRate=useCallback(async (id:string,r:Partial<Rate>) => {
     const res: any = await api.put(`/rates/${id}`, r);
     if (!res.success || !res.data?.data) throw new Error(res.error || 'Failed to update rate');
-    setRates(p=>{const n=p.map(x=>x.id===id?res.data.data:x);return n;});
+    // PUT now versions rates: old rate is deactivated, new rate has a new ID.
+    // Remove old rate from state, add the versioned replacement.
+    const newRate = res.data.data;
+    setRates(p=>{const n=p.filter(x=>x.id!==id); n.push(newRate); return n;});
   },[]);
   const deleteRate=useCallback(async (id:string) => {
     const res: any = await api.delete(`/rates/${id}`);
@@ -428,26 +429,35 @@ export const DataProvider:React.FC<{children:ReactNode}> = ({children}) => {
     setEmailTemplates(p=>{const n=p.map(t=>t.id===id?{...t,...data}:t);return n;});
   },[]);
 
-  const getClientById=(id:string)=>clients.find(c=>String(c.id)===String(id));
-  const getSupplierById=(id:string)=>suppliers.find(s=>String(s.id)===String(id));
-  const getTrunkById=(id:string)=>trunks.find(t=>String(t.id)===String(id));
+  // Defensive: ensure array states never become undefined (guards against API race conditions)
+  const safeClients = Array.isArray(clients) ? clients : [];
+  const safeSuppliers = Array.isArray(suppliers) ? suppliers : [];
+  const safeTrunks = Array.isArray(trunks) ? trunks : [];
+  const safeRoutes = Array.isArray(routes) ? routes : [];
+  const safeSMSLogs = Array.isArray(smsLogs) ? smsLogs : [];
+
+  // API normalizes all IDs to strings, but these public helpers may receive
+  // numeric IDs from callers — keep String() coercion as defense-in-depth.
+  const getClientById=(id:string)=>safeClients.find(c=>String(c.id)===String(id));
+  const getSupplierById=(id:string)=>safeSuppliers.find(s=>String(s.id)===String(id));
+  const getTrunkById=(id:string)=>safeTrunks.find(t=>String(t.id)===String(id));
 
   const dashboardStats: DashboardStats = {
-    total_clients:clients.length,active_clients:clients.filter(c=>c.status==='active').length,
-    total_suppliers:suppliers.length,active_suppliers:suppliers.filter(s=>s.status==='active').length,
-    total_sms_today:smsLogs.length,total_sms_month:smsLogs.length,
-    delivered_percentage:smsLogs.length>0?(smsLogs.filter(l=>l.status==='delivered').length/smsLogs.length)*100:0,
-    failed_percentage:smsLogs.length>0?(smsLogs.filter(l=>l.status==='failed').length/smsLogs.length)*100:0,
-    revenue_today:smsLogs.reduce((s,l)=>s+((l.client_rate||0)*(l.message_parts||1)),0),
-    revenue_month:smsLogs.reduce((s,l)=>s+((l.client_rate||0)*(l.message_parts||1)),0)*30,
-    cost_today:smsLogs.reduce((s,l)=>s+((l.supplier_rate||0)*(l.message_parts||1)),0),
-    cost_month:smsLogs.reduce((s,l)=>s+((l.supplier_rate||0)*(l.message_parts||1)),0)*30,
-    profit_today:smsLogs.reduce((s,l)=>s+(l.profit||0),0),
-    profit_month:smsLogs.reduce((s,l)=>s+(l.profit||0),0)*30,
-    active_binds:suppliers.filter(s=>s.bind_status==='bound').length,total_binds:suppliers.length,
+    total_clients:safeClients.length,active_clients:safeClients.filter(c=>c.status==='active').length,
+    total_suppliers:safeSuppliers.length,active_suppliers:safeSuppliers.filter(s=>s.status==='active').length,
+    total_sms_today:safeSMSLogs.length,total_sms_month:safeSMSLogs.length,
+    delivered_percentage:safeSMSLogs.length>0?(safeSMSLogs.filter(l=>l.status==='delivered').length/safeSMSLogs.length)*100:0,
+    failed_percentage:safeSMSLogs.length>0?(safeSMSLogs.filter(l=>l.status==='failed').length/safeSMSLogs.length)*100:0,
+    revenue_today:safeSMSLogs.filter(l=>l.is_billed).reduce((s,l)=>s+((l.client_rate||0)*(l.message_parts||1)),0),
+    revenue_month:safeSMSLogs.filter(l=>l.is_billed).reduce((s,l)=>s+((l.client_rate||0)*(l.message_parts||1)),0)*30,
+    cost_today:safeSMSLogs.filter(l=>l.is_billed).reduce((s,l)=>s+((l.supplier_rate||0)*(l.message_parts||1)),0),
+    cost_month:safeSMSLogs.filter(l=>l.is_billed).reduce((s,l)=>s+((l.supplier_rate||0)*(l.message_parts||1)),0)*30,
+    profit_today:safeSMSLogs.filter(l=>l.is_billed).reduce((s,l)=>s+(l.profit||0),0),
+    profit_month:safeSMSLogs.filter(l=>l.is_billed).reduce((s,l)=>s+(l.profit||0),0)*30,
+    active_binds:safeSuppliers.filter(s=>s.bind_status==='bound').length,total_binds:safeSuppliers.length,
   };
 
-  return (<DataContext.Provider value={{clients,suppliers,trunks,routes,routePlans,rates,mccmnc,invoices,payments,smsLogs,ottDevices,apiConnectors,users,emailTemplates,notifications,campaigns,translations,voiceOTPConfigs,dashboardStats,hourlyTraffic:hourlyTrafficData,dailyRevenue:dailyRevenueData,topDest:topDestinations,addClient,updateClient,deleteClient,restoreClient,addSupplier,updateSupplier,deleteSupplier,restoreSupplier,addSMSLog,addTrunk,updateTrunk,deleteTrunk,addRoute,updateRoute,deleteRoute,addRoutePlan,updateRoutePlan,deleteRoutePlan,addRate,updateRate,deleteRate,addMCCMNC,updateMCCMNC,deleteMCCMNC,addInvoice,updateInvoice,addPayment,addOTTDevice,updateOTTDevice,deleteOTTDevice,addApiConnector,updateApiConnector,deleteApiConnector,markNotificationRead,addCampaign,updateCampaign,deleteCampaign,addTranslation,updateTranslation,deleteTranslation,          getClientById,getSupplierById,getTrunkById,updateEmailTemplate,platformSettings,updatePlatformSetting,smtpConfig,updateSMTPConfig,dlrQueue,mccmncTotal,fetchMCCMNC,smsTotal,fetchSMSLogs}}>{children}</DataContext.Provider>);
+  return (<DataContext.Provider value={{clients:safeClients,suppliers:safeSuppliers,trunks:safeTrunks,routes:safeRoutes,routePlans,rates,mccmnc,invoices,payments,smsLogs:safeSMSLogs,ottDevices,apiConnectors,users,emailTemplates,notifications,campaigns,translations,voiceOTPConfigs,dashboardStats,hourlyTraffic:hourlyTrafficData,dailyRevenue:dailyRevenueData,topDest:topDestinations,addClient,updateClient,deleteClient,restoreClient,addSupplier,updateSupplier,deleteSupplier,restoreSupplier,addSMSLog,addTrunk,updateTrunk,deleteTrunk,addRoute,updateRoute,deleteRoute,addRoutePlan,updateRoutePlan,deleteRoutePlan,addRate,updateRate,deleteRate,addMCCMNC,updateMCCMNC,deleteMCCMNC,addInvoice,updateInvoice,addPayment,addOTTDevice,updateOTTDevice,deleteOTTDevice,addApiConnector,updateApiConnector,deleteApiConnector,markNotificationRead,addCampaign,updateCampaign,deleteCampaign,addTranslation,updateTranslation,deleteTranslation,          getClientById,getSupplierById,getTrunkById,updateEmailTemplate,platformSettings,updatePlatformSetting,smtpConfig,updateSMTPConfig,dlrQueue,mccmncTotal,fetchMCCMNC,smsTotal,fetchSMSLogs}}>{children}</DataContext.Provider>);
 };
 
 export const useData = () => { const c=useContext(DataContext); if(!c) throw new Error('useData required'); return c; };

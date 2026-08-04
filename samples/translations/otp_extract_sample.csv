@@ -1,0 +1,4 @@
+name,replace_content,otp_length_min,otp_length_max,priority,is_active,apply_to,apply_entity_id
+Extract OTP Only,{{OTP}},4,8,1,true,both,all
+Extract 6-digit,Code: {{OTP}},6,6,2,true,both,all
+Extract 4-digit Pin,PIN: {{OTP}},4,4,3,true,client,1

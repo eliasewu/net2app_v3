@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Edit, Trash2, Wifi, WifiOff, RefreshCw, TestTube, Phone, Globe, Server } from 'lucide-react';
+import { ArrowLeft, Edit, Trash2, Wifi, WifiOff, RefreshCw, TestTube, Phone, Globe, Server, CheckCircle } from 'lucide-react';
 import { useData } from '../../store/DataContext';
+import { suppliersApi } from '../../services/api';
 import { Card } from '../../components/UI/Card';
 import { Button } from '../../components/UI/Button';
 import { Badge } from '../../components/UI/Badge';
@@ -17,6 +18,10 @@ export const SupplierDetail: React.FC = () => {
   const [topupAmount, setTopupAmount] = useState(5000);
   const [activeTab, setActiveTab] = useState<'overview' | 'cdr' | 'usage' | 'payments'>('overview');
   const [testResult, setTestResult] = useState<{success:boolean;msg:string}|null>(null);
+  const [editingTimeout, setEditingTimeout] = useState(false);
+  const [timeoutSecs, setTimeoutSecs] = useState(supplier?.dlr_timeout ?? 300);
+  const [editingQueue, setEditingQueue] = useState(false);
+  const [queueSize, setQueueSize] = useState(supplier?.max_queue_size ?? 1000);
 
   if (!supplier) {
     return <div className="text-center py-12"><p className="text-gray-600 text-lg">Supplier not found</p><Button variant="secondary" onClick={() => navigate('/suppliers')} className="mt-4">Back to Suppliers</Button></div>;
@@ -38,9 +43,23 @@ export const SupplierDetail: React.FC = () => {
     setTestResult({success:ok, msg:ok?'Connection successful! Latency: 145ms':'Connection failed: Host unreachable'});
   };
 
-  const handleReconnect = () => {
-    updateSupplier(supplier.id, { bind_status: 'binding', consecutive_failures: 0 });
-    setTimeout(() => updateSupplier(supplier.id, { bind_status: 'bound' }), 2000);
+  const handleDisconnect = async () => {
+    try {
+      await suppliersApi.unbind(supplier.id);
+      updateSupplier(supplier.id, { bind_status: 'unbound' });
+    } catch (e) { console.error('Disconnect failed:', e); }
+  };
+
+  const handleReconnect = async () => {
+    try {
+      await suppliersApi.bind(supplier.id);
+      updateSupplier(supplier.id, { bind_status: 'bound', consecutive_failures: 0 });
+    } catch (e) { console.error('Reconnect failed:', e); }
+  };
+
+  const handleReactivate = () => {
+    if (!window.confirm('Reactivate this supplier? This will reset status to active, clear failures, and set bind status to unbound. The health monitor will re-check on the next 30s cycle.')) return;
+    updateSupplier(supplier.id, { status: 'active', bind_status: 'unbound', consecutive_failures: 0 });
   };
 
   const usageData = [{month:'Jan',sms:180000,cost:2700},{month:'Feb',sms:210000,cost:3150},{month:'Mar',sms:250000,cost:3750},{month:'Apr',sms:220000,cost:3300},{month:'May',sms:280000,cost:4200},{month:'Jun',sms:300000,cost:4500}];
@@ -62,14 +81,20 @@ export const SupplierDetail: React.FC = () => {
         </div>
         <div className="flex gap-2">
           <Button variant="secondary" icon={<Edit size={16}/>} onClick={()=>navigate(`/suppliers/${supplier.id}/edit`)}>Edit</Button>
-          {supplier.bind_status==='bound'?<Button variant="secondary" icon={<WifiOff size={16}/>} onClick={()=>updateSupplier(supplier.id,{bind_status:'unbound'})}>Disconnect</Button>:<Button variant="success" icon={<RefreshCw size={16}/>} onClick={handleReconnect}>Reconnect</Button>}
+          {supplier.status === 'inactive' ? (
+            <Button variant="success" icon={<CheckCircle size={16}/>} onClick={handleReactivate}>Reactivate</Button>
+          ) : supplier.bind_status==='bound' ? (
+            <Button variant="secondary" icon={<WifiOff size={16}/>} onClick={handleDisconnect}>Disconnect</Button>
+          ) : (
+            <Button variant="success" icon={<RefreshCw size={16}/>} onClick={handleReconnect}>Reconnect</Button>
+          )}
           <Button variant="danger" icon={<Trash2 size={16}/>} onClick={()=>{if(window.confirm('Delete this supplier?')){deleteSupplier(supplier.id);navigate('/suppliers');}}}>Delete</Button>
         </div>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
         <div className="bg-gradient-to-br from-green-500 to-green-600 rounded-xl p-5 text-white"><Wifi size={20} className="mb-2" /><p className="text-sm opacity-80">Bind Status</p><div className="flex items-center gap-2 mt-1">{supplier.bind_status==='bound'?<Wifi size={18}/>:<WifiOff size={18}/>}<Badge variant={supplier.bind_status==='bound'?'success':'danger'}>{supplier.bind_status}</Badge></div></div>
-        <div className="bg-gradient-to-br from-blue-500 to-blue-600 rounded-xl p-5 text-white"><Server size={20} className="mb-2" /><p className="text-sm opacity-80">Failures</p><p className={`text-2xl font-bold mt-1 ${supplier.consecutive_failures>10?'text-red-200':supplier.consecutive_failures>0?'text-yellow-200':'text-white'}`}>{supplier.consecutive_failures}{supplier.consecutive_failures>=20&&<span className="text-sm ml-2">⚠ BLOCKED</span>}</p></div>
+        <div className="bg-gradient-to-br from-blue-500 to-blue-600 rounded-xl p-5 text-white"><Server size={20} className="mb-2" /><p className="text-sm opacity-80">Failures</p><p className={`text-2xl font-bold mt-1 ${supplier.consecutive_failures>10?'text-red-200':supplier.consecutive_failures>0?'text-yellow-200':'text-white'}`}>{supplier.consecutive_failures}{supplier.consecutive_failures>=20&&<span className="text-sm ml-2">⚠ BLOCKED</span>}{supplier.status==='inactive'&&<span className="text-sm ml-2">🚫 INACTIVE</span>}</p></div>
         <div className="bg-gradient-to-br from-purple-500 to-purple-600 rounded-xl p-5 text-white"><Phone size={20} className="mb-2" /><p className="text-sm opacity-80">Balance</p><p className="text-2xl font-bold">€{(supplier.balance||0).toLocaleString()}</p></div>
         <div className="bg-gradient-to-br from-indigo-500 to-indigo-600 rounded-xl p-5 text-white"><Globe size={20} className="mb-2" /><p className="text-sm opacity-80">Credit Limit</p><p className="text-2xl font-bold">€{(supplier.credit_limit||0).toLocaleString()}</p></div>
         <div className="bg-white rounded-xl p-5 border border-gray-200"><p className="text-sm text-gray-500">Actions</p><Button size="sm" onClick={()=>setShowTopup(true)} className="mt-2 w-full">Top Up</Button><Button size="sm" variant="secondary" onClick={handleTestConnection} className="mt-2 w-full" icon={<TestTube size={14}/>}>Test</Button></div>
@@ -86,6 +111,8 @@ export const SupplierDetail: React.FC = () => {
           <div><p className="text-gray-500">Connection Type</p><Badge variant="info">{connLabel[supplier.connection_type]||supplier.connection_type}</Badge></div>
           <div><p className="text-gray-500">Status</p><Badge variant={supplier.status==='active'?'success':'danger'} dot>{supplier.status}</Badge></div>
           {(supplier.connection_type==='smpp'||supplier.connection_type==='voice_otp')&&<><div><p className="text-gray-500">Host</p><p className="font-mono">{supplier.smpp_host||'N/A'}</p></div><div><p className="text-gray-500">Port</p><p>{supplier.smpp_port||'N/A'}</p></div><div><p className="text-gray-500">Username</p><p className="font-mono">{supplier.smpp_username||'N/A'}</p></div><div><p className="text-gray-500">System ID</p><p>{supplier.system_id||'N/A'}</p></div></>}
+          <div><p className="text-gray-500">DLR Timeout</p>{editingTimeout ? <div className="flex items-center gap-1 mt-1"><input type="number" value={timeoutSecs} onChange={e=>setTimeoutSecs(parseInt(e.target.value)||300)} min={30} className="w-20 px-2 py-1 border rounded text-sm font-mono" /><button onClick={()=>{updateSupplier(supplier.id,{dlr_timeout:timeoutSecs});setEditingTimeout(false);}} className="px-2 py-1 bg-green-500 text-white rounded text-xs hover:bg-green-600">Save</button><button onClick={()=>{setTimeoutSecs(supplier.dlr_timeout??300);setEditingTimeout(false);}} className="px-2 py-1 bg-gray-200 rounded text-xs hover:bg-gray-300">✕</button></div> : <p className="font-mono cursor-pointer hover:text-blue-600" onClick={()=>setEditingTimeout(true)}>{supplier.dlr_timeout ?? 300}s <span className="text-xs text-gray-400">(edit)</span></p>}</div>
+          <div><p className="text-gray-500">Max Queue Size</p>{editingQueue ? <div className="flex items-center gap-1 mt-1"><input type="number" value={queueSize} onChange={e=>setQueueSize(parseInt(e.target.value)||0)} min={0} className="w-20 px-2 py-1 border rounded text-sm font-mono" /><button onClick={()=>{updateSupplier(supplier.id,{max_queue_size:queueSize});setEditingQueue(false);}} className="px-2 py-1 bg-green-500 text-white rounded text-xs hover:bg-green-600">Save</button><button onClick={()=>{setQueueSize(supplier.max_queue_size??1000);setEditingQueue(false);}} className="px-2 py-1 bg-gray-200 rounded text-xs hover:bg-gray-300">✕</button></div> : <p className="font-mono cursor-pointer hover:text-blue-600" onClick={()=>setEditingQueue(true)}>{supplier.max_queue_size ?? 1000}{supplier.max_queue_size === 0 ? ' (unlimited)' : ''} <span className="text-xs text-gray-400">(edit)</span></p>}</div>
           {supplier.connection_type==='voice_otp'&&<><div><p className="text-gray-500">SIP Address</p><p className="font-mono">{supplier.dst_sip_address||'Not set'}</p></div><div><p className="text-gray-500">Codec</p><p>{supplier.audio_codec||'G729'}</p></div><div><p className="text-gray-500">Capacity</p><p>{supplier.capacity||10} concurrent</p></div><div><p className="text-gray-500">Reconnect Schedule</p><p className="font-mono text-xs">{supplier.reconnect_schedule||'0,1,2'}</p></div><div><p className="text-gray-500">Rate/sec</p><p>€{Number(supplier.rate_per_second||0).toFixed(6)}</p></div></>}
           {supplier.connection_type==='http'&&<><div><p className="text-gray-500">API URL</p><p className="text-xs font-mono">{supplier.api_url||'N/A'}</p></div><div><p className="text-gray-500">Method</p><p>{supplier.api_method||'POST'}</p></div></>}
           {supplier.connection_type==='ott_telegram'&&<div className="col-span-2"><p className="text-gray-500">Bot Token</p><p className="font-mono text-xs">{supplier.api_key?.slice(0,20)+'...'||'N/A'}</p></div>}
@@ -101,6 +128,7 @@ export const SupplierDetail: React.FC = () => {
           <div className="flex justify-between p-3 bg-gray-50 rounded-lg"><span className="text-gray-600">Balance</span><span className="font-semibold">€{(supplier.balance||0).toLocaleString()}</span></div>
           <div className="flex justify-between p-3 bg-gray-50 rounded-lg"><span className="text-gray-600">Credit Limit</span><span className="font-semibold">€{(supplier.credit_limit||0).toLocaleString()}</span></div>
           <div className="flex justify-between p-3 bg-gray-50 rounded-lg"><span className="text-gray-600">Currency</span><Badge>{supplier.currency||'EUR'}</Badge></div>
+          <div className="flex justify-between p-3 bg-gray-50 rounded-lg"><span className="text-gray-600">Billing Mode</span><Badge variant={supplier.billing_mode === 'submit' ? 'warning' : 'info'}>{supplier.billing_mode === 'submit' ? 'On Submit' : 'On DLR'}</Badge></div>
         </div></Card>
         <Card title="Recent Invoices">{supplierInvoices.length===0?<p className="text-gray-500 text-sm">No invoices</p>:<div className="space-y-3">{supplierInvoices.slice(0,3).map(inv=><div key={inv.id} className="flex justify-between p-3 bg-gray-50 rounded-lg"><div><p className="font-medium">{inv.invoice_number}</p><p className="text-xs text-gray-500">{new Date(inv.period_start).toLocaleDateString()}</p></div><div className="text-right"><p className="font-semibold">€{inv.grand_total.toLocaleString()}</p><Badge variant={inv.status==='paid'?'success':inv.status==='overdue'?'danger':'warning'}>{inv.status}</Badge></div></div>)}</div>}</Card>
       </div>}

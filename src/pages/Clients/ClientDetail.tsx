@@ -1,13 +1,13 @@
 import React, { useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Edit, Trash2, Send, CreditCard, BarChart3, MessageSquare, Radio, PhoneCall, ToggleLeft, ToggleRight } from 'lucide-react';
+import { ArrowLeft, Edit, Trash2, Send, CreditCard, BarChart3, MessageSquare, Radio, PhoneCall, ToggleLeft, ToggleRight, Wifi, WifiOff, RefreshCw } from 'lucide-react';
 import { useData } from '../../store/DataContext';
 import { Card } from '../../components/UI/Card';
 import { Button } from '../../components/UI/Button';
 import { Badge } from '../../components/UI/Badge';
 import { Modal } from '../../components/UI/Modal';
 import { Input } from '../../components/UI/Input';
-import { voiceOtpApi } from '../../services/api';
+import { voiceOtpApi, bindApi } from '../../services/api';
 
 export const ClientDetail: React.FC = () => {
   const { id } = useParams<{ id: string }>();
@@ -79,13 +79,23 @@ export const ClientDetail: React.FC = () => {
         </div>
         <div className="flex gap-2">
           <Button variant="secondary" icon={<Edit size={16} />} onClick={() => navigate(`/clients/${client.id}/edit`)}>Edit</Button>
-          <Button variant="secondary" icon={<Send size={16} />} onClick={() => {}}>Send Welcome Email</Button>
+          {(client as any).bind_status === 'bound' ? (
+            <Button variant="secondary" icon={<WifiOff size={16} />} onClick={async () => {
+              try { await bindApi.unbindClient(client.id); updateClient(client.id, { bind_status: 'unbound' }); }
+              catch (e) { console.error('Disconnect failed:', e); }
+            }}>Disconnect</Button>
+          ) : (
+            <Button variant="success" icon={<RefreshCw size={16} />} onClick={async () => {
+              try { await bindApi.bindClient(client.id); updateClient(client.id, { bind_status: 'bound' }); }
+              catch (e) { console.error('Reconnect failed:', e); }
+            }}>Reconnect</Button>
+          )}
           <Button variant="danger" icon={<Trash2 size={16} />} onClick={handleDelete}>Delete</Button>
         </div>
       </div>
 
       {/* Quick Stats */}
-      <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-6 gap-4">
         <div className="bg-gradient-to-br from-blue-500 to-blue-600 rounded-xl p-5 text-white">
           <CreditCard size={20} className="mb-2" />
           <p className="text-sm opacity-80">Balance</p>
@@ -105,6 +115,14 @@ export const ClientDetail: React.FC = () => {
           <Radio size={20} className="mb-2" />
           <p className="text-sm opacity-80">Max TPS</p>
           <p className="text-2xl font-bold">{client.max_tps}</p>
+        </div>
+        <div className="bg-gradient-to-br from-green-500 to-green-600 rounded-xl p-5 text-white">
+          <Wifi size={20} className="mb-2" />
+          <p className="text-sm opacity-80">SMPP Status</p>
+          <div className="flex items-center gap-2 mt-1">
+            {(client as any).bind_status === 'bound' ? <Wifi size={18} /> : <WifiOff size={18} />}
+            <Badge variant={(client as any).bind_status === 'bound' ? 'success' : 'danger'}>{(client as any).bind_status || 'unknown'}</Badge>
+          </div>
         </div>
         <div className="bg-white rounded-xl p-5 border border-gray-200">
           <p className="text-sm text-gray-500">Actions</p>

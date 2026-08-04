@@ -7,23 +7,42 @@ const { Pool } = pg;
 
 const pool = new Pool({
   host: process.env.DB_HOST || 'localhost',
-  database: process.env.DB_NAME || 'net2app_hub',
+  database: process.env.DB_NAME || 'sms_platform',
   user: process.env.DB_USER || 'net2app_user',
   password: process.env.DB_PASS || 'Ariya@2024Net2App',
 });
 
 class DynamicRouter {
   
-  // Get MCC/MNC from destination number
-  getMccMnc(destination) {
-    // Simple MCC detection based on country code
-    if (destination.startsWith('880') || destination.startsWith('016') || 
-        destination.startsWith('017') || destination.startsWith('018') || 
-        destination.startsWith('019')) {
-      return { mcc: '470', mnc: '*' };
+  // Get MCC/MNC from destination number — resolves actual MNC via mccmnc table
+  async getMccMnc(destination) {
+    const cleaned = String(destination).replace(/^\+/, '');
+    
+    // Build all possible prefix lengths, query in one round trip, longest wins
+    const prefixes = [];
+    for (let len = Math.min(cleaned.length, 5); len >= 1; len--) {
+      prefixes.push(cleaned.substring(0, len));
     }
-    // Add more country detection as needed
-    return { mcc: '000', mnc: '*' };
+    
+    const result = await pool.query(
+      `SELECT mcc, mnc, operator, country FROM mccmnc
+       WHERE calling_code = ANY($1) AND (is_deleted IS NULL OR is_deleted = false)
+       ORDER BY LENGTH(calling_code) DESC LIMIT 1`,
+      [prefixes]
+    );
+    
+    if (result.rows.length) {
+      const row = result.rows[0];
+      return { mcc: row.mcc, mnc: row.mnc, operator: row.operator || '', country: row.country || '' };
+    }
+    
+    // Simple country code fallback for common prefixes
+    if (cleaned.startsWith('880') || cleaned.startsWith('016')) return { mcc: '470', mnc: '*', operator: '', country: 'Bangladesh' };
+    if (cleaned.startsWith('91')) return { mcc: '404', mnc: '*', operator: '', country: 'India' };
+    if (cleaned.startsWith('92')) return { mcc: '410', mnc: '*', operator: '', country: 'Pakistan' };
+    if (cleaned.startsWith('1')) return { mcc: '310', mnc: '*', operator: '', country: 'USA' };
+    if (cleaned.startsWith('44')) return { mcc: '234', mnc: '*', operator: '', country: 'UK' };
+    return { mcc: '000', mnc: '*', operator: '', country: 'Unknown' };
   }
 
   // Get client routing configuration
@@ -50,14 +69,15 @@ class DynamicRouter {
       return null;
     }
     
-    // Get all routes in the plan
+    // Get all routes in the plan (including voice_otp_config_id)
     const routesResult = await pool.query(`
       SELECT 
         r.id,
         r.route_name,
         r.route_method,
         r.trunk_ids,
-        r.is_active
+        r.is_active,
+        r.voice_otp_config_id
       FROM routes r
       WHERE r.id = ANY($1) AND r.is_active = true
     `, [routeIds]);
@@ -83,7 +103,7 @@ class DynamicRouter {
       return null;
     }
     
-    // Get all trunks
+    // Get all trunks (including voice_otp_config_id from trunk and supplier)
     const trunksResult = await pool.query(`
       SELECT 
         t.id,
@@ -93,8 +113,10 @@ class DynamicRouter {
         t.priority,
         t.percentage,
         t.mccmnc_allowed,
+        t.voice_otp_config_id AS trunk_voice_otp_config_id,
         s.supplier_code,
-        s.company_name
+        s.company_name,
+        s.voice_otp_config_id AS supplier_voice_otp_config_id
       FROM trunks t
       JOIN suppliers s ON t.supplier_id = s.id
       WHERE t.id = ANY($1) AND t.is_active = true
@@ -122,29 +144,27 @@ class DynamicRouter {
     return trunksResult.rows[0] || null;
   }
 
-  // Get rates for client and supplier
+  // Get rates for client and supplier — matches by MNC first, falls back to MCC, picks lowest
   async getRates(clientId, supplierId, mcc, mnc) {
-    const clientRate = await pool.query(`
-      SELECT rate, currency 
+    // Priority: exact MNC match → MCC wildcard MNC → MCC only → global fallback
+    // Picks the LOWEST matching rate (most favorable to client)
+    const rateQuery = (entityType, entityId) => pool.query(`
+      SELECT rate, currency, mnc
       FROM rates 
-      WHERE entity_type = 'client' 
-        AND entity_id = $1 
-        AND (mcc = $2 OR mcc = '*')
+      WHERE entity_type = $1 
+        AND entity_id = $2 
+        AND (mcc = $3 OR mcc = '*')
         AND is_active = true 
-      ORDER BY rate DESC 
+      ORDER BY 
+        CASE WHEN mnc = $4 THEN 0 WHEN mnc = '*' THEN 1 ELSE 2 END,
+        rate ASC
       LIMIT 1
-    `, [clientId, mcc]);
+    `, [entityType, entityId, mcc, mnc]);
     
-    const supplierRate = await pool.query(`
-      SELECT rate, currency 
-      FROM rates 
-      WHERE entity_type = 'supplier' 
-        AND entity_id = $1 
-        AND (mcc = $2 OR mcc = '*')
-        AND is_active = true 
-      ORDER BY rate DESC 
-      LIMIT 1
-    `, [supplierId, mcc]);
+    const [clientRate, supplierRate] = await Promise.all([
+      rateQuery('client', clientId),
+      rateQuery('supplier', supplierId)
+    ]);
     
     return {
       clientRate: clientRate.rows[0]?.rate || 0.05,
@@ -176,8 +196,8 @@ class DynamicRouter {
 
   // Main routing function
   async routeSms(clientId, destination, message, senderId) {
-    // 1. Get MCC/MNC from destination
-    const { mcc, mnc } = this.getMccMnc(destination);
+    // 1. Get MCC/MNC from destination (resolves real MNC from mccmnc table)
+    const { mcc, mnc } = await this.getMccMnc(destination);
     console.log(`[Router] MCC: ${mcc}, MNC: ${mnc}`);
     
     // 2. Get client routing configuration
@@ -206,7 +226,12 @@ class DynamicRouter {
       rates,
       connector,
       mcc,
-      mnc
+      mnc,
+      // Voice OTP config resolution priority: route > trunk > supplier > null (auto-resolve)
+      voiceOtpConfigId: routing.route.voice_otp_config_id
+        || routing.trunk.trunk_voice_otp_config_id
+        || routing.trunk.supplier_voice_otp_config_id
+        || null,
     };
   }
 }

@@ -105,6 +105,7 @@ export const AddSupplier: React.FC = () => {
     balance: existingSupplier?.balance || 0,
     credit_limit: existingSupplier?.credit_limit || 0,
     currency: (existingSupplier?.currency || 'EUR') as Currency,
+    billing_mode: (existingSupplier?.billing_mode || 'dlr') as 'submit' | 'dlr',
     status: existingSupplier?.status || 'active',
     bind_status: existingSupplier?.bind_status || 'unbound',
     consecutive_failures: existingSupplier?.consecutive_failures || 0,
@@ -113,6 +114,8 @@ export const AddSupplier: React.FC = () => {
     voice_otp_mode: existingSupplier?.voice_otp_mode || null,
     dst_sip_address: existingSupplier?.dst_sip_address || '',
     reconnect_schedule: existingSupplier?.reconnect_schedule || '0,1,2',
+    max_queue_size: existingSupplier?.max_queue_size ?? 1000,
+    dlr_timeout: existingSupplier?.dlr_timeout ?? 300,
   });
 
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -358,10 +361,13 @@ export const AddSupplier: React.FC = () => {
           </Card>
         )}
 
-        <Card title="Billing Settings"><div className="grid grid-cols-3 gap-6">
-          <Select label="Currency" value={formData.currency} onChange={e => updateField('currency', e.target.value)} options={[{value:'EUR',label:'EUR'},{value:'USD',label:'USD'},{value:'GBP',label:'GBP'}]} />
-          <Input label="Balance" type="number" value={formData.balance} onChange={e => updateField('balance', parseFloat(e.target.value))} />
-          <Input label="Credit Limit" type="number" value={formData.credit_limit} onChange={e => updateField('credit_limit', parseFloat(e.target.value))} />
+<Card title="Billing & Queue Settings"><div className="grid grid-cols-3 gap-6">
+  <Select label="Currency" value={formData.currency} onChange={e => updateField('currency', e.target.value)} options={[{value:'EUR',label:'EUR'},{value:'USD',label:'USD'},{value:'GBP',label:'GBP'}]} />
+  <Select label="Billing Mode" value={formData.billing_mode} onChange={e => updateField('billing_mode', e.target.value)} options={[{value:'submit',label:'On Submit'},{value:'dlr',label:'On DLR (Delivery)'}]} />
+  <Input label="Balance" type="number" value={formData.balance} onChange={e => updateField('balance', parseFloat(e.target.value))} />
+  <Input label="Credit Limit" type="number" value={formData.credit_limit} onChange={e => updateField('credit_limit', parseFloat(e.target.value))} />
+  <Input label="Max Queue Size" type="number" value={formData.max_queue_size} onChange={e => updateField('max_queue_size', parseInt(e.target.value)||1000)} hint="Max pending SMS queue depth for inbound gateways (0=unlimited)" min={0} />
+  <Input label="DLR Timeout (sec)" type="number" value={formData.dlr_timeout} onChange={e => updateField('dlr_timeout', parseInt(e.target.value)||300)} hint="Time before inbound messages are reported as EXPIRED" min={30} />
         </div></Card>
 
         {formData.connection_type === 'smpp' && (

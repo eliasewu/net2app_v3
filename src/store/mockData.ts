@@ -115,8 +115,8 @@ export const mockCampaigns: Campaign[] = [
 
 // ==================== TRANSLATIONS ====================
 export const mockTranslations: Translation[] = [
-  { id: '1', translation_type: 'sender_id', source_pattern: 'TECHCORP', target_value: 'TC-MSG', client_id: '1', supplier_id: '1', route_id: null, mcc: null, mnc: null, name: 'Sender ID Mask', description: 'Mask TECHCORP to TC-MSG', subtype: 'sender_id_masking', priority: 1, apply_to: 'client', apply_entity_id: '1', is_active: true, created_at: '2024-01-15T00:00:00Z' },
-  { id: '2', translation_type: 'destination', source_pattern: '+44', target_value: '0044', client_id: null, supplier_id: '2', route_id: null, mcc: null, mnc: null, name: 'UK Prefix Rewrite', description: 'Rewrite +44 to 0044 for supplier', subtype: '', priority: 2, apply_to: 'supplier', apply_entity_id: '2', is_active: true, created_at: '2024-02-01T00:00:00Z' },
+  { id: '1', translation_type: 'sid_alias', source_pattern: 'TECHCORP', target_value: 'TC-MSG', client_id: '1', supplier_id: '1', route_id: null, mcc: null, mnc: null, name: 'Sender ID Mask', description: 'Mask TECHCORP to TC-MSG', subtype: 'sender_id_masking', priority: 1, apply_to: 'client', apply_entity_id: '1', is_active: true, created_at: '2024-01-15T00:00:00Z' },
+  { id: '2', translation_type: 'number_prefix', source_pattern: '+44', target_value: '0044', client_id: null, supplier_id: '2', route_id: null, mcc: null, mnc: null, name: 'UK Prefix Rewrite', description: 'Rewrite +44 to 0044 for supplier', subtype: '', priority: 2, apply_to: 'supplier', apply_entity_id: '2', is_active: true, created_at: '2024-02-01T00:00:00Z' },
 ];
 
 // ==================== VOICE OTP CONFIG ====================

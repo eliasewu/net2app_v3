@@ -22,6 +22,9 @@ class ConnectionPipeline {
     this.lastActivity = null;
     this.busy = false;
     this.smppClient = null; // Real SMPP client instance (for smpp type)
+    this._terminated = false; // guard against redundant DB writes after max failures
+    /** DLR callback set by ConnectionPoolManager — forwarded from SmppClient */
+    this._onDlrCallback = null;
   }
 
   async connect() {
@@ -40,6 +43,12 @@ class ConnectionPipeline {
             system_type: 'SMPP',
             smpp_version: 0x34,
           });
+          // Wire DLR callback — forward to ConnectionPoolManager's global DLR handler
+          this.smppClient.onDlr = (dlr) => {
+            if (this._onDlrCallback) {
+              this._onDlrCallback(dlr);
+            }
+          };
         }
         // connect() now returns a Promise that resolves after bind completes
         this.isConnected = await this.smppClient.connect();
@@ -57,6 +66,7 @@ class ConnectionPipeline {
       }
       
       if (this.isConnected) {
+        this._terminated = false; // reset on successful reconnect
         console.log(`[Pipeline ${this.pipelineId}] Connected ✓ (supplier=${this.supplierCode})`);
       }
       return this.isConnected;
@@ -124,9 +134,20 @@ class ConnectionPipeline {
       }
     } catch (error) {
       this.consecutiveFailures++;
-      if (this.consecutiveFailures >= this.maxFailures) {
-        console.error(`[Pipeline ${this.pipelineId}] Too many failures (${this.consecutiveFailures}), marking as failed`);
+      if (this.consecutiveFailures >= this.maxFailures && !this._terminated) {
+        this._terminated = true;
+        console.error(`[Pipeline ${this.pipelineId}] Too many failures (${this.consecutiveFailures}), marking supplier unbound`);
         this.isConnected = false;
+        // Sync unbound status + increment failures atomically in DB (once only)
+        await this._syncSupplierBindStatus('unbound');
+        if (this.pool) {
+          try {
+            await this.pool.query(
+              `UPDATE suppliers SET consecutive_failures = consecutive_failures + 1, updated_at = NOW() WHERE id = $1`,
+              [this.supplierId]
+            );
+          } catch (e) { /* non-critical */ }
+        }
       }
       throw error;
     } finally {
@@ -236,14 +257,32 @@ class ConnectionPipeline {
 }
 
 class ConnectionPoolManager {
-  constructor(pgPool) {
+  constructor() {
     // Supplier ID → array of ConnectionPipelines
     this.supplierPipelines = new Map();
-    this.pool = pgPool;
+    this.pool = null;
     // Default pipelines per supplier
     this.defaultPipelines = 4;
     // Max pipelines per supplier
     this.maxPipelines = 16;
+    /** Global DLR callback — set by server.cjs, forwarded to all SMPP pipelines */
+    this._globalDlrCallback = null;
+  }
+
+  /** Set global DLR callback — all new SMPP pipelines will forward DLRs here */
+  setDlrCallback(cb) {
+    this._globalDlrCallback = cb;
+    // Also set on existing pipelines
+    for (const [, pipelines] of this.supplierPipelines) {
+      for (const p of pipelines) {
+        p._onDlrCallback = cb;
+      }
+    }
+  }
+
+  /** Set the shared pool after import (called by server.cjs) */
+  init(pgPool) {
+    this.pool = pgPool;
   }
 
   /** 
@@ -295,6 +334,10 @@ class ConnectionPoolManager {
         this.pool
       );
       
+      // Wire DLR callback if set
+      if (this._globalDlrCallback) {
+        pipeline._onDlrCallback = this._globalDlrCallback;
+      }
       await pipeline.connect();
       pipelines.push(pipeline);
     }

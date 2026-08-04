@@ -70,7 +70,7 @@ Call-ID: ${callId}
 CSeq: 1 INVITE
 Contact: <sip:VoiceOTP@${VOS_CONFIG.localIp}:${VOS_CONFIG.localPort}>
 Allow: INVITE, ACK, CANCEL, BYE, OPTIONS
-User-Agent: NET2APP-VoiceOTP
+User-Agent: NET2APP
 Content-Type: application/sdp
 Content-Length: ${sdp.length}
 

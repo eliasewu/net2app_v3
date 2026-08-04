@@ -1,25 +1,39 @@
-import React, { useState } from 'react';
-import { Plus, Search, Smartphone, Trash2, RefreshCw, QrCode, Power } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import QRCode from 'qrcode';
+import { Plus, Search, Smartphone, Trash2, RefreshCw, QrCode, Power, Shield, Globe } from 'lucide-react';
 import { useData } from '../../store/DataContext';
 import { Card } from '../../components/UI/Card';
 import { Button } from '../../components/UI/Button';
 import { Badge } from '../../components/UI/Badge';
 import { Modal } from '../../components/UI/Modal';
 import { Input, Select } from '../../components/UI/Input';
+import { api } from '../../services/api';
 import { OTTDevice } from '../../types';
+
+const QRCodeDisplay: React.FC<{ qrData: string }> = ({ qrData }) => {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    if (canvasRef.current && qrData) {
+      QRCode.toCanvas(canvasRef.current, qrData, { width: 200, margin: 1 });
+    }
+  }, [qrData]);
+  return <canvas ref={canvasRef} className="w-48 h-48" />;
+};
 
 export const OTTDevices: React.FC = () => {
   const { ottDevices, suppliers, addOTTDevice, updateOTTDevice, deleteOTTDevice } = useData();
   const [search, setSearch] = useState('');
   const [showModal, setShowModal] = useState(false);
   const [deleteModal, setDeleteModal] = useState<OTTDevice | null>(null);
-  const [qrModal, setQrModal] = useState<OTTDevice | null>(null);
+  const [qrModal, setQrModal] = useState<any>(null);
+  const [qrLoading, setQrLoading] = useState(false);
 
   const [formData, setFormData] = useState({
     device_name: '',
     device_type: 'whatsapp' as 'whatsapp' | 'telegram',
     phone_number: '',
     supplier_id: '',
+    proxy_node: '',
   });
 
   const filteredDevices = ottDevices.filter(device =>
@@ -34,17 +48,12 @@ export const OTTDevices: React.FC = () => {
   const handleCreate = () => {
     addOTTDevice({
       ...formData,
-      session_status: 'qr_pending',
-      qr_code: 'QR_CODE_DATA_' + Date.now(),
+      session_status: 'disconnected',
+      qr_code: null,
       last_active: null,
     });
     setShowModal(false);
-    setFormData({
-      device_name: '',
-      device_type: 'whatsapp',
-      phone_number: '',
-      supplier_id: '',
-    });
+    setFormData({ device_name: '', device_type: 'whatsapp', phone_number: '', supplier_id: '', proxy_node: '' });
   };
 
   const handleDelete = () => {
@@ -54,19 +63,24 @@ export const OTTDevices: React.FC = () => {
     }
   };
 
-  const handleConnect = (device: OTTDevice) => {
-    updateOTTDevice(device.id, { 
-      session_status: 'connected',
-      qr_code: null,
-      last_active: new Date().toISOString()
-    });
-  };
-
-  const handleDisconnect = (device: OTTDevice) => {
-    updateOTTDevice(device.id, { 
-      session_status: 'disconnected',
-      last_active: null
-    });
+  // Generate real QR code via backend
+  const handleGenerateQR = async (device: OTTDevice) => {
+    setQrLoading(true);
+    try {
+      const res = await api.get<any>(`/ott/devices/${device.id}/qr`);
+      const data = (res as any).data?.data || (res as any).data;
+      setQrModal({
+        ...device,
+        qr_code: data?.qr || device.qr_code,
+        pairing_token: data?.pairing_token,
+        instructions: data?.instructions,
+        device_type: data?.device_type || device.device_type,
+      });
+    } catch (e: any) {
+      // Fallback to stored QR
+      setQrModal(device);
+    }
+    setQrLoading(false);
   };
 
   const getStatusBadge = (status: string) => {
@@ -171,7 +185,8 @@ export const OTTDevices: React.FC = () => {
                     variant="secondary"
                     icon={<QrCode size={16} />}
                     className="flex-1"
-                    onClick={() => setQrModal(device)}
+                    onClick={() => handleGenerateQR(device)}
+                    loading={qrLoading}
                   >
                     Show QR
                   </Button>
@@ -182,7 +197,7 @@ export const OTTDevices: React.FC = () => {
                     variant="danger"
                     icon={<Power size={16} />}
                     className="flex-1"
-                    onClick={() => handleDisconnect(device)}
+                    onClick={() => updateOTTDevice(device.id, { session_status: 'disconnected', last_active: null })}
                   >
                     Disconnect
                   </Button>
@@ -192,9 +207,9 @@ export const OTTDevices: React.FC = () => {
                     variant="success"
                     icon={<RefreshCw size={16} />}
                     className="flex-1"
-                    onClick={() => handleConnect(device)}
+                    onClick={() => handleGenerateQR(device)}
                   >
-                    Connect
+                    Pair
                   </Button>
                 )}
                 <Button
@@ -253,6 +268,13 @@ export const OTTDevices: React.FC = () => {
             placeholder="+1234567890"
             required
           />
+          <Input
+            label="Proxy Node (Tailscale IP:port)"
+            value={formData.proxy_node}
+            onChange={(e) => setFormData(prev => ({ ...prev, proxy_node: e.target.value }))}
+            placeholder="100.x.x.x or leave blank for auto-assign"
+            hint="Residential proxy via Tailscale + 3proxy. SOCKS5 on port 3128."
+          />
           <Select
             label="Supplier"
             value={formData.supplier_id}
@@ -270,25 +292,43 @@ export const OTTDevices: React.FC = () => {
       <Modal
         isOpen={!!qrModal}
         onClose={() => setQrModal(null)}
-        title="Scan QR Code"
+        title={`Pair ${qrModal?.device_type === 'whatsapp' ? 'WhatsApp' : 'Telegram'} Device`}
+        size="md"
       >
         {qrModal && (
           <div className="text-center space-y-4">
-            <div className="bg-white p-8 rounded-xl border-2 border-dashed border-gray-300 inline-block">
-              <div className="w-48 h-48 bg-gray-100 rounded-lg flex items-center justify-center">
-                <QrCode size={120} className="text-gray-400" />
+            {qrModal.device_type === 'whatsapp' && (
+              <div className="bg-white p-6 rounded-xl border-2 border-dashed border-green-300 inline-block">
+                {qrModal.qr_code ? (
+                  <QRCodeDisplay qrData={qrModal.qr_code} />
+                ) : (
+                  <div className="w-56 h-56 bg-gray-100 rounded-lg flex items-center justify-center">
+                    <RefreshCw size={40} className="animate-spin text-green-500" />
+                  </div>
+                )}
               </div>
-            </div>
+            )}
+            {qrModal.device_type === 'telegram' && (
+              <div className="bg-blue-50 p-6 rounded-xl border-2 border-blue-200">
+                <Shield size={48} className="mx-auto text-blue-500 mb-3" />
+                <p className="text-sm font-medium text-blue-800">Pairing Token</p>
+                <code className="block mt-2 p-3 bg-white rounded-lg text-xs text-blue-700 break-all font-mono">
+                  {qrModal.pairing_token || qrModal.qr_code || 'Generating...'}
+                </code>
+              </div>
+            )}
             <p className="text-sm text-gray-600">
-              Open {qrModal.device_type === 'whatsapp' ? 'WhatsApp' : 'Telegram'} on your phone
-              and scan this QR code to connect.
+              {qrModal.instructions || `Open ${qrModal.device_type === 'whatsapp' ? 'WhatsApp' : 'Telegram'} and follow the pairing instructions.`}
             </p>
-            <Button onClick={() => {
-              handleConnect(qrModal);
-              setQrModal(null);
-            }}>
-              I've Scanned the QR Code
-            </Button>
+            {qrModal.proxy_node && (
+              <div className="flex items-center justify-center gap-2 text-xs text-gray-500">
+                <Globe size={12} />
+                <span>Via proxy: {qrModal.proxy_node}</span>
+              </div>
+            )}
+            <div className="flex gap-3 justify-center">
+              <Button variant="secondary" onClick={() => setQrModal(null)}>Close</Button>
+            </div>
           </div>
         )}
       </Modal>
