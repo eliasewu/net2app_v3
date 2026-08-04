@@ -5562,6 +5562,7 @@ async function handleVoiceOtpSend(req, res) {
                 const finalStatus = callResult.status || 'unknown';
                 const finalDlr = callResult.dlr || 'UNKNOWN';
                 const finalDuration = callResult.duration || 0;
+                const isDelivered = finalDlr === 'DELIVRD';
                 await pool.query(`UPDATE voice_otp_logs SET status=$1,dlr_status=$2,duration=$3,completed_at=NOW() WHERE call_id=$4`,
                     [finalStatus, finalDlr, finalDuration, callId]
                 ).catch(()=>{});
@@ -5569,8 +5570,41 @@ async function handleVoiceOtpSend(req, res) {
                 await pool.query(
                     `UPDATE sms_logs SET dlr_status=$1, status=$2, delivery_time=NOW(), dlr_timestamp=NOW()
                      WHERE message_id=$3`,
-                    [finalDlr, finalDlr === 'DELIVRD' ? 'delivered' : 'failed', callId]
+                    [finalDlr, isDelivered ? 'delivered' : 'failed', callId]
                 ).catch(()=>{});
+
+                // ── BILLING: charge client + pay supplier on DELIVRD ──
+                if (isDelivered && client_id && clientRate > 0) {
+                    try {
+                        await applyBilling({
+                            messageId: callId,
+                            clientId: client_id,
+                            supplierId: supplier_id || null,
+                            clientCost: clientRate,
+                            supplierCost: supplierRate || 0,
+                            clientBillingMode: 'dlr',
+                            supplierBillingMode: 'dlr',
+                            isSubmit: false,
+                            dlrStatus: 'DELIVRD'
+                        });
+                        // Update voice_otp_logs with billing info
+                        await pool.query(
+                            `UPDATE voice_otp_logs SET total_cost=$1, client_cost=$2, billing_status='billed'
+                             WHERE call_id=$3`,
+                            [supplierRate || 0, clientRate, callId]
+                        ).catch(()=>{});
+                        // Update sms_logs with rates if they weren't set earlier
+                        await pool.query(
+                            `UPDATE sms_logs SET client_rate=$1, supplier_rate=$2, profit=$3
+                             WHERE message_id=$4 AND client_rate IS NULL`,
+                            [clientRate, supplierRate || 0, profit || 0, callId]
+                        ).catch(()=>{});
+                        console.error(`[voice-otp] 💰 Billed: ${callId} client=€${clientRate} supplier=€${supplierRate||0} profit=€${profit||0}`);
+                    } catch (e) {
+                        console.error(`[voice-otp] ⚠ Billing failed for ${callId}: ${e.message}`);
+                    }
+                }
+
                 // Push DLR to dlr_outbox so SMPP clients (e.g. TriAngle) receive delivery notification
                 if (client_id) {
                     try {
