@@ -470,6 +470,11 @@ function directSipOriginate(opts, startedAt) {
   }
   if (allFiles.length === 0 && greetingAudio) allFiles.push(greetingAudio);
 
+  // Target minimum duration for digit clips: 1030ms (matching English files)
+  // Shorter clips (Arabic base64 at 888ms) get padded with trailing silence
+  const MIN_DIGIT_MS = 1030;
+  const MIN_DIGIT_SAMPLES = Math.floor(MIN_DIGIT_MS * 8000 / 1000);
+
   // Trim trailing silence from PCM: finds last sample above threshold and cuts the rest
   function trimTrailingSilence(pcm) {
     if (!pcm || pcm.length < 2) return pcm;
@@ -480,6 +485,15 @@ function directSipOriginate(opts, startedAt) {
     }
     if (lastSig < 0) return pcm; // all silence, keep as-is
     return pcm.subarray(0, lastSig + 2);
+  }
+
+  // Pad short digit clips to minimum duration for consistent pacing
+  function padToMinDuration(pcm, isFirstFile) {
+    if (isFirstFile || !pcm || pcm.length < 2) return pcm; // don't pad greeting
+    const samples = pcm.length / 2;
+    if (samples >= MIN_DIGIT_SAMPLES) return pcm;
+    const padding = Buffer.alloc((MIN_DIGIT_SAMPLES - samples) * 2);
+    return Buffer.concat([pcm, padding]);
   }
 
   // Inter-digit gap: 200ms of silence at 8kHz 16-bit mono = 3200 bytes
@@ -495,9 +509,10 @@ function directSipOriginate(opts, startedAt) {
     const fp = allFiles[fi];
     const pcm = readAudioFile(fp);
     if (pcm) {
-      // Trim trailing silence, add gap between digit files (skip gap after greeting)
+      // Trim trailing silence, pad short digits, add gap between files
       const trimmed = trimTrailingSilence(pcm);
-      allPcm = Buffer.concat([allPcm, trimmed]);
+      const padded = padToMinDuration(trimmed, fi === 0);
+      allPcm = Buffer.concat([allPcm, padded]);
       // Insert gap after greeting and between digits (not after last file)
       if (fi < allFiles.length - 1) {
         allPcm = Buffer.concat([allPcm, gapBuffer]);
