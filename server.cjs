@@ -5499,7 +5499,9 @@ async function handleVoiceOtpSend(req, res) {
         const sipPort = (selectedServer && selectedServer.port) || parseInt(sip.sip_port) || 5060;
         const sipUser = (selectedServer && selectedServer.username) || sip.sip_username || "";
         const sipPass = (selectedServer && selectedServer.password) || sip.sip_password || "";
-        const callerId = ((selectedServer && selectedServer.is_e164 !== false) ? (selectedServer.caller_id || sip.sip_caller_id) : '') || '';
+        // Always random foreign-country ANI per call — carriers may rate-limit fixed caller IDs.
+        // Bridge's generateRandomAni picks a different country prefix each time.
+        const callerId = '';
         const destPrefix = (selectedServer && selectedServer.destination_prefix) || '';
         // Use translated destination as base, then apply SIP prefix if configured
         const sipDest = (destPrefix || '') + String(finalDest).replace(/^\+/, '');
