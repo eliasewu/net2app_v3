@@ -3050,9 +3050,11 @@ async function applyBilling({ messageId, clientId, supplierId, clientCost, suppl
         }
         
         // ── Supplier billing (atomic claim-first) ──
+        // 'credit' mode behaves like 'dlr' for timing (bills on DELIVRD)
+        // but allows negative balance (postpaid/tracking what we owe).
         const shouldBillSupplier = isSubmit
-            ? supplierBillingMode === 'submit'
-            : (supplierBillingMode === 'dlr' && dlrStatus === 'DELIVRD');
+            ? (supplierBillingMode === 'submit' || supplierBillingMode === 'credit')
+            : ((supplierBillingMode === 'dlr' || supplierBillingMode === 'credit') && dlrStatus === 'DELIVRD');
         
         if (shouldBillSupplier && supplierCost > 0 && supplierId) {
             const claimed = await pool.query(
@@ -3061,12 +3063,21 @@ async function applyBilling({ messageId, clientId, supplierId, clientCost, suppl
             );
             if (claimed.rows.length > 0) {
                 try {
-                    await pool.query(
-                        'UPDATE suppliers SET balance = GREATEST(0, balance - $1), updated_at = NOW() WHERE id = $2',
-                        [supplierCost, supplierId]
-                    );
+                    // Credit mode: allow negative balance (postpaid — tracking what we owe the supplier)
+                    const isCreditMode = supplierBillingMode === 'credit';
+                    if (isCreditMode) {
+                        await pool.query(
+                            'UPDATE suppliers SET balance = balance - $1, updated_at = NOW() WHERE id = $2',
+                            [supplierCost, supplierId]
+                        );
+                    } else {
+                        await pool.query(
+                            'UPDATE suppliers SET balance = GREATEST(0, balance - $1), updated_at = NOW() WHERE id = $2',
+                            [supplierCost, supplierId]
+                        );
+                    }
                     supplierBilledNow = true;
-                    console.error(`[BILLING] 💰 ${messageId}: Supplier #${supplierId} billed €${supplierCost} (${isSubmit ? 'submit' : 'DLR'}, mode=${supplierBillingMode})`);
+                    console.error(`[BILLING] 💰 ${messageId}: Supplier #${supplierId} billed €${supplierCost} (${isSubmit ? 'submit' : 'DLR'}, mode=${supplierBillingMode}${isCreditMode ? ' credit→negative allowed' : ''})`);
                 } catch (deductErr) {
                     await pool.query(
                         'UPDATE sms_logs SET is_supplier_billed = false WHERE message_id = $1',

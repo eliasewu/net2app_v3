@@ -4,7 +4,7 @@ export type UserRole = 'super_admin' | 'admin' | 'support' | 'billing' | 'agent'
 
 export type ConnectionType = 'smpp' | 'http' | 'rcs' | 'flash_sms' | 'ott_whatsapp' | 'ott_telegram' | 'voice_otp' | 'local_bypass';
 
-export type BillingMode = 'submit' | 'dlr';
+export type BillingMode = 'submit' | 'dlr' | 'credit';
 
 export type Currency = 'EUR' | 'USD' | 'GBP';
 
