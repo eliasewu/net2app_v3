@@ -480,6 +480,7 @@ CREATE TABLE voice_otp_configs (
     audio_files JSONB DEFAULT '{}',
     secondary_audio_files JSONB DEFAULT '{}',
     is_active BOOLEAN DEFAULT true,
+    is_dual_language BOOLEAN DEFAULT false,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 

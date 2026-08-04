@@ -4949,8 +4949,9 @@ app.post('/api/voice-otp/configs', auth, async (req, res) => {
               primary_language_code, secondary_language_code,
               primary_greeting_text, primary_retry_text,
               secondary_greeting_text, secondary_retry_text,
-              greeting_text, retry_text, retry_count, play_count, is_active, created_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW()) RETURNING *`,
+              greeting_text, retry_text, retry_count, play_count, is_active,
+              is_dual_language, created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NOW()) RETURNING *`,
             [
                 b.language,
                 b.primary_language_code || b.language_code || 'en',
@@ -4966,6 +4967,7 @@ app.post('/api/voice-otp/configs', auth, async (req, res) => {
                 b.retry_count ?? 4,
                 b.play_count ?? 1,
                 b.is_active !== false,
+                b.is_dual_language === true,
             ]
         );
         res.json({ success: true, data: result.rows[0] });
@@ -4982,7 +4984,7 @@ app.put('/api/voice-otp/configs/:id', auth, async (req, res) => {
             'greeting_text','retry_text','greeting_audio_url','secondary_greeting_audio_url',
             'audio_files','secondary_audio_files','audio_0_9',
             'sip_host','sip_port','sip_username','sip_password','caller_id','is_active','sip_e164','audio_codec',
-            'retry_count','play_count'];
+            'retry_count','play_count','is_dual_language'];
         const setParts = []; const values = []; let idx = 1;
         for (const key of allowed) {
             if (req.body[key] !== undefined) { setParts.push(`${key} = $${idx++}`); values.push(req.body[key]); }
@@ -5267,22 +5269,35 @@ async function handleVoiceOtpSend(req, res) {
         const { destination, otp_code, config_id, client_id, supplier_id } = req.body;
         if (!destination) return res.status(400).json({ error: 'destination is required' });
 
-        // 1. Look up language config by country prefix or MCC
+        // 1. Look up language config: explicit config_id > supplier's voice_otp_config_id > country prefix > first active
         let config = null;
+        let supplierRow = null;
+        if (supplier_id) {
+            try {
+                const sr = await pool.query('SELECT * FROM suppliers WHERE id = $1', [supplier_id]);
+                if (sr.rows.length) supplierRow = sr.rows[0];
+            } catch (e) { /* non-critical */ }
+        }
         if (config_id) {
             const cr = await pool.query('SELECT * FROM voice_otp_configs WHERE id = $1', [config_id]);
             if (cr.rows.length) config = cr.rows[0];
         }
+        if (!config && supplierRow && supplierRow.voice_otp_config_id) {
+            const cr = await pool.query('SELECT * FROM voice_otp_configs WHERE id = $1 AND is_active = true', [supplierRow.voice_otp_config_id]);
+            if (cr.rows.length) config = cr.rows[0];
+        }
         if (!config) {
-            for (let len = 4; len >= 1; len--) {
-                const prefix = String(destination).substring(0, len);
-                const cr = await pool.query(
-                    `SELECT * FROM voice_otp_configs
-                     WHERE (',' || replace(replace(country_prefix, ' ', ''), '+', '') || ',') LIKE '%,' || $1 || ',%'
-                     AND is_active = true ORDER BY id LIMIT 1`,
-                    [prefix]
-                );
-                if (cr.rows.length) { config = cr.rows[0]; break; }
+            // Prefix match via the SHARED engine helper (comma-aware, longest match,
+            // local-first) — keeps the manual path identical to the queue path.
+            // The destination's leading '+' is stripped so '+880...' matches '880'.
+            try {
+                const voiceEngine = require('./src/services/voiceOtpEngine.cjs');
+                if (voiceEngine && typeof voiceEngine.resolveVoiceOtpConfigByPrefix === 'function') {
+                    const cleanedDest = String(destination).replace(/^\+/, '');
+                    config = await voiceEngine.resolveVoiceOtpConfigByPrefix(pool, cleanedDest);
+                }
+            } catch (e) {
+                console.error('[voice-otp] resolveVoiceOtpConfigByPrefix error:', e.message);
             }
         }
         if (!config) {
@@ -5290,6 +5305,30 @@ async function handleVoiceOtpSend(req, res) {
             if (cr.rows.length) config = cr.rows[0];
         }
         if (!config) return res.status(400).json({ error: 'No active voice OTP config found' });
+
+        // 1b. Apply supplier voice_otp_mode overrides (local_1x / local_2x / local_international).
+        // Uses the SAME shared helper as executeVoiceOtpPipeline so manual test calls
+        // behave exactly like queue-routed calls:
+        //   local_1x            → greeting + digits played ONCE (local language)
+        //   local_2x            → greeting + digits played TWICE (local language)
+        //   local_international → local greeting+digits, then English greeting+digits
+        let englishConfig = null;
+        // applyVoiceOtpModeOverrides no-ops for null supplier mode + unflagged configs,
+        // and resolves the English config for dual-language playback (config flag or
+        // supplier local_international mode) — so picking 'Local + International' on
+        // the send form plays local + English even without a supplier mode.
+        if (config) {
+            try {
+                const voiceEngine = require('./src/services/voiceOtpEngine.cjs');
+                if (voiceEngine && typeof voiceEngine.applyVoiceOtpModeOverrides === 'function') {
+                    const modeResult = await voiceEngine.applyVoiceOtpModeOverrides(pool, config, supplierRow);
+                    config = modeResult.config;
+                    englishConfig = modeResult.englishConfig || null;
+                }
+            } catch (e) {
+                console.error('[voice-otp] applyVoiceOtpModeOverrides error:', e.message);
+            }
+        }
 
         // 1.5 Apply translations (OTP extract, number prefix, SID alias, content replace)
         // Voice OTP calls should respect the same translation rules as SMS.
@@ -5467,10 +5506,57 @@ async function handleVoiceOtpSend(req, res) {
         if (destPrefix) console.error(`[voice-otp] Prepending prefix ${destPrefix} → ${sipDest}`);
 
         // 5. Originate SIP call via Asterisk bridge
+        // 5a. Overlap protection — never place two calls to the same destination.
+        // The engine lock is held until the call completes (released in the
+        // .then/.catch handlers below), matching the queue path's no-overlap rule.
+        const lockDest = finalDest || destination;
+        let preRegisteredCall = null;
+        let voiceOtpLockModule = null;
+        try {
+            voiceOtpLockModule = require('./src/services/voiceOtpEngine.cjs');
+            if (voiceOtpLockModule && typeof voiceOtpLockModule.tryRegisterActiveCall === 'function') {
+                preRegisteredCall = voiceOtpLockModule.tryRegisterActiveCall(lockDest);
+                if (!preRegisteredCall) {
+                    console.error(`[voice-otp] 🚫 BLOCKED overlapping call to ${lockDest} (another Voice OTP call is active)`);
+                    // Mark the just-created log rows as rejected so they don't stay 'initiated' forever
+                    pool.query(`UPDATE voice_otp_logs SET status='failed',dlr_status='REJECTED',error_message='Overlapping call — another Voice OTP call is active for this destination',completed_at=NOW() WHERE call_id=$1`, [callId]).catch(()=>{});
+                    pool.query(`UPDATE sms_logs SET dlr_status='REJECTED', status='failed', error='destination_busy_overlapping_call' WHERE message_id=$1`, [callId]).catch(()=>{});
+                    return res.status(409).json({ error: 'destination_busy_overlapping_call', message: 'Destination already has an active Voice OTP call — retry after it finishes.' });
+                }
+            }
+        } catch (e) { /* lock is best-effort */ }
+        const releaseLock = () => {
+            try {
+                if (preRegisteredCall && voiceOtpLockModule && typeof voiceOtpLockModule.releaseActiveCall === 'function') {
+                    voiceOtpLockModule.releaseActiveCall(lockDest);
+                    preRegisteredCall = null;
+                }
+            } catch (e) { /* best-effort */ }
+        };
         try {
             const ac = require('./asterisk-bridge.cjs');
-            const callOpts = { callId, destination: sipDest, sipHost, sipPort, sipUsername: sipUser, sipPassword: sipPass, callerId: callerId || callerIdPool.pickCallerId(sipDest) || '', greetingAudio: config.greeting_audio_url || null, digitAudio: config.audio_0_9 || null, otpCode: finalOtp, timeout: (req.body.timeout || 30) * 1000 };
+            // Build the COMPLETE audio sequence (greeting + OTP digit clips) from the
+            // config's audio_0_9_primary / audio_0_9_secondary / audio_0_9 maps.
+            // The bridge needs the flat `audioFiles` array — passing only `digitAudio`
+            // (legacy audio_0_9 column, empty on modern configs) made calls play just
+            // the ~1s greeting, then BYE → "call drops after 1-2s".
+            let audioSeq = null;
+            try {
+                const voiceEngine = require('./src/services/voiceOtpEngine.cjs');
+                if (voiceEngine && typeof voiceEngine.buildAudioSequence === 'function') {
+                    audioSeq = voiceEngine.buildAudioSequence(config, finalOtp, config.play_count || 1, false, englishConfig);
+                }
+            } catch (e) {
+                // Do NOT silently fall back to the old greeting-only path — that would
+                // reproduce the 1-second-call bug. Fail the request so it's visible.
+                console.error('[voice-otp] buildAudioSequence error:', e.message);
+                releaseLock();
+                return res.status(500).json({ error: 'Failed to build voice OTP audio sequence: ' + e.message });
+            }
+            const audioFilesList = (audioSeq && Array.isArray(audioSeq.audio) && audioSeq.audio.length > 0) ? audioSeq.audio : null;
+            const callOpts = { callId, destination: sipDest, sipHost, sipPort, sipUsername: sipUser, sipPassword: sipPass, callerId: callerId || callerIdPool.pickCallerId(sipDest) || '', greetingAudio: config.greeting_audio_url || null, digitAudio: config.audio_0_9 || null, audioFiles: audioFilesList || undefined, otpCode: finalOtp, playCount: (audioSeq && audioSeq.repeat) || config.play_count || 1, timeout: (req.body.timeout || 30) * 1000 };
             ac.originateCall(callOpts).then(async (callResult) => {
+                releaseLock();
                 const finalStatus = callResult.status || 'unknown';
                 const finalDlr = callResult.dlr || 'UNKNOWN';
                 const finalDuration = callResult.duration || 0;
@@ -5502,6 +5588,7 @@ async function handleVoiceOtpSend(req, res) {
                     }
                 }
             }).catch(async () => {
+                releaseLock();
                 await pool.query(`UPDATE voice_otp_logs SET status='failed',dlr_status='FAILED',completed_at=NOW() WHERE call_id=$1`, [callId]);
                 // Also update sms_logs on bridge error
                 await pool.query(
@@ -5523,6 +5610,7 @@ async function handleVoiceOtpSend(req, res) {
                 }
             });
         } catch (bridgeErr) {
+            releaseLock();
             console.warn('[voice-otp] Asterisk bridge error:', bridgeErr.message);
             // Bridge error = call FAILED. Do NOT fake DELIVRD — that triggers false DLR billing.
             setTimeout(async () => { await pool.query(`UPDATE voice_otp_logs SET status='failed',dlr_status='FAILED',error_message=$2,completed_at=NOW() WHERE call_id=$1`, [callId, bridgeErr.message]); }, 2000);
@@ -5567,15 +5655,15 @@ app.post('/api/voice-otp/test', auth, async (req, res) => {
 app.post('/api/voice-otp/logs', auth, async (req, res) => {
     try {
         const f = req.body || {};
-        let q = 'SELECT * FROM voice_otp_logs WHERE 1=1';
+        let q = 'SELECT vl.*, s.supplier_code, s.company_name AS supplier_name FROM voice_otp_logs vl LEFT JOIN suppliers s ON s.id = vl.supplier_id WHERE 1=1';
         const p = []; let i = 1;
-        if (f.status)    { q += ` AND status = $${i++}`; p.push(f.status); }
-        if (f.dlr_status){ q += ` AND dlr_status = $${i++}`; p.push(f.dlr_status); }
-        if (f.destination){ q += ` AND destination ILIKE $${i++}`; p.push(`%${f.destination}%`); }
-        if (f.client_id) { q += ` AND client_id = $${i++}`; p.push(f.client_id); }
-        if (f.start_date){ q += ` AND created_at >= $${i++}`; p.push(f.start_date); }
-        if (f.end_date)  { q += ` AND created_at <= $${i++}`; p.push(f.end_date); }
-        q += ' ORDER BY created_at DESC LIMIT 500';
+        if (f.status)    { q += ` AND vl.status = $${i++}`; p.push(f.status); }
+        if (f.dlr_status){ q += ` AND vl.dlr_status = $${i++}`; p.push(f.dlr_status); }
+        if (f.destination){ q += ` AND vl.destination ILIKE $${i++}`; p.push(`%${f.destination}%`); }
+        if (f.client_id) { q += ` AND vl.client_id = $${i++}`; p.push(f.client_id); }
+        if (f.start_date){ q += ` AND vl.created_at >= $${i++}`; p.push(f.start_date); }
+        if (f.end_date)  { q += ` AND vl.created_at <= $${i++}`; p.push(f.end_date); }
+        q += ' ORDER BY vl.created_at DESC LIMIT 500';
         const result = await pool.query(q, p);
         res.json({ success: true, data: result.rows });
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -5583,7 +5671,9 @@ app.post('/api/voice-otp/logs', auth, async (req, res) => {
 
 app.get('/api/voice-otp/logs', auth, async (req, res) => {
     try {
-        const result = await pool.query('SELECT * FROM voice_otp_logs ORDER BY created_at DESC LIMIT 500');
+        const result = await pool.query(
+            'SELECT vl.*, s.supplier_code, s.company_name AS supplier_name FROM voice_otp_logs vl LEFT JOIN suppliers s ON s.id = vl.supplier_id ORDER BY vl.created_at DESC LIMIT 500'
+        );
         res.json({ success: true, data: result.rows });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -5601,11 +5691,34 @@ app.post('/api/voice-otp/retry/:callId', auth, async (req, res) => {
         await pool.query(
             `UPDATE voice_otp_logs SET retry_count = retry_count + 1, status = 'initiated', next_retry_at = NULL
              WHERE call_id = $1`, [callId]
-        );
+        ).catch(() => {});
+        // Re-send with the SAME destination/OTP from the original call log.
+        // (Previously the body was forwarded empty → /send rejected with 400,
+        //  so the retry button never actually retried.)
+        req.body = {
+            ...(req.body || {}),
+            destination: req.body?.destination || log.destination,
+            otp_code: req.body?.otp_code || log.otp_code || undefined,
+            client_id: req.body?.client_id || log.client_id || undefined,
+            supplier_id: req.body?.supplier_id || log.supplier_id || undefined,
+        };
         // Forward to send logic
         try {
-            return app._router.stack.find(l => l.route?.path === '/api/voice-otp/send' && l.route?.methods?.post)?.handle?.(req, res)
-                || res.status(500).json({ error: 'Send endpoint not available' });
+            const sendHandler = app._router.stack.find(l => l.route?.path === '/api/voice-otp/send' && l.route?.methods?.post)?.handle;
+            if (!sendHandler) return res.status(500).json({ error: 'Send endpoint not available' });
+            // If the re-send is blocked (overlapping call → 409), don't burn a retry.
+            const origJson = res.json.bind(res);
+            res.json = (payload) => {
+                if (payload && payload.error === 'destination_busy_overlapping_call') {
+                    pool.query(
+                        `UPDATE voice_otp_logs SET retry_count = GREATEST(retry_count - 1, 0), status = 'failed', dlr_status = 'REJECTED',
+                         error_message = 'Overlapping call — another Voice OTP call is active', completed_at = NOW() WHERE call_id = $1`,
+                        [callId]
+                    ).catch(() => {});
+                }
+                return origJson(payload);
+            };
+            return sendHandler(req, res);
         } catch (e) { res.status(500).json({ error: e.message }); }
     } catch (e) { res.status(500).json({ error: e.message }); }
 });

@@ -489,6 +489,7 @@ export interface VoiceOTPConfig {
   secondary_audio_files: any;
   retry_count?: number;
   play_count?: number;
+  is_dual_language?: boolean;
   is_active: boolean;
   created_at: string;
 }

@@ -22,7 +22,9 @@ const statusBadge = (s: string, dlr?: string | null) => {
 const emptyForm = {
   language: '', language_code: 'en', country_prefix: '',
   is_active: true,
+  is_dual_language: false,
   primary_language_code: 'en',
+  secondary_language_code: 'en',
   retry_count: 4, play_count: 1,
 };
 
@@ -69,7 +71,9 @@ export const VoiceOTP: React.FC = () => {
       language: s.language || '', language_code: s.language_code || 'en',
       country_prefix: s.country_prefix || '',
       is_active: s.is_active !== false,
+      is_dual_language: s.is_dual_language === true,
       primary_language_code: s.primary_language_code || 'en',
+      secondary_language_code: s.secondary_language_code || 'en',
       retry_count: s.retry_count || 4,
       play_count: s.play_count || 1,
     });
@@ -117,14 +121,21 @@ export const VoiceOTP: React.FC = () => {
     return typeof raw === 'string' ? JSON.parse(raw) : raw;
   };
 
-  // audio map: MERGE legacy + primary uploads (single language per config)
-  // Uploaded data URLs take priority over legacy disk paths for the same digit
+  // Layer toggle: Primary (local language) vs Secondary (international/English)
+  const [audioLayer, setAudioLayer] = useState<'primary' | 'secondary'>('primary');
+
+  // audio map per selected layer:
+  //  - primary   → legacy + audio_0_9_primary (uploaded data URLs take priority)
+  //  - secondary → audio_0_9_secondary only (English clips of a dual config)
   const audioMap = useMemo(() => {
     if (!uploadTarget) return {};
+    if (audioLayer === 'secondary') {
+      return parseAudioJson((uploadTarget as any).audio_0_9_secondary);
+    }
     const legacy = parseAudioJson(uploadTarget.audio_0_9);
     const primary = parseAudioJson((uploadTarget as any).audio_0_9_primary);
     return { ...legacy, ...primary };
-  }, [uploadTarget?.id, uploadTarget?.audio_0_9, (uploadTarget as any)?.audio_0_9_primary]);
+  }, [uploadTarget?.id, audioLayer, uploadTarget?.audio_0_9, (uploadTarget as any)?.audio_0_9_primary, (uploadTarget as any)?.audio_0_9_secondary]);
 
   const hasDigitAudio = (digit: string) => !!(audioMap && audioMap[digit]);
   const getDigitAudioUrl = (digit: string): string | null => (audioMap && audioMap[digit]) || null;
@@ -152,7 +163,7 @@ export const VoiceOTP: React.FC = () => {
     fd.append('audio', file);
     fd.append('field', 'digit');
     fd.append('digit', digit);
-    fd.append('layer', 'primary');
+    fd.append('layer', audioLayer);
     const res: any = await voiceOtpApi.uploadAudio(String(uploadTarget.id), fd);
     if (!res.success) throw new Error(res.error || 'Upload failed');
     await loadConfigs();
@@ -186,7 +197,7 @@ export const VoiceOTP: React.FC = () => {
       try {
         const fd = new FormData();
         fd.append('audio', file);
-        fd.append('field', 'greeting_audio_url');
+        fd.append('field', audioLayer === 'secondary' ? 'secondary_greeting_audio_url' : 'greeting_audio_url');
         const res: any = await voiceOtpApi.uploadAudio(String(uploadTarget.id), fd);
         if (!res.success) throw new Error(res.error || 'Upload failed');
         await loadConfigs();
@@ -479,7 +490,7 @@ export const VoiceOTP: React.FC = () => {
   // ──────────── table columns ────────────
 
   const langColumns = [
-    { key: 'language', header: 'Language / Group', render: (s: any) => <div><p className="font-medium text-sm">{s.language || 'Unnamed'}</p><p className="text-[10px] text-gray-500">{s.country_prefix ? '+' + s.country_prefix.replace(/,/g, ', +') : 'Any'} · {s.primary_language_code || 'en'}</p></div> },
+    { key: 'language', header: 'Language / Group', render: (s: any) => <div><p className="font-medium text-sm">{s.language || 'Unnamed'}{s.is_dual_language && <span className="ml-2"><Badge variant="info" size="sm">+Intl</Badge></span>}</p><p className="text-[10px] text-gray-500">{s.country_prefix ? '+' + s.country_prefix.replace(/,/g, ', +') : 'Any'} · {s.primary_language_code || 'en'}{s.secondary_language_code && s.secondary_language_code !== (s.primary_language_code || 'en') ? ' → ' + s.secondary_language_code : ''}</p></div> },
     { key: 'playback', header: 'Playback', render: (s: any) => <div className="text-xs"><span className="font-medium">{s.play_count || 1}x Play</span><span className="text-gray-400"> · </span><span>Rtry: {s.retry_count || 4}</span></div> },
     { key: 'status', header: 'Status', render: (s: any) => <Badge variant={s.is_active ? 'success' : 'danger'} dot size="sm">{s.is_active ? 'Active' : 'Inactive'}</Badge> },
     { key: 'actions', header: 'Actions', render: (s: any) => <div className="flex gap-0.5">
@@ -493,6 +504,7 @@ export const VoiceOTP: React.FC = () => {
     { key: 'call_id', header: 'Call ID', render: (l: any) => <span className="font-mono text-xs">{l.call_id?.slice(-12) || '-'}</span> },
     { key: 'destination', header: 'Destination', render: (l: any) => <span className="text-sm">{l.destination || '-'}</span> },
     { key: 'otp', header: 'OTP', render: (l: any) => <span className="font-mono text-sm font-semibold">{l.otp_code || '-'}</span> },
+    { key: 'supplier', header: 'Supplier', render: (l: any) => <span className="text-xs">{l.supplier_code || l.supplier_name || (l.supplier_id ? '#'+l.supplier_id : '—')}</span> },
     { key: 'language', header: 'Lang', render: (l: any) => <span className="text-xs">{l.language || '-'}</span> },
     { key: 'duration', header: 'Dur', render: (l: any) => <span className="text-xs">{l.duration || 0}s</span> },
     { key: 'status', header: 'Status', render: (l: any) => statusBadge(l.status, l.dlr_status) },
@@ -583,6 +595,15 @@ export const VoiceOTP: React.FC = () => {
               <span className="text-xs text-gray-400">+{configs.filter(c => c.is_active).length - 8} more</span>
             )}
           </div>
+
+          {/* Primary / Secondary (international) audio layer toggle */}
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-medium text-gray-500 uppercase tracking-wider">Layer:</span>
+            <div className="flex rounded-lg border overflow-hidden shadow-sm">
+              <button onClick={() => setAudioLayer('primary')} className={'px-3 py-1.5 text-xs font-medium transition-all ' + (audioLayer === 'primary' ? 'bg-purple-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50')}>Primary (Local)</button>
+              <button onClick={() => setAudioLayer('secondary')} className={'px-3 py-1.5 text-xs font-medium transition-all ' + (audioLayer === 'secondary' ? 'bg-blue-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50')}>Secondary (International)</button>
+            </div>
+          </div>
           {uploading && <span className="text-sm text-blue-600 animate-pulse flex items-center gap-1"><span className="w-4 h-4 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" /> Uploading...</span>}
         </div>
 
@@ -591,19 +612,19 @@ export const VoiceOTP: React.FC = () => {
         )}
 
         {uploadTarget && <>
-          {/* Greeting card — single language */}
+          {/* Greeting card — primary or secondary (dual config) */}
           <div className="max-w-md">
             <Card>
               <div className="flex items-center justify-between mb-3">
                 <div className="flex items-center gap-2">
-                  <Badge variant="info" size="sm">Greeting</Badge>
-                  <span className="text-xs text-gray-400">{uploadTarget.primary_language_code || 'en'}</span>
+                  <Badge variant="info" size="sm">{audioLayer === 'secondary' ? 'Secondary Greeting' : 'Greeting'}</Badge>
+                  <span className="text-xs text-gray-400">{audioLayer === 'secondary' ? (uploadTarget.secondary_language_code || 'en') : (uploadTarget.primary_language_code || 'en')}</span>
                 </div>
-                {uploadTarget.greeting_audio_url ? <Badge variant="success" size="sm" dot>✓ Uploaded</Badge> : <Badge variant="info" size="sm">No file</Badge>}
+                {(audioLayer === 'secondary' ? (uploadTarget as any).secondary_greeting_audio_url : uploadTarget.greeting_audio_url) ? <Badge variant="success" size="sm" dot>✓ Uploaded</Badge> : <Badge variant="info" size="sm">No file</Badge>}
               </div>
               <div className="flex gap-2">
                 <Button variant="secondary" size="sm" icon={<Upload size={14} />} onClick={handleGreetingUpload}>Upload</Button>
-                {uploadTarget.greeting_audio_url && <Button variant={playingKey === 'greeting' ? 'danger' : 'primary'} size="sm" icon={playingKey === 'greeting' ? <Pause size={14} /> : <Play size={14} />} onClick={() => playAudio(uploadTarget.greeting_audio_url!, 'greeting')}>{playingKey === 'greeting' ? 'Stop' : 'Play'}</Button>}
+                {(audioLayer === 'secondary' ? (uploadTarget as any).secondary_greeting_audio_url : uploadTarget.greeting_audio_url) && <Button variant={playingKey === 'greeting' ? 'danger' : 'primary'} size="sm" icon={playingKey === 'greeting' ? <Pause size={14} /> : <Play size={14} />} onClick={() => playAudio((audioLayer === 'secondary' ? (uploadTarget as any).secondary_greeting_audio_url : uploadTarget.greeting_audio_url)!, 'greeting')}>{playingKey === 'greeting' ? 'Stop' : 'Play'}</Button>}
               </div>
             </Card>
           </div>
@@ -613,7 +634,8 @@ export const VoiceOTP: React.FC = () => {
             <div className="flex items-center justify-between mb-4">
               <div className="flex items-center gap-2">
                 <h3 className="font-semibold text-gray-700">Digit Audio (0–9)</h3>
-                <Badge variant="info" size="sm">{digitCount}/10 uploaded</Badge>
+                <Badge variant={audioLayer === 'secondary' ? 'info' : 'purple'} size="sm">{audioLayer === 'secondary' ? 'Secondary · ' + (uploadTarget.secondary_language_code || 'en') : 'Primary · ' + (uploadTarget.primary_language_code || 'en')}</Badge>
+                <Badge variant="success" size="sm">{digitCount}/10 uploaded</Badge>
               </div>
               {digitCount > 0 && (
                 <div className="flex gap-2">
@@ -962,6 +984,7 @@ export const VoiceOTP: React.FC = () => {
             <Input label="Language / Group Name *" value={form.language} onChange={e => setForm(p => ({ ...p, language: e.target.value }))} required />
             <Input label="Country Prefix(es)" value={form.country_prefix} onChange={e => setForm(p => ({ ...p, country_prefix: e.target.value }))} placeholder="93,91,880" />
             <Input label="Language Code" value={form.primary_language_code} onChange={e => setForm(p => ({ ...p, primary_language_code: e.target.value }))} placeholder="bn" />
+            <Input label="Secondary Language Code" value={form.secondary_language_code} onChange={e => setForm(p => ({ ...p, secondary_language_code: e.target.value }))} placeholder="en-US (for local+english dual playback)" />
             <div><label className="text-xs font-medium text-gray-500">Retry Count</label>
               <select value={form.retry_count} onChange={e => setForm(p => ({ ...p, retry_count: parseInt(e.target.value) }))} className="mt-1 block w-full rounded-lg border-gray-300 text-sm py-2 px-3 bg-white">
                 {[1,2,3,4].map(n => <option key={n} value={n}>{n}</option>)}
@@ -971,7 +994,10 @@ export const VoiceOTP: React.FC = () => {
                 {[1,2,3].map(n => <option key={n} value={n}>{n}</option>)}
               </select></div>
           </div>
-          <label className="flex items-center gap-2"><input type="checkbox" checked={form.is_active} onChange={e => setForm(p => ({ ...p, is_active: e.target.checked }))} className="w-4 h-4 rounded" /><span className="text-sm">Active</span></label>
+          <div className="flex flex-wrap gap-6">
+            <label className="flex items-center gap-2"><input type="checkbox" checked={form.is_active} onChange={e => setForm(p => ({ ...p, is_active: e.target.checked }))} className="w-4 h-4 rounded" /><span className="text-sm">Active</span></label>
+            <label className="flex items-center gap-2" title="Plays the local greeting+digits, then the English greeting+digits in one call"><input type="checkbox" checked={form.is_dual_language} onChange={e => setForm(p => ({ ...p, is_dual_language: e.target.checked }))} className="w-4 h-4 rounded" /><span className="text-sm">Dual Language (local + international)</span></label>
+          </div>
         </div>
       </Modal>
     </div>

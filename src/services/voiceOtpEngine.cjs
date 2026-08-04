@@ -324,18 +324,50 @@ function resolveCountryLanguage(destination) {
  * @param {string} defaultLanguageCode - fallback language
  * @returns {Promise<object>} voice_otp_config row
  */
+/**
+ * Find the best voice_otp_config for a destination by country prefix.
+ * Shared by the queue engine and the manual /api/voice-otp/send path.
+ *
+ * country_prefix may be a comma-separated list (e.g. '+44,+1,+91,...'). It is
+ * split into entries and the LONGEST entry that prefixes the destination wins;
+ * on equal-length ties, non-English configs are preferred, then lowest id.
+ * This keeps a country-specific local config (e.g. India +91) from being
+ * beaten by a generic English config that lists the same prefix.
+ *
+ * @param {object} pool - PostgreSQL pool
+ * @param {string} cleanedDest - destination with leading '+' removed
+ * @returns {Promise<object|null>} best-matching voice_otp_config row
+ */
+async function resolveVoiceOtpConfigByPrefix(pool, cleanedDest) {
+    const result = await pool.query(
+        `SELECT *, (
+            SELECT MAX(LENGTH(e)) FROM unnest(string_to_array(replace(replace(country_prefix,' ',''),'+',''), ',')) e
+            WHERE e != '' AND $1 LIKE e || '%'
+         ) AS matched_len
+         FROM voice_otp_configs 
+         WHERE is_active = true AND country_prefix != ''
+           AND EXISTS (
+             SELECT 1 FROM unnest(string_to_array(replace(replace(country_prefix,' ',''),'+',''), ',')) e
+             WHERE e != '' AND $1 LIKE e || '%'
+           )
+         ORDER BY matched_len DESC,
+                  CASE WHEN primary_language_code LIKE 'en%' THEN 1 ELSE 0 END ASC,
+                  id ASC
+         LIMIT 1`,
+        [cleanedDest]
+    );
+    const row = result.rows[0] || null;
+    if (row) delete row.matched_len;
+    return row;
+}
+
 async function resolveVoiceOtpConfig(pool, destination, defaultLanguageCode) {
     const cleaned = destination.replace(/^\+/, '');
     
-    // 1. Try exact country prefix match
-    let result = await pool.query(
-        `SELECT * FROM voice_otp_configs 
-         WHERE is_active = true AND country_prefix != '' AND $1 LIKE country_prefix || '%'
-         ORDER BY LENGTH(country_prefix) DESC LIMIT 1`,
-        [cleaned]
-    );
+    // 1. Try exact country prefix match (comma-aware, longest-match, local-first)
+    let result = await resolveVoiceOtpConfigByPrefix(pool, cleaned);
     
-    if (result.rows.length > 0) return result.rows[0];
+    if (result) return result;
     
     // 2. Try language code match
     result = await pool.query(
@@ -379,43 +411,32 @@ async function resolveVoiceOtpConfig(pool, destination, defaultLanguageCode) {
  * @param {object} [secondaryConfig] - optional secondary language config (e.g. English config for local_international mode)
  * @returns {{ audio: string[], repeat: number, language: string, usedSecondary: boolean }}
  */
-function buildAudioSequence(config, otpCode, playCount, useSecondaryLanguage, secondaryConfig) {
-    const digits = otpCode.split('');
+// Helper: build audio array for a single language config (reused for dual-lang)
+// digitLayer selects which digit clips this half plays:
+//   'primary'   → legacy + audio_0_9_primary (uploaded data URLs take priority)
+//   'secondary' → audio_0_9_secondary ONLY — the other language's clips must NOT
+//                 leak into the local half of a dual-language config.
+function buildSingleLangAudio(cfg, otpCode, lang, audioDir, digitLayer = 'primary') {
     const audio = [];
-    const audioDir = path.join(__dirname, '..', '..', 'data', 'uploads', 'audio');
-    
-    const primaryLang = config.primary_language_code || config.language_code || 'en-US';
-    const secondaryLang = (secondaryConfig && secondaryConfig.primary_language_code) || config.secondary_language_code || primaryLang;
-    // Check if secondary has actual audio uploaded (on the secondaryConfig or on the primary config)
-    const secCfg = secondaryConfig || config;
-    const hasSecondaryAudio = !!(secCfg.greeting_audio_url || 
-        (secCfg.audio_0_9_primary && Object.keys(typeof secCfg.audio_0_9_primary === 'string' ? JSON.parse(secCfg.audio_0_9_primary) : (secCfg.audio_0_9_primary || {})).length > 0) ||
-        (secCfg.audio_0_9 && Object.keys(typeof secCfg.audio_0_9 === 'string' ? JSON.parse(secCfg.audio_0_9) : (secCfg.audio_0_9 || {})).length > 0));
-    
-    // Determine which language/config to use
-    const useSecondary = useSecondaryLanguage && (secondaryLang !== primaryLang || hasSecondaryAudio);
-    const lang = useSecondary ? secondaryLang : primaryLang;
-    const effectiveConfig = useSecondary ? secCfg : config;
-    
-    // Greeting — pick from effective config (secondaryConfig if available and active, else primary config)
-    const greeting = effectiveConfig.greeting_audio_url || path.join(audioDir, lang, 'greeting.wav');
+    const digits = otpCode.split('');
+
+    // Greeting
+    const greeting = cfg.greeting_audio_url || path.join(audioDir, lang, 'greeting.wav');
     audio.push(greeting);
-    
-    // Helper: parse JSONB safely
+
+    // Parse JSONB safely
     const parseJson = (raw) => {
         if (!raw) return {};
-        return typeof raw === 'string' ? JSON.parse(raw) : raw;
+        try { return typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { return {}; }
     };
-    
-    // Digits 0-9 — use effective config's audio
-    // Merge: legacy audio_0_9 < audio_0_9_primary (uploaded data URLs take priority)
-    const legacyMap = parseJson(effectiveConfig.audio_0_9);
-    const primaryUploadMap = parseJson(effectiveConfig.audio_0_9_primary);
-    const secondaryUploadMap = parseJson(effectiveConfig.audio_0_9_secondary);
-    
-    // Build effective map: legacy < primary-upload < secondary-upload
-    const effectiveDigitMap = { ...legacyMap, ...primaryUploadMap, ...secondaryUploadMap };
-    
+
+    const legacyMap = parseJson(cfg.audio_0_9);
+    const primaryUploadMap = parseJson(cfg.audio_0_9_primary);
+    const secondaryUploadMap = parseJson(cfg.audio_0_9_secondary);
+    const effectiveDigitMap = digitLayer === 'secondary'
+        ? secondaryUploadMap
+        : { ...legacyMap, ...primaryUploadMap };
+
     for (const digit of digits) {
         if (effectiveDigitMap[digit]) {
             audio.push(effectiveDigitMap[digit]);
@@ -423,13 +444,66 @@ function buildAudioSequence(config, otpCode, playCount, useSecondaryLanguage, se
             audio.push(path.join(audioDir, lang, `${digit}.wav`));
         }
     }
-    
-    // Retry text — from effective config
-    const retryText = effectiveConfig.primary_retry_text || effectiveConfig.retry_text || '';
-    if (retryText) {
-        audio.push(greeting);
+
+    return audio;
+}
+
+function buildAudioSequence(config, otpCode, playCount, useSecondaryLanguage, secondaryConfig) {
+    const audioDir = path.join(__dirname, '..', '..', 'data', 'uploads', 'audio');
+
+    const primaryLang = config.primary_language_code || config.language_code || 'en-US';
+    const secondaryLang = (secondaryConfig && secondaryConfig.primary_language_code) || config.secondary_language_code || primaryLang;
+    const secCfg = secondaryConfig || config;
+    let hasSecondaryAudio = false;
+    try {
+        hasSecondaryAudio = !!(secCfg.greeting_audio_url || 
+            (secCfg.audio_0_9_primary && Object.keys(typeof secCfg.audio_0_9_primary === 'string' ? JSON.parse(secCfg.audio_0_9_primary) : (secCfg.audio_0_9_primary || {})).length > 0) ||
+            (secCfg.audio_0_9 && Object.keys(typeof secCfg.audio_0_9 === 'string' ? JSON.parse(secCfg.audio_0_9) : (secCfg.audio_0_9 || {})).length > 0));
+    } catch { hasSecondaryAudio = false; }
+
+    // ── Dual-language mode (local_international) ──
+    // When secondaryConfig is provided and this is NOT a retry fallback,
+    // concatenate both languages in ONE call: primary greeting+digits + secondary greeting+digits
+    const isDualLang = secondaryConfig && !useSecondaryLanguage && secondaryLang !== primaryLang;
+
+    if (isDualLang) {
+        // English half digit layer: use the config's own audio_0_9_secondary when it
+        // has one; otherwise the global English config's own maps (legacy/primary).
+        const secDigitsRaw = secondaryConfig && secondaryConfig.audio_0_9_secondary;
+        let secDigitsObj = {};
+        try { secDigitsObj = typeof secDigitsRaw === 'string' ? JSON.parse(secDigitsRaw) : (secDigitsRaw || {}); } catch { secDigitsObj = {}; }
+        const secDigitLayer = Object.keys(secDigitsObj).length > 0 ? 'secondary' : 'primary';
+
+        const primaryAudio = buildSingleLangAudio(config, otpCode, primaryLang, audioDir, 'primary');
+        const secondaryAudio = buildSingleLangAudio(secondaryConfig, otpCode, secondaryLang, audioDir, secDigitLayer);
+        console.log('[VoiceOTP] Dual-language audio: %s (%d files) + %s (%d files)',
+            primaryLang, primaryAudio.length, secondaryLang, secondaryAudio.length);
+        return {
+            audio: [...primaryAudio, ...secondaryAudio],
+            repeat: playCount || 1,
+            language: `${primaryLang}+${secondaryLang}`,
+            usedSecondary: false,
+        };
     }
-    
+
+    // ── Single-language mode ──
+    const useSecondary = useSecondaryLanguage && (secondaryLang !== primaryLang || hasSecondaryAudio);
+    const lang = useSecondary ? secondaryLang : primaryLang;
+    const effectiveConfig = useSecondary ? secCfg : config;
+
+    // Retry-language fallback: use the secondary digit clips ONLY when the config
+    // actually has them; otherwise fall back to the primary clips (previous
+    // behavior) instead of playing silence on retries (e.g. India hi→en retry).
+    let singleDigitLayer = 'primary';
+    if (useSecondary) {
+        try {
+            const sRaw = effectiveConfig.audio_0_9_secondary;
+            const sObj = typeof sRaw === 'string' ? JSON.parse(sRaw) : (sRaw || {});
+            singleDigitLayer = Object.keys(sObj).length > 0 ? 'secondary' : 'primary';
+        } catch { singleDigitLayer = 'primary'; }
+    }
+    const audio = buildSingleLangAudio(effectiveConfig, otpCode, lang, audioDir, singleDigitLayer);
+
     return {
         audio,
         repeat: playCount || 1,
@@ -586,6 +660,7 @@ async function originateCall(pool, options) {
                 otpCode,
                 language: audioSeq.language,
                 timeout,
+                playCount: playCount || 1,
             });
             
             return {
@@ -729,6 +804,108 @@ function simulateCall(callId, destination, otpCode, playCount) {
 }
 
 // ============================================================================
+// 4b. VOICE OTP MODE OVERRIDES (shared by engine + manual API)
+// ============================================================================
+
+/**
+ * Find the best English config for dual-language playback.
+ * Picks an active config whose primary language is English, preferring one that
+ * has uploaded greeting + digit audio; lowest id as the final tie-break.
+ *
+ * @param {object} pool - PostgreSQL pool
+ * @returns {Promise<object|null>} English voice_otp_config row or null
+ */
+async function resolveEnglishConfig(pool) {
+    const enResult = await pool.query(
+        `SELECT * FROM voice_otp_configs 
+         WHERE is_active = true AND primary_language_code LIKE 'en%'
+         ORDER BY greeting_audio_url IS NOT NULL DESC, 
+                  (COALESCE(audio_0_9_primary::text, '{}') != '{}' OR COALESCE(audio_0_9::text, '{}') != '{}') DESC,
+                  id ASC
+         LIMIT 1`
+    );
+    return enResult.rows[0] || null;
+}
+
+/**
+ * Apply supplier-level voice_otp_mode overrides to a resolved config.
+ * One config per country — the mode dynamically adjusts play_count and language
+ * so we don't need 3+ duplicate config rows per country.
+ *
+ *   local_1x            → greeting + digits played ONCE (local language)
+ *   local_2x            → greeting + digits played TWICE (local language)
+ *   local_international → local greeting+digits, then English greeting+digits
+ *
+ * Dual-language is ALSO triggered when the config itself is flagged
+ * (is_dual_language = true, e.g. a 'Local + International' group selected on
+ * the manual send form) — so both the queue path and the manual path behave
+ * identically even without a supplier mode.
+ *
+ * @param {object} pool - PostgreSQL pool
+ * @param {object} config - voice_otp_configs row (will be spread, not mutated)
+ * @param {object} supplier - supplier row (voice_otp_mode)
+ * @returns {Promise<{config: object, englishConfig: object|null}>}
+ */
+async function applyVoiceOtpModeOverrides(pool, config, supplier) {
+    const voiceOtpMode = (supplier && supplier.voice_otp_mode) || null;
+    if (!config) {
+        return { config, englishConfig: null };
+    }
+    // Was the config EXPLICITLY flagged as dual in the Language tab? Only flagged
+    // dual configs may carry their own secondary (English) audio — a supplier
+    // local_international mode applied to an ordinary country config should fall
+    // back to the global English config (its own 'secondary' map may be a
+    // different-language retry-fallback, e.g. Bangla).
+    const originallyDual = config.is_dual_language === true;
+
+    let englishConfig = null;
+    if (voiceOtpMode === 'local_1x') {
+        config = { ...config, play_count: 1, secondary_language_code: config.primary_language_code, is_dual_language: false };
+    } else if (voiceOtpMode === 'local_2x') {
+        config = { ...config, play_count: 2, secondary_language_code: config.primary_language_code, is_dual_language: false };
+    } else if (voiceOtpMode === 'local_international') {
+        config = { ...config, play_count: config.play_count || 1, secondary_language_code: 'en-US', is_dual_language: true };
+    }
+
+    // Dual-language: config flagged as dual (or local_international mode above)
+    // → resolve the English config for concatenated local + English playback.
+    // PREFER the config's OWN secondary audio (secondary greeting + audio_0_9_secondary
+    // uploaded in the Audio tab) when present — a self-contained dual config beats
+    // the global English config. Falls back to the global English config otherwise.
+    if (config.is_dual_language) {
+        try {
+            const secGreeting = config.secondary_greeting_audio_url || null;
+            const secDigitsRaw = config.audio_0_9_secondary;
+            const secDigits = (typeof secDigitsRaw === 'string' ? JSON.parse(secDigitsRaw) : (secDigitsRaw || {})) || {};
+            const hasOwnSecondary = originallyDual && (!!secGreeting || Object.keys(secDigits).length > 0);
+            if (hasOwnSecondary) {
+                englishConfig = {
+                    ...config,
+                    greeting_audio_url: secGreeting,
+                    audio_0_9: null,
+                    audio_0_9_primary: null,
+                    audio_0_9_secondary: secDigits,
+                    primary_language_code: config.secondary_language_code || 'en-US',
+                };
+                console.log(`[VoiceOTP] Using config #${config.id} own secondary audio for dual-language (greeting=${!!secGreeting}, digits=${Object.keys(secDigits).length})`);
+            } else {
+                englishConfig = await resolveEnglishConfig(pool);
+                if (englishConfig) {
+                    console.log(`[VoiceOTP] English config #${englishConfig.id} (${englishConfig.language}) resolved for dual-language`);
+                } else {
+                    console.log('[VoiceOTP] No English config found — dual-language will fall back to primary');
+                }
+            }
+            if (englishConfig) config._englishConfig = englishConfig;
+        } catch (e) {
+            console.error('[VoiceOTP] English config lookup failed:', e.message);
+        }
+    }
+    console.log(`[VoiceOTP] Mode '${voiceOtpMode}' applied: play_count=${config.play_count}, secondary=${config.secondary_language_code}, dual=${!!config.is_dual_language}`);
+    return { config, englishConfig };
+}
+
+// ============================================================================
 // 5. RETRY ENGINE (reconnect_schedule)
 // ============================================================================
 
@@ -783,6 +960,8 @@ async function executeWithRetry(pool, options) {
     const secondaryLang = (config && config.secondary_language_code) || '';
     const primaryLang = (config && config.primary_language_code) || (config && config.language_code) || 'en-US';
     const hasSecondary = secondaryLang && secondaryLang !== primaryLang;
+    // Dual-language mode: when _englishConfig is set, always use dual-lang (both in one call)
+    const isDualLangMode = !!(config && config._englishConfig);
     
     for (let attempt = 0; attempt < schedule.length; attempt++) {
         // Wait for the scheduled delay before this attempt
@@ -791,11 +970,13 @@ async function executeWithRetry(pool, options) {
         }
         
         // --- Language switching on retry ---
+        // Dual-lang mode: always use primary (both languages concatenated in one call)
+        // Single-lang mode: alternate primary/secondary on retry
         // Attempt 0 → primary language
         // Attempt 1 → secondary language (if available)
         // Attempt 2 → primary language again
         // Attempt 3 → secondary language again
-        const useSecondaryLanguage = hasSecondary && (attempt % 2 === 1);
+        const useSecondaryLanguage = isDualLangMode ? false : (hasSecondary && (attempt % 2 === 1));
         
         // Update log: retrying with language info
         if (attempt > 0) {
@@ -971,31 +1152,9 @@ async function executeVoiceOtpPipeline(pool, ctx) {
     // 2b. Apply voice_otp_mode overrides (supplier-level dynamic behavior)
     // One config per country — the mode dynamically adjusts play_count and language switching.
     // This avoids needing 3+ duplicate config rows per country.
-    const voiceOtpMode = supplier.voice_otp_mode || null;
-    if (config && voiceOtpMode) {
-        if (voiceOtpMode === 'local_1x') {
-            config = { ...config, play_count: 1, secondary_language_code: config.primary_language_code };
-        } else if (voiceOtpMode === 'local_2x') {
-            config = { ...config, play_count: 2, secondary_language_code: config.primary_language_code };
-        } else if (voiceOtpMode === 'local_international') {
-            config = { ...config, play_count: config.play_count || 1, secondary_language_code: 'en-US' };
-            // Look up the best English config for concatenated dual-language audio
-            const enResult = await pool.query(
-                `SELECT * FROM voice_otp_configs 
-                 WHERE is_active = true AND primary_language_code LIKE 'en%'
-                 ORDER BY greeting_audio_url IS NOT NULL DESC, 
-                          (audio_0_9_primary IS NOT NULL OR audio_0_9 IS NOT NULL) DESC
-                 LIMIT 1`
-            );
-            if (enResult.rows.length > 0) {
-                config._englishConfig = enResult.rows[0];
-                console.log(`[VoiceOTP] English config #${enResult.rows[0].id} (${enResult.rows[0].language}) resolved for dual-language`);
-            } else {
-                console.log('[VoiceOTP] No English config found — dual-language will fall back to primary');
-            }
-        }
-        console.log(`[VoiceOTP] Mode '${voiceOtpMode}' applied: play_count=${config.play_count}, secondary=${config.secondary_language_code}`);
-    }
+    // Shared with the manual /api/voice-otp/send path so both behave identically.
+    const modeResult = await applyVoiceOtpModeOverrides(pool, config, supplier);
+    config = modeResult.config;
     
     // 3. Determine play count (client-level > mode-override > config-level > default 1)
     const playCount = client.play_count || (config ? config.play_count : 1) || 1;
@@ -1162,12 +1321,16 @@ function tryRegisterActiveCall(destination) {
     const destKey = (destination || '').replace(/\D/g, '');
     const existing = activeVoiceCalls.get(destKey);
     if (existing) {
-        // Auto-cleanup stale locks (older than 60s — call should complete within 30s)
-        if (Date.now() - existing.startedAt > 60000) {
+        // Auto-cleanup stale locks — ONLY for crashed/abandoned runs. The lock is
+        // normally released by the pipeline's finally block when the call finishes.
+        // The threshold must comfortably exceed the longest possible retry sequence
+        // (reconnect schedule up to '0,1,2,5' = ~8min of delays + several 30-45s call
+        // attempts), otherwise a retrying call gets its lock stolen → overlapping call.
+        if (Date.now() - existing.startedAt > 1200000) { // 20 min
             console.log('[VoiceOTP] Cleaning stale lock for %s (age=%dms)', destKey, Date.now() - existing.startedAt);
             activeVoiceCalls.delete(destKey);
         } else {
-            return null; // genuinely busy
+            return null; // genuinely busy (call may still be retrying)
         }
     }
     const callId = `VOICE_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
@@ -1205,6 +1368,7 @@ module.exports = {
     extractOtpDigits,
     resolveCountryLanguage,
     resolveVoiceOtpConfig,
+    resolveVoiceOtpConfigByPrefix,
     buildAudioSequence,
     concatenateWavFiles,
     originateCall,
@@ -1225,4 +1389,6 @@ module.exports = {
     // Utils
     generateRandomOtp,
     parseSipAddress,
+    applyVoiceOtpModeOverrides,
+    resolveEnglishConfig,
 };

@@ -40,7 +40,7 @@ export const AddSupplier: React.FC = () => {
   const voiceOtpPlayModes = [
     { value: 'local_1x', label: 'Local (Single)', desc: 'Match by prefix → single language, played once. E.g. +880 finds Bangla config, plays greeting + digits × 1' },
     { value: 'local_2x', label: 'Local (Double)', desc: 'Match by prefix → single language, played twice. E.g. +880 finds Bangla config, plays greeting + digits × 2' },
-    { value: 'local_international', label: 'Local + International', desc: 'Match by prefix → local first, international fallback. E.g. +880 finds Bangla config → retry in English' },
+    { value: 'local_international', label: 'Local + International', desc: 'Match by prefix → plays local first, then English in the SAME call. E.g. +880 finds Bangla config → greeting+digits in Bangla, then in English' },
   ];
 
   useEffect(() => {

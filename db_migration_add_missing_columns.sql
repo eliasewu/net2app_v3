@@ -124,3 +124,6 @@ ALTER TABLE notifications ADD COLUMN IF NOT EXISTS is_emailed BOOLEAN DEFAULT fa
 -- SAFETY: All statements use IF NOT EXISTS, so it's safe to run
 -- multiple times. No data loss risk.
 -- ============================================================
+
+-- Voice OTP: dual-language flag (local + international playback)
+ALTER TABLE voice_otp_configs ADD COLUMN IF NOT EXISTS is_dual_language BOOLEAN DEFAULT false;

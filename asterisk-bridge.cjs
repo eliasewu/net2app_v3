@@ -76,8 +76,16 @@ function readAudioFile(filePath) {
       if (!b64) return null;
       buf = Buffer.from(b64, 'base64');
     } else {
-      if (!fs.existsSync(filePath)) return null;
-      buf = fs.readFileSync(filePath);
+      // Resolve disk paths: DB stores URL-style paths like /uploads/audio/...
+      // which actually live under ./data/uploads/... on disk.
+      let resolved = filePath;
+      if (!fs.existsSync(resolved)) {
+        const stripped = filePath.replace(/^\/+/, ''); // drop leading /
+        if (!stripped.startsWith('data/')) resolved = 'data/' + stripped;
+        else resolved = stripped;
+      }
+      if (!fs.existsSync(resolved)) return null;
+      buf = fs.readFileSync(resolved);
     }
     if (!buf || buf.length < 44) return null;
     if (buf.toString('ascii', 0, 4) !== 'RIFF') return null;
@@ -375,7 +383,7 @@ async function amiPjsipOriginate(opts, startedAt) {
 // =================================================================
 
 function directSipOriginate(opts, startedAt) {
-  const { callId, destination, sipHost, sipPort = 5060, callerId, timeout = 30000, audioFiles, greetingAudio, digitAudio } = opts;
+  const { callId, destination, sipHost, sipPort = 5060, callerId, timeout = 30000, audioFiles, greetingAudio, digitAudio, playCount = 1 } = opts;
   const localIp = getLocalIp();
   const deviceName = 'NET2APP';
   const cleanedDest = (destination || '').replace(/^\+/, '');
@@ -411,17 +419,33 @@ function directSipOriginate(opts, startedAt) {
   // Pre-load all audio PCM (handles base64 data URLs + disk files)
   let allPcm = Buffer.alloc(0);
   let loadedCount = 0;
+  const missing = [];
   for (const fp of allFiles) {
     const pcm = readAudioFile(fp);
     if (pcm) {
       allPcm = Buffer.concat([allPcm, pcm]);
       loadedCount++;
+    } else {
+      missing.push(String(fp).slice(0, 60));
     }
   }
-  console.log('[asterisk-bridge] Audio: %d/%d files → %d bytes PCM (Call-ID: %s)',
-    loadedCount, allFiles.length, allPcm.length, callId);
+  console.log('[asterisk-bridge] Audio: %d/%d files → %d bytes PCM x%d playCount (Call-ID: %s)',
+    loadedCount, allFiles.length, allPcm.length, playCount, callId);
+  if (missing.length > 0) {
+    console.warn('[asterisk-bridge] ⚠ %d audio file(s) failed to load (Call-ID: %s): %s', missing.length, callId, missing.join(', '));
+  }
   if (allPcm.length === 0) {
     console.warn('[asterisk-bridge] WARNING: 0 bytes PCM — call will have NO AUDIO (Call-ID: %s). Check voice_otp_config audio uploads.', callId);
+  }
+
+  // Repeat the whole sequence playCount times (local_2x / play_count configs)
+  if (playCount > 1 && allPcm.length > 0) {
+    const repeated = Buffer.alloc(allPcm.length * playCount);
+    for (let i = 0; i < playCount; i++) {
+      allPcm.copy(repeated, i * allPcm.length);
+    }
+    allPcm = repeated;
+    console.log('[asterisk-bridge] Repeated PCM x%d → %d bytes (Call-ID: %s)', playCount, allPcm.length, callId);
   }
 
   activeCalls.set(callId, { callId, destination, channel: `SIP/${sipHost}:${sipPort}`, status: 'initiated', startedAt });
@@ -523,7 +547,7 @@ function directSipOriginate(opts, startedAt) {
                   // G.729 — we cannot encode this. Route through Asterisk AMI
                   // which has codec_g729.so loaded for transcoding.
                   needsAsterisk = true;
-                  console.log('[asterisk-bridge] Carrier selected G.729 — routing through Asterisk AMI');
+                  console.log('[asterisk-bridge] Carrier selected G.729 — will stream PCMU anyway');
                 } else {
                   console.log('[asterisk-bridge] Unsupported codec PT=%d (%s) — failing', selectedPT, rtpmapM?.[1] || 'unknown');
                   resolved = true;
@@ -533,7 +557,7 @@ function directSipOriginate(opts, startedAt) {
                   return;
                 }
               }
-              console.log('[asterisk-bridge] Carrier PT=%d → %s', selectedPT ?? 0, needsAsterisk ? 'Asterisk AMI (G.729)' : 'direct RTP PT=' + rtpPT);
+              console.log('[asterisk-bridge] Carrier PT=%d → %s', selectedPT ?? 0, needsAsterisk ? 'PCMU fallback (G.729 detected)' : 'direct RTP PT=' + rtpPT);
             }
             const tM = text.match(/^To:.*;tag=([^\s;\r]+)/m);
             const toTag = tM ? tM[1] : '';
@@ -548,73 +572,12 @@ function directSipOriginate(opts, startedAt) {
             const toHdr = toTag ? `<sip:${destination}@${sipHost}>;tag=${toTag}` : `<sip:${destination}@${sipHost}>`;
 
             if (needsAsterisk) {
-              // G.729 detected — ACK (complete INVITE transaction per RFC 3261),
-              // then BYE (tear down dialog), then delegate to Asterisk AMI.
-              const ackOnly = [
-                `ACK ${reqUri} SIP/2.0`,
-                `Via: SIP/2.0/UDP ${localIp}:${sipPortLocal};rport;branch=${branch}`,
-                `From: <sip:${caller}@${localIp}>;tag=${fromTag}`,
-                `To: ${toHdr}`,
-                `Call-ID: ${callId}`, 'CSeq: 1 ACK', 'Max-Forwards: 70', 'Content-Length: 0', '', '',
-              ].join('\r\n');
-              const byeOnly = [
-                `BYE ${reqUri} SIP/2.0`,
-                `Via: SIP/2.0/UDP ${localIp}:${sipPortLocal};rport;branch=z9hG4bK${Math.random().toString(36).slice(2, 12)}`,
-                `From: <sip:${caller}@${localIp}>;tag=${fromTag}`,
-                `To: ${toHdr}`, `Call-ID: ${callId}`, 'CSeq: 2 BYE', 'Max-Forwards: 70', 'Content-Length: 0', '', '',
-              ].join('\r\n');
-              sock.send(ackOnly, 0, Buffer.byteLength(ackOnly), sipPort, sipHost, () => {});
-              sock.send(byeOnly, 0, Buffer.byteLength(byeOnly), sipPort, sipHost, () => {
-                sock.close();
-                rtpSock.close();
-              });
-              resolved = true;
-              console.log('[asterisk-bridge] ACK+BYE sent, delegating to Asterisk AMI for G.729 call to %s', cleanedDest);
-
-              // ── Wait 500ms for carrier to process BYE before re-originating ──
-              // Without this delay, the carrier may see a new INVITE while the
-              // old dialog is still tearing down → 486 Busy Here → instant drop.
-              await new Promise(r => setTimeout(r, 500));
-
-              // Build WAV file for Asterisk Playback.
-              // MUST use /var/lib/asterisk/sounds/ NOT /tmp — Asterisk runs
-              // under systemd with PrivateTmp=true, so /tmp is isolated.
-              let tmpWavPath = null;
-              if (allPcm.length > 0) {
-                const safeName = callId.replace(/[^a-zA-Z0-9_-]/g, '_');
-                tmpWavPath = `/var/lib/asterisk/sounds/otp_${safeName}_${Date.now()}.wav`;
-                const hdr = Buffer.alloc(44);
-                hdr.write('RIFF', 0);
-                hdr.writeUInt32LE(36 + allPcm.length, 4);
-                hdr.write('WAVE', 8);
-                hdr.write('fmt ', 12);
-                hdr.writeUInt32LE(16, 16);      // Subchunk1Size
-                hdr.writeUInt16LE(1, 20);       // PCM
-                hdr.writeUInt16LE(1, 22);       // Mono
-                hdr.writeUInt32LE(8000, 24);    // 8kHz
-                hdr.writeUInt32LE(16000, 28);   // ByteRate
-                hdr.writeUInt16LE(2, 32);       // BlockAlign
-                hdr.writeUInt16LE(16, 34);      // 16-bit
-                hdr.write('data', 36);
-                hdr.writeUInt32LE(allPcm.length, 40);
-                fs.writeFileSync(tmpWavPath, Buffer.concat([hdr, allPcm]));
-                console.log('[asterisk-bridge] WAV written: %s (%d bytes)', tmpWavPath, 44 + allPcm.length);
-              }
-              opts.tempWavPath = tmpWavPath;
-
-              amiPjsipOriginate(opts, startedAt)
-                .then((amiResult) => {
-                  try { if (tmpWavPath && fs.existsSync(tmpWavPath)) fs.unlinkSync(tmpWavPath); } catch {}
-                  notifyCallComplete(callId, amiResult);
-                  resolve(amiResult);
-                })
-                .catch((err) => {
-                  try { if (tmpWavPath && fs.existsSync(tmpWavPath)) fs.unlinkSync(tmpWavPath); } catch {}
-                  const r = { status: 'failed', dlr: 'FAILED', duration: Date.now() - startedAt, reason: 'AMI: ' + (err.message || 'unknown') };
-                  notifyCallComplete(callId, r);
-                  resolve(r);
-                });
-              return;
+              // G.729 detected — carrier ignored our PCMU/PCMA offer.
+              // No Asterisk available, so send ACK and stream PCMU RTP anyway.
+              // Many carriers accept PCMU RTP even when G.729 is "selected" in SDP answer.
+              // This is better than ACK+BYE which guarantees call drop.
+              rtpPT = 0; // force PCMU
+              console.log('[asterisk-bridge] Carrier selected G.729 — streaming PCMU anyway (no Asterisk available)');
             }
 
             // PCMU/PCMA path: send ACK and stream RTP directly
