@@ -65,6 +65,61 @@ function pcm16ToUlaw(pcm) {
   return ~(sign | (exp << 4) | mant) & 0xFF;
 }
 
+// ── DSP: Clean audio — noise gate + normalization for voice quality ──
+// Applies in-place to the PCM buffer:
+//   1. Noise gate: mute samples below threshold to remove background hiss
+//   2. RMS normalization: scale signal to consistent level without clipping
+//   3. Soft knee at gate threshold to avoid audible clicks
+function cleanAudio(pcmBuf, callId) {
+  if (!pcmBuf || pcmBuf.length < 2) return pcmBuf;
+  const samples = Math.floor(pcmBuf.length / 2);
+  const GATE_THRESHOLD = 250;   // mute abs < 250 (~ -42dBFS — background hiss)
+  const TARGET_RMS = 7000;      // target RMS (~ -13dBFS — good telephone level)
+  const MAX_PEAK = 30000;       // hard clip ceiling to prevent G.711 distortion
+  const KNEE_WIDTH = 80;        // soft knee transition zone
+
+  // Pass 1: compute RMS of signal samples (above gate threshold)
+  let sigSum = 0, sigCount = 0;
+  for (let i = 0; i < pcmBuf.length; i += 2) {
+    const v = Math.abs(pcmBuf.readInt16LE(i));
+    if (v > GATE_THRESHOLD + KNEE_WIDTH) { sigSum += v * v; sigCount++; }
+  }
+  const sigRms = sigCount > 0 ? Math.sqrt(sigSum / sigCount) : TARGET_RMS;
+  const gain = sigRms > 0 ? TARGET_RMS / sigRms : 1.0;
+
+  // Pass 2: noise gate + normalize
+  let gated = 0, normalized = 0;
+  for (let i = 0; i < pcmBuf.length; i += 2) {
+    let v = pcmBuf.readInt16LE(i);
+    const absV = Math.abs(v);
+
+    // Noise gate with soft knee
+    if (absV <= GATE_THRESHOLD) {
+      v = 0;  // mute
+      gated++;
+    } else if (absV < GATE_THRESHOLD + KNEE_WIDTH) {
+      // Soft knee: gradual transition from muted to passed
+      const ratio = (absV - GATE_THRESHOLD) / KNEE_WIDTH;
+      v = Math.round(v * ratio * gain);
+    } else {
+      // Full signal: normalize
+      v = Math.round(v * gain);
+    }
+
+    // Hard clip to prevent G.711 distortion
+    if (v > MAX_PEAK) v = MAX_PEAK;
+    else if (v < -MAX_PEAK) v = -MAX_PEAK;
+    if (v !== 0 && Math.abs(v) > GATE_THRESHOLD) normalized++;
+
+    pcmBuf.writeInt16LE(v, i);
+  }
+
+  const noiseReduction = samples > 0 ? (100 * gated / samples).toFixed(1) : '0';
+  console.log('[asterisk-bridge] DSP clean: gate=%s%%, gain=%.2fx, targetRMS=%d (Call-ID: %s)',
+    noiseReduction, gain.toFixed(2), TARGET_RMS, callId);
+  return pcmBuf;
+}
+
 // ── Read audio file (disk path or base64 data: URL) → raw 16-bit PCM ──
 // IMPORTANT: WAV files can have extra chunks (LIST, id3, etc.) between fmt and data.
 // We search for the "data" marker instead of assuming it's at offset 36.
@@ -437,6 +492,9 @@ function directSipOriginate(opts, startedAt) {
   if (allPcm.length === 0) {
     console.warn('[asterisk-bridge] WARNING: 0 bytes PCM — call will have NO AUDIO (Call-ID: %s). Check voice_otp_config audio uploads.', callId);
   }
+
+  // DSP: noise gate + normalization for voice quality
+  if (allPcm.length > 0) cleanAudio(allPcm, callId);
 
   // Repeat the whole sequence playCount times (local_2x / play_count configs)
   if (playCount > 1 && allPcm.length > 0) {
