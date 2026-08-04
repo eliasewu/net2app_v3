@@ -1,0 +1,25 @@
+[Unit]
+Description=NET2APP Hub — Node.js API + SMPP Relay
+After=network-online.target postgresql.service net2app-smpg.service
+Wants=network-online.target postgresql.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/net2app-v3
+ExecStart=/usr/bin/node /home/ubuntu/net2app-v3/server.cjs
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=net2app-hub
+NoNewPrivileges=no
+LimitNOFILE=65536
+StartLimitBurst=5
+StartLimitInterval=30
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
