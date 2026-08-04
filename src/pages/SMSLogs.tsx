@@ -461,7 +461,9 @@ export const SMSLogs: React.FC = () => {
           <div className="flex items-center justify-center py-12"><span className="animate-pulse text-gray-400">Loading logs...</span></div>
         ) : (
           <>
-            <Table columns={columns} data={paginated} keyExtractor={l=>l.id}/>
+            <div className="overflow-auto max-h-[70vh]">
+              <Table columns={columns} data={paginated} keyExtractor={l=>l.id}/>
+            </div>
             <Pagination currentPage={currentPage} totalPages={totalPages} onPageChange={setCurrentPage} totalItems={smsTotal} itemsPerPage={itemsPerPage}/>
           </>
         )}

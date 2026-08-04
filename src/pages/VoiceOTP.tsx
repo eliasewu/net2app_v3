@@ -283,7 +283,7 @@ export const VoiceOTP: React.FC = () => {
         <div className="px-6 py-4 border-b">
           <h2 className="text-lg font-semibold">Voice OTP Calls</h2>
         </div>
-        <div className="overflow-x-auto">
+        <div className="overflow-auto max-h-[70vh]">
           <table className="w-full">
             <thead className="bg-gray-50">
               <tr>
