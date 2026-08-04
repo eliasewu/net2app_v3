@@ -448,6 +448,8 @@ function directSipOriginate(opts, startedAt) {
     console.log('[asterisk-bridge] Repeated PCM x%d → %d bytes (Call-ID: %s)', playCount, allPcm.length, callId);
   }
 
+  let connectedStart = 0; // captured when 200 OK arrives (actual audio starts)
+
   activeCalls.set(callId, { callId, destination, channel: `SIP/${sipHost}:${sipPort}`, status: 'initiated', startedAt });
 
   // Create RTP socket for audio streaming
@@ -524,6 +526,8 @@ function directSipOriginate(opts, startedAt) {
             if (resolved) return;
             clearTimeout(timer);
 
+            // Connected timestamp: actual call duration starts NOW (audio time only)
+            connectedStart = Date.now();
             // Debug: log raw 200 OK (first 600 chars) for Contact/SDP diagnostics
             console.log('[asterisk-bridge] 200 OK RAW (first 600): %s', text.substring(0, 600));
 
@@ -591,7 +595,9 @@ function directSipOriginate(opts, startedAt) {
             sock.send(ack, 0, Buffer.byteLength(ack), sipPort, sipHost, () => {});
 
             const finish = () => {
-              const dur = Date.now() - startedAt;
+              const connectedAt = Date.now(); // capture when audio finishes
+              // connectedMs = time from ACK→BYE (actual audio time, not SIP handshake)
+              const connectedMs = connectedAt - connectedStart;
               const bye = [
                 `BYE ${reqUri} SIP/2.0`,
                 `Via: SIP/2.0/UDP ${localIp}:${sipPortLocal};rport;branch=z9hG4bK${Math.random().toString(36).slice(2, 12)}`,
@@ -601,7 +607,9 @@ function directSipOriginate(opts, startedAt) {
               ].join('\r\n');
               // Mark call complete and resolve BEFORE closing sockets
               resolved = true;
-              const r = { status: 'completed', dlr: 'DELIVRD', duration: dur };
+              // connectedMs = actual audio playback time (ACK→BYE), not SIP handshake
+              // dur = total time from INVITE to BYE (kept for reference)
+              const r = { status: 'completed', dlr: 'DELIVRD', duration: connectedMs || dur, totalDuration: dur };
               notifyCallComplete(callId, r); resolve(r);
               // Send BYE — close sockets in the callback so the packet isn't dropped.
               // Without this, sock.close() right after send() can kill the pending UDP datagram.
