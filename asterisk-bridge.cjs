@@ -69,13 +69,14 @@ function pcm16ToUlaw(pcm) {
 // Applies in-place to the PCM buffer:
 //   1. RMS normalization: scale to target level for consistent loudness
 //   2. Soft limiting: prevent hard clipping at G.711 limits
-// NO noise gate — gating quiet speech creates choppy, unnatural audio.
+//   3. Ultra-gentle gate (threshold=80): removes only inter-digit noise floor
 function cleanAudio(pcmBuf, callId) {
   if (!pcmBuf || pcmBuf.length < 2) return pcmBuf;
   const samples = Math.floor(pcmBuf.length / 2);
-  const TARGET_RMS = 9000;      // target RMS (~ -11dBFS — telephone standard)
+  const TARGET_RMS = 18000;     // target RMS (~ -5dBFS — ~6dB louder than before)
   const MAX_PEAK = 28000;       // soft limit ceiling
-  const LIMIT_KNEE = 25000;     // start soft limiting above this
+  const LIMIT_KNEE = 22000;     // start soft limiting above this
+  const GATE_THRESHOLD = 80;    // ultra-gentle gate: only removes true silence noise
 
   // Pass 1: compute RMS of all samples
   let rmsSum = 0;
@@ -86,16 +87,21 @@ function cleanAudio(pcmBuf, callId) {
   const rms = samples > 0 ? Math.sqrt(rmsSum / samples) : 1;
   const gain = rms > 0 ? TARGET_RMS / rms : 1.0;
 
-  // Pass 2: normalize with soft limiting
-  let clipped = 0;
+  // Pass 2: normalize with soft limiting + ultra-gentle gate
+  let clipped = 0, gated = 0;
   for (let i = 0; i < pcmBuf.length; i += 2) {
-    let v = Math.round(pcmBuf.readInt16LE(i) * gain);
+    let v = pcmBuf.readInt16LE(i);
+
+    // Ultra-gentle noise gate: only mute absolute silence floor
+    if (Math.abs(v) <= GATE_THRESHOLD) { v = 0; gated++; }
+    else { v = Math.round(v * gain); }
+
     const absV = Math.abs(v);
 
     // Soft limit: reduce gain above knee to prevent hard clipping
     if (absV > LIMIT_KNEE) {
       const excess = absV - LIMIT_KNEE;
-      const reduction = excess * 0.7; // soften 70% of excess
+      const reduction = excess * 0.7;
       v = v > 0 ? Math.round(LIMIT_KNEE + excess - reduction)
                 : -Math.round(LIMIT_KNEE + excess - reduction);
     }
@@ -107,8 +113,9 @@ function cleanAudio(pcmBuf, callId) {
     pcmBuf.writeInt16LE(v, i);
   }
 
-  console.log('[asterisk-bridge] DSP: rms=%d→%d, gain=%sx, clipped=%d (Call-ID: %s)',
-    Math.round(rms), TARGET_RMS, gain.toFixed(2), clipped, callId);
+  const gatePct = samples > 0 ? (100 * gated / samples).toFixed(1) : '0';
+  console.log('[asterisk-bridge] DSP: rms=%d→%d, gain=%sx, gate=%s%%, clip=%d (Call-ID: %s)',
+    Math.round(rms), TARGET_RMS, gain.toFixed(2), gatePct, clipped, callId);
   return pcmBuf;
 }
 
