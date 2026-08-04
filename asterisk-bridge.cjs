@@ -493,7 +493,7 @@ function directSipOriginate(opts, startedAt) {
           `INVITE sip:${destination}@${sipHost}:${sipPort} SIP/2.0`,
           `Via: SIP/2.0/UDP ${localIp}:${sipPortLocal};rport;branch=${branch}`,
           'Max-Forwards: 70',
-          `From: <sip:${caller}@${localIp}>;tag=${fromTag}`,
+          `From: "OTP" <sip:${caller}@${localIp}>;tag=${fromTag}`,
           `To: <sip:${destination}@${sipHost}>`,
           `Call-ID: ${callId}`,
           'CSeq: 1 INVITE',
@@ -584,7 +584,7 @@ function directSipOriginate(opts, startedAt) {
             const ack = [
               `ACK ${reqUri} SIP/2.0`,
               `Via: SIP/2.0/UDP ${localIp}:${sipPortLocal};rport;branch=${branch}`,
-              `From: <sip:${caller}@${localIp}>;tag=${fromTag}`,
+              `From: "OTP" <sip:${caller}@${localIp}>;tag=${fromTag}`,
               `To: ${ackTo}`,
               `Call-ID: ${callId}`, 'CSeq: 1 ACK', 'Max-Forwards: 70', 'Content-Length: 0', '', '',
             ].join('\r\n');
@@ -595,7 +595,7 @@ function directSipOriginate(opts, startedAt) {
               const bye = [
                 `BYE ${reqUri} SIP/2.0`,
                 `Via: SIP/2.0/UDP ${localIp}:${sipPortLocal};rport;branch=z9hG4bK${Math.random().toString(36).slice(2, 12)}`,
-                `From: <sip:${caller}@${localIp}>;tag=${fromTag}`,
+                `From: "OTP" <sip:${caller}@${localIp}>;tag=${fromTag}`,
                 `To: ${toHdr}`, `Call-ID: ${callId}`, 'CSeq: 2 BYE', 'Max-Forwards: 70', 'Content-Length: 0',
                 '', '',
               ].join('\r\n');

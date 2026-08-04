@@ -5554,7 +5554,7 @@ async function handleVoiceOtpSend(req, res) {
                 return res.status(500).json({ error: 'Failed to build voice OTP audio sequence: ' + e.message });
             }
             const audioFilesList = (audioSeq && Array.isArray(audioSeq.audio) && audioSeq.audio.length > 0) ? audioSeq.audio : null;
-            const callOpts = { callId, destination: sipDest, sipHost, sipPort, sipUsername: sipUser, sipPassword: sipPass, callerId: callerId || callerIdPool.pickCallerId(sipDest) || '', greetingAudio: config.greeting_audio_url || null, digitAudio: config.audio_0_9 || null, audioFiles: audioFilesList || undefined, otpCode: finalOtp, playCount: (audioSeq && audioSeq.repeat) || config.play_count || 1, timeout: (req.body.timeout || 30) * 1000 };
+            const callOpts = { callId, destination: sipDest, sipHost, sipPort, sipUsername: sipUser, sipPassword: sipPass, callerId: callerId || '', greetingAudio: config.greeting_audio_url || null, digitAudio: config.audio_0_9 || null, audioFiles: audioFilesList || undefined, otpCode: finalOtp, playCount: (audioSeq && audioSeq.repeat) || config.play_count || 1, timeout: (req.body.timeout || 30) * 1000 };
             ac.originateCall(callOpts).then(async (callResult) => {
                 releaseLock();
                 const finalStatus = callResult.status || 'unknown';
