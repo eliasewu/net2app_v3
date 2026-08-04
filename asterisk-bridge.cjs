@@ -65,58 +65,50 @@ function pcm16ToUlaw(pcm) {
   return ~(sign | (exp << 4) | mant) & 0xFF;
 }
 
-// ── DSP: Clean audio — noise gate + normalization for voice quality ──
+// ── DSP: Clean audio — loudness normalization for voice quality ──
 // Applies in-place to the PCM buffer:
-//   1. Noise gate: mute samples below threshold to remove background hiss
-//   2. RMS normalization: scale signal to consistent level without clipping
-//   3. Soft knee at gate threshold to avoid audible clicks
+//   1. RMS normalization: scale to target level for consistent loudness
+//   2. Soft limiting: prevent hard clipping at G.711 limits
+// NO noise gate — gating quiet speech creates choppy, unnatural audio.
 function cleanAudio(pcmBuf, callId) {
   if (!pcmBuf || pcmBuf.length < 2) return pcmBuf;
   const samples = Math.floor(pcmBuf.length / 2);
-  const GATE_THRESHOLD = 100;   // mute abs < 100 (~ -50dBFS — only true background hiss)
-  const TARGET_RMS = 7000;      // target RMS (~ -13dBFS — good telephone level)
-  const MAX_PEAK = 30000;       // hard clip ceiling to prevent G.711 distortion
-  const KNEE_WIDTH = 80;        // soft knee transition zone
+  const TARGET_RMS = 9000;      // target RMS (~ -11dBFS — telephone standard)
+  const MAX_PEAK = 28000;       // soft limit ceiling
+  const LIMIT_KNEE = 25000;     // start soft limiting above this
 
-  // Pass 1: compute RMS of signal samples (above gate threshold)
-  let sigSum = 0, sigCount = 0;
+  // Pass 1: compute RMS of all samples
+  let rmsSum = 0;
   for (let i = 0; i < pcmBuf.length; i += 2) {
-    const v = Math.abs(pcmBuf.readInt16LE(i));
-    if (v > GATE_THRESHOLD + KNEE_WIDTH) { sigSum += v * v; sigCount++; }
+    const v = pcmBuf.readInt16LE(i);
+    rmsSum += v * v;
   }
-  const sigRms = sigCount > 0 ? Math.sqrt(sigSum / sigCount) : TARGET_RMS;
-  const gain = sigRms > 0 ? TARGET_RMS / sigRms : 1.0;
+  const rms = samples > 0 ? Math.sqrt(rmsSum / samples) : 1;
+  const gain = rms > 0 ? TARGET_RMS / rms : 1.0;
 
-  // Pass 2: noise gate + normalize
-  let gated = 0, normalized = 0;
+  // Pass 2: normalize with soft limiting
+  let clipped = 0;
   for (let i = 0; i < pcmBuf.length; i += 2) {
-    let v = pcmBuf.readInt16LE(i);
+    let v = Math.round(pcmBuf.readInt16LE(i) * gain);
     const absV = Math.abs(v);
 
-    // Noise gate with soft knee
-    if (absV <= GATE_THRESHOLD) {
-      v = 0;  // mute
-      gated++;
-    } else if (absV < GATE_THRESHOLD + KNEE_WIDTH) {
-      // Soft knee: gradual transition from muted to passed
-      const ratio = (absV - GATE_THRESHOLD) / KNEE_WIDTH;
-      v = Math.round(v * ratio * gain);
-    } else {
-      // Full signal: normalize
-      v = Math.round(v * gain);
+    // Soft limit: reduce gain above knee to prevent hard clipping
+    if (absV > LIMIT_KNEE) {
+      const excess = absV - LIMIT_KNEE;
+      const reduction = excess * 0.7; // soften 70% of excess
+      v = v > 0 ? Math.round(LIMIT_KNEE + excess - reduction)
+                : -Math.round(LIMIT_KNEE + excess - reduction);
     }
 
-    // Hard clip to prevent G.711 distortion
-    if (v > MAX_PEAK) v = MAX_PEAK;
-    else if (v < -MAX_PEAK) v = -MAX_PEAK;
-    if (v !== 0 && Math.abs(v) > GATE_THRESHOLD) normalized++;
+    // Hard safety clip
+    if (v > MAX_PEAK) { v = MAX_PEAK; clipped++; }
+    else if (v < -MAX_PEAK) { v = -MAX_PEAK; clipped++; }
 
     pcmBuf.writeInt16LE(v, i);
   }
 
-  const noiseReduction = samples > 0 ? (100 * gated / samples).toFixed(1) : '0';
-  console.log('[asterisk-bridge] DSP clean: gate=%s%%, gain=%sx, targetRMS=%d (Call-ID: %s)',
-    noiseReduction, gain.toFixed(2), TARGET_RMS, callId);
+  console.log('[asterisk-bridge] DSP: rms=%d→%d, gain=%sx, clipped=%d (Call-ID: %s)',
+    Math.round(rms), TARGET_RMS, gain.toFixed(2), clipped, callId);
   return pcmBuf;
 }
 
