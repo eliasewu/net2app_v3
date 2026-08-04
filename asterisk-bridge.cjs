@@ -115,7 +115,7 @@ function cleanAudio(pcmBuf, callId) {
   }
 
   const noiseReduction = samples > 0 ? (100 * gated / samples).toFixed(1) : '0';
-  console.log('[asterisk-bridge] DSP clean: gate=%s%%, gain=%.2fx, targetRMS=%d (Call-ID: %s)',
+  console.log('[asterisk-bridge] DSP clean: gate=%s%%, gain=%sx, targetRMS=%d (Call-ID: %s)',
     noiseReduction, gain.toFixed(2), TARGET_RMS, callId);
   return pcmBuf;
 }
