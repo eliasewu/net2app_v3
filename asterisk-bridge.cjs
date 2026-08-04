@@ -596,8 +596,9 @@ function directSipOriginate(opts, startedAt) {
 
             const finish = () => {
               const connectedAt = Date.now(); // capture when audio finishes
+              const dur = connectedAt - startedAt; // total time INVITE→BYE
               // connectedMs = time from ACK→BYE (actual audio time, not SIP handshake)
-              const connectedMs = connectedAt - connectedStart;
+              const connectedMs = connectedStart ? (connectedAt - connectedStart) : dur;
               const bye = [
                 `BYE ${reqUri} SIP/2.0`,
                 `Via: SIP/2.0/UDP ${localIp}:${sipPortLocal};rport;branch=z9hG4bK${Math.random().toString(36).slice(2, 12)}`,
