@@ -5502,7 +5502,7 @@ async function handleVoiceOtpSend(req, res) {
         const callerId = ((selectedServer && selectedServer.is_e164 !== false) ? (selectedServer.caller_id || sip.sip_caller_id) : '') || '';
         const destPrefix = (selectedServer && selectedServer.destination_prefix) || '';
         // Use translated destination as base, then apply SIP prefix if configured
-        const sipDest = destPrefix ? destPrefix + String(finalDest).replace(/^\+/, '') : finalDest;
+        const sipDest = (destPrefix || '') + String(finalDest).replace(/^\+/, '');
         if (destPrefix) console.error(`[voice-otp] Prepending prefix ${destPrefix} → ${sipDest}`);
 
         // 5. Originate SIP call via Asterisk bridge
