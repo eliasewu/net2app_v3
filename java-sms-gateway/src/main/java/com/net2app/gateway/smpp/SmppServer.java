@@ -238,10 +238,59 @@ public class SmppServer {
                 return handleSubmitSm((SubmitSm) pduRequest);
             }
 
+            // DeliverSm — DLR receipt from inbound gateway
+            if (pduRequest instanceof DeliverSm) {
+                refreshActivity();
+                return handleDeliverSm((DeliverSm) pduRequest);
+            }
+
             // DeliverSmResp, DataSm, etc. — acknowledge silently
             PduResponse resp = pduRequest.createResponse();
             resp.setCommandStatus(0);
             return resp;
+        }
+
+        private PduResponse handleDeliverSm(DeliverSm deliverSm) {
+            try {
+                String receipt = new String(deliverSm.getShortMessage(), "UTF-8");
+                log.info("SMPP DLR from {}: {}", boundSystemId, receipt.length() > 100 ? receipt.substring(0, 100) + "..." : receipt);
+
+                // Parse standard SMPP DLR receipt format:
+                // "id:SUBMITTED_MSG_ID sub:001 dlvrd:001 submit date:... done date:... stat:DELIVRD err:000 text:..."
+                String msgId = null;
+                String stat = null;
+
+                // Extract id (the original message_id we sent)
+                java.util.regex.Matcher idMatcher = java.util.regex.Pattern.compile("id:([^\\s]+)").matcher(receipt);
+                if (idMatcher.find()) {
+                    msgId = idMatcher.group(1);
+                }
+
+                // Extract stat (DELIVRD, UNDELIV, EXPIRED, etc.)
+                java.util.regex.Matcher statMatcher = java.util.regex.Pattern.compile("stat:([^\\s]+)").matcher(receipt);
+                if (statMatcher.find()) {
+                    stat = statMatcher.group(1);
+                }
+
+                if (msgId != null && stat != null) {
+                    log.info("SMPP DLR PARSED: msgId={} stat={} from {}", msgId, stat, boundSystemId);
+                    Database.updateDlr(msgId, stat);
+
+                    // Also insert into dlr_outbox so Node.js can push to external client
+                    Database.insertDlrOutbox(msgId, stat, receipt);
+                } else {
+                    log.warn("SMPP DLR from {}: could not parse id/stat from receipt", boundSystemId);
+                }
+
+                DeliverSmResp resp = deliverSm.createResponse();
+                resp.setCommandStatus(0);
+                return resp;
+            } catch (Exception e) {
+                log.error("DeliverSm error: {}", e.getMessage());
+                DeliverSmResp resp = deliverSm.createResponse();
+                resp.setCommandStatus(0x00000045);
+                return resp;
+            }
         }
 
         private PduResponse handleSubmitSm(SubmitSm submitSm) {

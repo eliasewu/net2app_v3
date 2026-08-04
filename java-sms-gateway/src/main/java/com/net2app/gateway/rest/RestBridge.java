@@ -1,7 +1,11 @@
 package com.net2app.gateway.rest;
 
+import com.cloudhopper.commons.util.windowing.WindowFuture;
 import com.cloudhopper.smpp.SmppSession;
+import com.cloudhopper.smpp.pdu.PduRequest;
+import com.cloudhopper.smpp.pdu.PduResponse;
 import com.cloudhopper.smpp.pdu.SubmitSm;
+import com.cloudhopper.smpp.pdu.SubmitSmResp;
 import com.cloudhopper.smpp.type.Address;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.net2app.gateway.db.Database;
@@ -190,6 +194,7 @@ public class RestBridge {
                 String sourceAddr = String.valueOf(req.getOrDefault("source_addr", ""));
                 String destAddr = String.valueOf(req.getOrDefault("dest_addr", ""));
                 String message = String.valueOf(req.getOrDefault("message", ""));
+                String ourMessageId = String.valueOf(req.getOrDefault("our_message_id", ""));
 
                 if (destAddr.isEmpty() || message.isEmpty()) {
                     sendJson(exchange, 400, Map.of("error", "Missing dest_addr or message"));
@@ -225,13 +230,34 @@ public class RestBridge {
                 log.info("REST DELIVER: {} -> {} ({} chars) via {} session",
                     sourceAddr, destAddr, message.length(), supplier.supplierCode);
 
-                session.sendRequestPdu(sm, 10000, false);
+                // Send synchronously to capture the submit_sm_resp message_id.
+                // This is the ID test192 assigns — we need it to match DLRs later.
+                String gatewayMsgId = null;
+                try {
+                    WindowFuture<Integer, PduRequest, PduResponse> future =
+                        session.sendRequestPdu(sm, 10000, false);
+                    if (future != null && future.await()) {
+                        PduResponse resp = future.getResponse();
+                        if (resp instanceof SubmitSmResp) {
+                            gatewayMsgId = ((SubmitSmResp) resp).getMessageId();
+                            log.info("REST DELIVER: gateway msgId={} for our msgId={}", gatewayMsgId, ourMessageId);
+                        }
+                    }
+                } catch (Exception e) {
+                    log.warn("REST DELIVER: failed to get submit_sm_resp: {}", e.getMessage());
+                }
+
+                // Store the gateway's message_id so DLR matching works
+                if (gatewayMsgId != null && !ourMessageId.isEmpty()) {
+                    Database.updateSmppMessageId(ourMessageId, gatewayMsgId);
+                }
 
                 sendJson(exchange, 200, Map.of(
                     "status", "ok",
                     "supplier_code", supplier.supplierCode,
                     "system_id", supplier.smppUsername,
-                    "dest_addr", destAddr
+                    "dest_addr", destAddr,
+                    "gateway_message_id", gatewayMsgId != null ? gatewayMsgId : ""
                 ));
             } catch (Exception e) {
                 log.error("Deliver handler error: {}", e.getMessage());

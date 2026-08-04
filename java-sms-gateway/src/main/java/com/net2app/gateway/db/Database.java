@@ -212,6 +212,49 @@ public class Database {
         return 1000; // default
     }
 
+    /**
+     * Insert a DLR receipt into dlr_outbox for the Node.js DlrPusher to deliver to clients.
+     */
+    public static void insertDlrOutbox(String messageId, String status, String receipt) {
+        String sql = """
+            INSERT INTO dlr_outbox (message_id, status, dlr_receipt, created_at)
+            VALUES (?, ?, ?, NOW())
+            ON CONFLICT (message_id) DO UPDATE SET
+                status = EXCLUDED.status,
+                dlr_receipt = EXCLUDED.dlr_receipt,
+                completed_at = NULL,
+                smpp_pushed = false
+            """;
+        try (Connection conn = getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, messageId);
+            ps.setString(2, status);
+            ps.setString(3, receipt);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            log.error("Insert DLR outbox error: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Store the gateway-assigned message_id from submit_sm_resp.
+     * This is the ID that will appear in deliver_sm DLR receipts from the gateway.
+     */
+    public static void updateSmppMessageId(String ourMessageId, String gatewayMsgId) {
+        String sql = "UPDATE sms_logs SET smpp_message_id = ? WHERE message_id = ?";
+        try (Connection conn = getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, gatewayMsgId);
+            ps.setString(2, ourMessageId);
+            int updated = ps.executeUpdate();
+            if (updated > 0) {
+                log.info("Stored gateway msgId={} for our msgId={}", gatewayMsgId, ourMessageId);
+            }
+        } catch (SQLException e) {
+            log.error("Update smpp_message_id error: {}", e.getMessage());
+        }
+    }
+
     public static void updateDlr(String messageId, String state) {
         String dlrStatus = switch (state) {
             case "1" -> "DELIVRD";

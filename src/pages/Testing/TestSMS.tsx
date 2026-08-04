@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
-import { Send, TrendingUp, TrendingDown } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
+import { Send, TrendingUp, TrendingDown, ExternalLink } from 'lucide-react';
 import { useData } from '../../store/DataContext';
 import { api, smsApi } from '../../services/api';
 import { Card } from '../../components/UI/Card';
@@ -21,6 +22,7 @@ interface TestResult {
 }
 
 export const TestSMS: React.FC = () => {
+  const navigate = useNavigate();
   const { clients, routePlans, rates, mccmnc, suppliers, routes, trunks } = useData();
   const [formData, setFormData] = useState({
     client_id: '',
@@ -384,6 +386,12 @@ export const TestSMS: React.FC = () => {
           {/* Results */}
           {results.length > 0 && (
             <Card title={`Test Results (${results.length})`} noPadding>
+              <div className="flex items-center justify-between px-4 py-2 bg-gray-50 border-b">
+                <span className="text-xs text-gray-500">{results.length} message(s) sent</span>
+                <button onClick={() => navigate('/sms-logs')} className="flex items-center gap-1 text-xs text-blue-600 hover:text-blue-800 font-medium transition-colors">
+                  <ExternalLink size={12} /> View in SMS Logs
+                </button>
+              </div>
               <div className="divide-y divide-gray-100 max-h-[400px] overflow-y-auto">
                 {results.map(r => (
                   <div key={r.id} className={`px-4 py-3 ${r.status === 'delivered' ? 'bg-green-50' : r.status === 'rejected' || r.status === 'failed' ? 'bg-red-50' : 'bg-gray-50'}`}>

@@ -140,11 +140,14 @@ let connectionPoolMgr = null;
         queueManager.onDeliverToInboundSupplier = async (supplierId, job) => {
             try {
                 const http = require('http');
+                const ourMsgId = job.message_id || '';
+                console.error(`[InboundDeliver] → Sending ${ourMsgId} to supplier #${supplierId} (sender=${job.sender_id} dest=${job.destination})`);
                 const payload = JSON.stringify({
                     supplier_id: supplierId,
                     source_addr: job.sender_id || 'NET2APP',
                     dest_addr: job.destination,
-                    message: job.message || ''
+                    message: job.message || '',
+                    our_message_id: ourMsgId
                 });
                 const result = await new Promise((resolve, reject) => {
                     const req = http.request({
@@ -170,7 +173,20 @@ let connectionPoolMgr = null;
                     req.write(payload);
                     req.end();
                 });
-                console.error(`[InboundDeliver] ✓ ${job.message_id}: Delivered via Java gateway to supplier #${supplierId}`);
+
+                // Store the gateway's message_id (from test192) so DLR deliver_sm receipts
+                // from the GSM modem can be matched back to our sms_logs.
+                // test192 sends DLRs with its own msgId format (e.g. 0030f100221f-582550200).
+                const gatewayMsgId = result?.gateway_message_id || '';
+                if (ourMsgId && gatewayMsgId) {
+                    await pool.query(
+                        `UPDATE sms_logs SET smpp_message_id = $1 WHERE message_id = $2 AND smpp_message_id IS NULL`,
+                        [gatewayMsgId, ourMsgId]
+                    ).catch(e => console.error(`[InboundDeliver] ⚠ Failed to store smpp_message_id for ${ourMsgId}: ${e.message}`));
+                    console.error(`[InboundDeliver] ✓ ${ourMsgId}: Delivered via Java gateway → supplier #${supplierId}, gateway msgId=${gatewayMsgId}`);
+                } else {
+                    console.error(`[InboundDeliver] ✓ ${ourMsgId}: Delivered via Java gateway to supplier #${supplierId} (no gateway msgId in response)`);
+                }
                 return true;
             } catch (e) {
                 console.error(`[InboundDeliver] ✗ ${job.message_id}: Failed — ${e.message}`);
