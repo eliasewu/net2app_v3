@@ -23,6 +23,9 @@ interface VoiceCall {
   supplier_name: string;
   reconnect_trace: string[];
   billing_status: string;
+  client_rate: number;
+  supplier_rate: number;
+  profit: number;
 }
 
 export const VoiceOTP: React.FC = () => {
@@ -289,6 +292,10 @@ export const VoiceOTP: React.FC = () => {
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">OTP</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Dial Result</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Client €</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Supplier €</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Profit €</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Billing</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Duration</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Supplier</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Retries</th>
@@ -337,6 +344,24 @@ export const VoiceOTP: React.FC = () => {
                       )}
                     </td>
                     <td className="px-4 py-3 text-sm">{call.supplier_code || call.supplier_name || (call.supplier_id ? `#${call.supplier_id}` : '—')}</td>
+                    <td className="px-4 py-3 text-sm font-mono">{call.client_rate != null ? `€${Number(call.client_rate).toFixed(4)}` : '—'}</td>
+                    <td className="px-4 py-3 text-sm font-mono">{call.supplier_rate != null ? `€${Number(call.supplier_rate).toFixed(4)}` : '—'}</td>
+                    <td className="px-4 py-3 text-sm font-mono">
+                      {call.profit != null ? (
+                        <span className={Number(call.profit) > 0 ? 'text-emerald-600' : Number(call.profit) < 0 ? 'text-red-600' : 'text-gray-500'}>
+                          €{Number(call.profit).toFixed(4)}
+                        </span>
+                      ) : '—'}
+                    </td>
+                    <td className="px-4 py-3">
+                      {call.billing_status === 'billed' ? (
+                        <span className="px-2 py-0.5 bg-emerald-100 text-emerald-700 rounded-full text-xs font-medium">Billed</span>
+                      ) : call.billing_status === 'pending' ? (
+                        <span className="px-2 py-0.5 bg-gray-100 text-gray-500 rounded-full text-xs">Pending</span>
+                      ) : (
+                        <span className="text-gray-400 text-xs">—</span>
+                      )}
+                    </td>
                     <td className="px-4 py-3 text-sm">
                       <span className={call.retry_count > 0 ? 'text-orange-600 font-medium' : ''}>
                         {call.retry_count}/{call.max_retries}
@@ -362,21 +387,21 @@ export const VoiceOTP: React.FC = () => {
                           <RotateCcw className="w-4 h-4" />
                         </button>
                       )}
-                      {call.billing_status === 'billed' && (
-                        <span className="ml-1 px-1.5 py-0.5 bg-emerald-100 text-emerald-700 rounded text-xs">$</span>
-                      )}
+  
                     </td>
                   </tr>
                   {/* Expandable detail row */}
                   {expandedRows.has(call.id) && (
                     <tr key={`detail-${call.id}`}>
-                      <td colSpan={11} className="px-6 py-3 bg-gray-50 border-b">
+                      <td colSpan={15} className="px-6 py-3 bg-gray-50 border-b">
                         <div className="space-y-2 text-sm">
                           <div className="flex flex-wrap gap-x-6 gap-y-1">
                             <span className="text-gray-500">Call ID: <span className="font-mono text-gray-700">{call.call_id}</span></span>
                             <span className="text-gray-500">Language: <span className="text-gray-700">{call.language || '—'}</span></span>
                             <span className="text-gray-500">Billing: <span className={`font-medium ${call.billing_status === 'billed' ? 'text-emerald-600' : 'text-gray-500'}`}>{call.billing_status || 'pending'}</span></span>
-                            <span className="text-gray-500">Cost: <span className="text-gray-700">{call.total_cost ? `€${Number(call.total_cost).toFixed(4)}` : '—'}</span></span>
+                            <span className="text-gray-500">Client Rate: <span className="text-gray-700">{call.client_rate != null ? `€${Number(call.client_rate).toFixed(4)}` : '—'}</span></span>
+                            <span className="text-gray-500">Supplier Rate: <span className="text-gray-700">{call.supplier_rate != null ? `€${Number(call.supplier_rate).toFixed(4)}` : '—'}</span></span>
+                            <span className="text-gray-500">Profit: <span className={`font-medium ${Number(call.profit||0) > 0 ? 'text-emerald-600' : Number(call.profit||0) < 0 ? 'text-red-600' : 'text-gray-700'}`}>{call.profit != null ? `€${Number(call.profit).toFixed(4)}` : '—'}</span></span>
                           </div>
                           {call.error_message && (
                             <div className="bg-red-50 border border-red-200 rounded p-2">
@@ -404,7 +429,7 @@ export const VoiceOTP: React.FC = () => {
               ))}
               {calls.length === 0 && (
                 <tr>
-                  <td colSpan={11} className="px-6 py-8 text-center text-gray-500">
+                  <td colSpan={15} className="px-6 py-8 text-center text-gray-500">
                     No voice OTP calls yet
                   </td>
                 </tr>

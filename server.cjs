@@ -5691,7 +5691,7 @@ app.post('/api/voice-otp/test', auth, async (req, res) => {
 app.post('/api/voice-otp/logs', auth, async (req, res) => {
     try {
         const f = req.body || {};
-        let q = 'SELECT vl.*, s.supplier_code, s.company_name AS supplier_name FROM voice_otp_logs vl LEFT JOIN suppliers s ON s.id = vl.supplier_id WHERE 1=1';
+        let q = 'SELECT vl.*, s.supplier_code, s.company_name AS supplier_name, sms.client_rate, sms.supplier_rate, sms.profit FROM voice_otp_logs vl LEFT JOIN suppliers s ON s.id = vl.supplier_id LEFT JOIN sms_logs sms ON sms.message_id = vl.call_id WHERE 1=1';
         const p = []; let i = 1;
         if (f.status)    { q += ` AND vl.status = $${i++}`; p.push(f.status); }
         if (f.dlr_status){ q += ` AND vl.dlr_status = $${i++}`; p.push(f.dlr_status); }
@@ -5708,7 +5708,7 @@ app.post('/api/voice-otp/logs', auth, async (req, res) => {
 app.get('/api/voice-otp/logs', auth, async (req, res) => {
     try {
         const result = await pool.query(
-            'SELECT vl.*, s.supplier_code, s.company_name AS supplier_name FROM voice_otp_logs vl LEFT JOIN suppliers s ON s.id = vl.supplier_id ORDER BY vl.created_at DESC LIMIT 500'
+            'SELECT vl.*, s.supplier_code, s.company_name AS supplier_name, sms.client_rate, sms.supplier_rate, sms.profit FROM voice_otp_logs vl LEFT JOIN suppliers s ON s.id = vl.supplier_id LEFT JOIN sms_logs sms ON sms.message_id = vl.call_id ORDER BY vl.created_at DESC LIMIT 500'
         );
         res.json({ success: true, data: result.rows });
     } catch (e) { res.status(500).json({ error: e.message }); }

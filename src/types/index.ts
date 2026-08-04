@@ -515,6 +515,13 @@ export interface VoiceOTPLog {
   next_retry_at: string | null;
   created_at: string;
   completed_at: string | null;
+  // Billing
+  client_cost?: number;
+  total_cost?: number;
+  billing_status?: string;
+  client_rate?: number;
+  supplier_rate?: number;
+  profit?: number;
 }
 
 // ==================== API CONNECTOR ====================
