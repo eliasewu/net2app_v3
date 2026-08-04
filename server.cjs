@@ -5485,7 +5485,7 @@ async function handleVoiceOtpSend(req, res) {
         if (destMcc && sipServers.length > 1) {
             for (const srv of sipServers) {
                 const allowed = (srv.mccmnc_allowed || "").split(",").map(s => s.trim()).filter(Boolean);
-                if (allowed.includes(destMcc) || allowed.includes("*")) { selectedServer = srv; break; }
+                if (allowed.includes(destMcc) || allowed.includes(destMcc + '*') || allowed.includes('*')) { selectedServer = srv; break; }
             }
         }
 
