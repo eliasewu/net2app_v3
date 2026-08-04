@@ -73,7 +73,7 @@ function pcm16ToUlaw(pcm) {
 function cleanAudio(pcmBuf, callId) {
   if (!pcmBuf || pcmBuf.length < 2) return pcmBuf;
   const samples = Math.floor(pcmBuf.length / 2);
-  const GATE_THRESHOLD = 250;   // mute abs < 250 (~ -42dBFS — background hiss)
+  const GATE_THRESHOLD = 100;   // mute abs < 100 (~ -50dBFS — only true background hiss)
   const TARGET_RMS = 7000;      // target RMS (~ -13dBFS — good telephone level)
   const MAX_PEAK = 30000;       // hard clip ceiling to prevent G.711 distortion
   const KNEE_WIDTH = 80;        // soft knee transition zone
