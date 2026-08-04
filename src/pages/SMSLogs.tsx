@@ -362,12 +362,32 @@ export const SMSLogs: React.FC = () => {
         </span>
       </div>;
     } },
-    { key:'rates', header:'Charge', align:'right' as const, hideOnMobile:true, render:(log:ExtendedLog) => {
-      if (!log.client_rate) return <span className="text-xs text-gray-400">—</span>;
+    { key:'client_rate', header:'Client €', align:'right' as const, hideOnMobile:true, render:(log:ExtendedLog) => {
+      if (!log.client_rate || log.client_rate === 0) return <span className="text-xs text-gray-400">—</span>;
+      const charged = log.is_billed;
+      return <span className={`text-xs font-mono font-medium ${charged ? 'text-gray-700' : 'text-red-400 line-through'}`}>
+        €{Number(log.client_rate).toFixed(4)}
+      </span>;
+    } },
+    { key:'supplier_rate', header:'Supplier €', align:'right' as const, hideOnMobile:true, render:(log:ExtendedLog) => {
+      if (!log.supplier_rate || log.supplier_rate === 0) return <span className="text-xs text-gray-400">—</span>;
+      return <span className="text-xs font-mono text-gray-500">€{Number(log.supplier_rate).toFixed(4)}</span>;
+    } },
+    { key:'profit', header:'Profit €', align:'right' as const, hideOnMobile:true, render:(log:ExtendedLog) => {
+      if (log.profit == null) return <span className="text-xs text-gray-400">—</span>;
+      const p = Number(log.profit);
+      return <span className={`text-xs font-mono font-medium ${p > 0 ? 'text-emerald-600' : p < 0 ? 'text-red-600' : 'text-gray-500'}`}>
+        €{p.toFixed(4)}
+      </span>;
+    } },
+    { key:'billing', header:'Billing', hideOnMobile:true, render:(log:ExtendedLog) => {
       if (log.is_billed) {
-        return <div className="text-[10px]"><p className="text-gray-600">€{Number(log.client_rate).toFixed(4)}</p><p className="text-green-600">+€{Number(log.profit||0).toFixed(4)}</p></div>;
+        return <Badge variant="success" size="sm">Billed</Badge>;
       }
-      return <div className="text-[10px]"><p className="text-red-500">€0.00</p><p className="text-gray-400">not charged</p></div>;
+      if (log.client_rate && log.client_rate > 0 && !log.is_billed) {
+        return <Badge variant="warning" size="sm">Pending</Badge>;
+      }
+      return <span className="text-xs text-gray-400">—</span>;
     } },
     { key:'send', header:'Send Result', render:(log:ExtendedLog) => getSendResult(log) },
     { key:'dlr', header:'Deliver Result', hideOnMobile:true, render:(log:ExtendedLog) => getDeliverResult(log) },
