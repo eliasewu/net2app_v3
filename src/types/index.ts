@@ -2,7 +2,7 @@
 
 export type UserRole = 'super_admin' | 'admin' | 'support' | 'billing' | 'agent' | 'client' | 'supplier';
 
-export type ConnectionType = 'smpp' | 'http' | 'rcs' | 'flash_sms' | 'ott_whatsapp' | 'ott_telegram' | 'voice_otp' | 'local_bypass';
+export type ConnectionType = 'smpp' | 'http' | 'rcs' | 'flash_sms' | 'ott_whatsapp' | 'ott_telegram' | 'voice_otp' | 'local_bypass' | 'android_SMS';
 
 export type BillingMode = 'submit' | 'dlr' | 'credit';
 

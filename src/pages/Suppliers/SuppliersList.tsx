@@ -101,6 +101,7 @@ export const SuppliersList: React.FC = () => {
       voice_otp: { label: 'Voice OTP', variant: 'warning' },
       local_bypass: { label: 'Local Bypass', variant: 'default' },
       rcs: { label: 'RCS', variant: 'purple' },
+      android_SMS: { label: 'Android SMS', variant: 'success' },
     };
     const config = typeMap[type] || { label: type.toUpperCase(), variant: 'default' as const };
     return <Badge variant={config.variant}>{config.label}</Badge>;
@@ -379,6 +380,7 @@ export const SuppliersList: React.FC = () => {
               <option value="all">All Types</option>
               <option value="smpp">SMPP</option>
               <option value="http">HTTP API</option>
+              <option value="android_SMS">Android SMS</option>
               <option value="ott_whatsapp">WhatsApp</option>
               <option value="ott_telegram">Telegram</option>
               <option value="voice_otp">Voice OTP</option>

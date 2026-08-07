@@ -54,7 +54,31 @@ export const SupplierRates: React.FC = () => {
   const [formData, setFormData] = useState({ entity_id:'', mcc:'', country:'', rate:0, effective_from: new Date().toISOString().split('T')[0], is_active:true });
   const itemsPerPage = 20;
 
-  const supplierRates = allRates.filter(r => r.entity_type === 'supplier');
+  // Build a set of known supplier IDs for filtering out orphaned rates.
+  const knownSupplierIds = new Set(suppliers.map(s => String(s.id)));
+
+  // Show only current active + last active rate per destination.
+  // Groups by (entity_id, mcc, mnc), keeps active rate + most recent inactive.
+  // Excludes rates for unknown/deleted suppliers.
+  const supplierRates = (() => {
+    const allSupplierRates = allRates.filter(r => r.entity_type === 'supplier' && knownSupplierIds.has(String(r.entity_id)));
+    const groups = new Map<string, Rate[]>();
+    for (const r of allSupplierRates) {
+      const key = `${r.entity_id}|${r.mcc}|${r.mnc}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key)!.push(r);
+    }
+    const result: Rate[] = [];
+    for (const [, rates] of groups) {
+      const sorted = rates.sort((a, b) => new Date(b.effective_from).getTime() - new Date(a.effective_from).getTime());
+      const active = sorted.find(r => r.is_active);
+      const lastInactive = sorted.find(r => !r.is_active);
+      if (active) result.push(active);
+      if (lastInactive && lastInactive !== active) result.push(lastInactive);
+      if (!active && lastInactive) result.push(lastInactive);
+    }
+    return result;
+  })();
   const [countries, setCountries] = useState<string[]>([]);
   const [countryOps, setCountryOps] = useState<typeof mccmnc>([]);
 
@@ -248,7 +272,7 @@ export const SupplierRates: React.FC = () => {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <div><h1 className="text-2xl font-bold text-gray-800">Supplier Rates</h1><p className="text-gray-500 mt-1">{supplierRates.filter(r => r.is_active).length} active / {supplierRates.length} total — % change shows rate movement</p></div>
+        <div><h1 className="text-2xl font-bold text-gray-800">Supplier Rates</h1><p className="text-gray-500 mt-1">{supplierRates.filter(r => r.is_active).length} active rates · showing current + last rate per destination — full history available via 🕐 icon</p></div>
         <div className="flex gap-2"><Button variant="secondary" icon={<RefreshCw size={16}/>} onClick={()=>{setSupplierFilter(supplierFilter!=='all'?supplierFilter:'');setShowBulkModal(true);}}>Bulk Update</Button><Button variant="secondary" icon={<Download size={16}/>} onClick={handleExportCSV}>Export CSV</Button><Button icon={<Plus size={18}/>} onClick={()=>openModal()}>Add Rate</Button></div>
       </div>
 

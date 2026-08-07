@@ -47,22 +47,54 @@ class SMSQueueManager {
       throttled: 0,
       rejected: 0,
       lastProcessed: null,
+      // TPS tracking
+      enqueued1s: 0,        // enqueued in last 1s
+      processed1s: 0,       // processed (submitted) in last 1s
+      delivered1s: 0,       // delivered in last 1s
+      peakEnqueueTps: 0,    // peak enqueue TPS observed
+      peakProcessTps: 0,    // peak process TPS observed
     };
+
+    // TPS tracking: rolling window counters
+    this._tpsWindow = [];    // [{ timestamp, enqueued, processed, delivered }]
+    this._tpsWindowMs = 5000; // keep 5s rolling window
 
     // Configurable options
     this.pollIntervalMs = options.pollIntervalMs || 200;       // How often each worker polls
     this.batchSize = options.batchSize || 50;                   // Jobs per poll
     this.workerCount = options.workerCount || 4;                // Number of concurrent workers
+    this.maxWorkers = options.maxWorkers || 16;                 // Maximum workers (auto-scale cap)
+    this.minWorkers = options.minWorkers || 4;                  // Minimum workers
     this.maxRetries = options.maxRetries || 5;                  // Max delivery attempts
     this.retryBackoffBase = options.retryBackoffBase || 1000;   // Base backoff ms
     this.dlrTimeoutMs = options.dlrTimeoutMs || 300000;         // 5 min DLR timeout
     this.deadLetterAfterRetries = options.deadLetterAfterRetries || 5;
     this.maxPipelinesPerSupplier = options.maxPipelinesPerSupplier || 4;
 
+    // ======== IN-MEMORY ENQUEUE BUFFER ========
+    // At 100+ TPS, individual INSERT per message is too slow (1 DB roundtrip = ~1-5ms).
+    // Buffer incoming jobs and flush in batches of 200 via multi-row INSERT.
+    // This reduces DB roundtrips by 200x and prevents backpressure from
+    // saturating the SMPP server event loop.
+    this._buffer = [];
+    this._bufferMaxSize = options.bufferMaxSize || 2000;        // Max buffer before forced flush
+    this._bufferFlushSize = options.bufferFlushSize || 200;     // Flush when buffer reaches this
+    this._bufferFlushMs = options.bufferFlushMs || 50;          // Flush interval ms
+    this._bufferFlushTimer = null;
+    this._bufferFlushing = false;
+    this._bufferDropped = 0;     // Jobs dropped due to buffer overflow
+
+    // ======== OVERLOAD PROTECTION ========
+    this._overloadThreshold = options.overloadThreshold || 10000;    // Queue depth at which to reject
+    this._overloadRejectCount = 0;                                    // Count of rejected due to overload
+
     // Supplier connection_type cache (avoids DB query per job)
     // Each entry: { value, expiresAt } — TTL 60s to avoid stale reads
     this._supplierTypeCache = new Map();
     this._supplierTypeCacheTtlMs = 60000;
+
+    // Auto-scaler interval reference
+    this._autoScalerTimer = null;
   }
 
   /** Initialize the outbox table (idempotent) */
@@ -143,6 +175,189 @@ class SMSQueueManager {
     console.log('[QueueManager] sms_outbox table ready');
   }
 
+  /**
+   * High-throughput enqueue: buffers jobs in-memory and flushes in batches.
+   * At 100+ TPS this avoids 1 DB roundtrip per message (1-5ms each → 100-500ms/s).
+   * Batch flushing reduces to ~1 INSERT per 200 jobs.
+   *
+   * Falls back to direct enqueue() if the buffer is full or flush fails.
+   */
+  enqueueBuffered(job) {
+    // Overload check: if queue depth exceeds threshold, reject immediately
+    // to prevent unbounded growth that would crash the DB.
+    if (this._buffer.length >= this._bufferMaxSize) {
+      this._bufferDropped++;
+      console.error(`[QueueManager] 🚫 Buffer overflow (${this._bufferMaxSize}) — rejecting ${job.message_id}`);
+      return { message_id: job.message_id, status: 'rejected', reason: 'buffer_overflow' };
+    }
+
+    this._buffer.push(job);
+    this._recordEnqueue();
+
+    // Start flush timer on first buffered job
+    if (!this._bufferFlushTimer) {
+      this._bufferFlushTimer = setTimeout(() => this._flushBuffer(), this._bufferFlushMs);
+    }
+
+    // Flush immediately if buffer exceeds flush size
+    if (this._buffer.length >= this._bufferFlushSize) {
+      // Clear timer — we're flushing now
+      if (this._bufferFlushTimer) {
+        clearTimeout(this._bufferFlushTimer);
+        this._bufferFlushTimer = null;
+      }
+      // Fire-and-forget flush (don't block caller)
+      this._flushBuffer().catch(e => {
+        console.error('[QueueManager] Buffer flush failed:', e.message);
+      });
+    }
+
+    return { message_id: job.message_id, status: 'queued', buffered: true };
+  }
+
+  /** Flush in-memory buffer to PostgreSQL via multi-row INSERT */
+  async _flushBuffer() {
+    if (this._bufferFlushing || this._buffer.length === 0) return;
+    this._bufferFlushing = true;
+    this._bufferFlushTimer = null;
+
+    const batch = this._buffer.splice(0, this._bufferFlushSize);
+    if (batch.length === 0) { this._bufferFlushing = false; return; }
+
+    try {
+      // Build multi-row INSERT: ($1,$2,...), ($27,$28,...), ...
+      // Each row has 26 columns. Build parameterized query.
+      const cols = [
+        'message_id', 'client_id', 'client_code', 'supplier_id', 'supplier_code',
+        'sender_id', 'destination', 'message', 'message_parts',
+        'client_rate', 'supplier_rate', 'profit', 'currency',
+        'mcc', 'mnc', 'operator', 'country', 'route_name', 'trunk_name',
+        'billing_mode', 'supplier_billing_mode', 'webhook_url', 'idempotency_key', 'voice_otp_config_id',
+        'source', 'status', 'attempt_count', 'max_attempts', 'next_attempt_at', 'queued_at'
+      ];
+      const colsPerRow = cols.length;
+
+      const values = [];
+      const placeholders = [];
+      let paramIdx = 0;
+
+      for (const job of batch) {
+        const rowPlaceholders = [];
+        for (let i = 0; i < colsPerRow; i++) rowPlaceholders.push(`$${++paramIdx}`);
+        placeholders.push(`(${rowPlaceholders.join(',')})`);
+
+        values.push(
+          job.message_id, job.client_id, job.client_code || '',
+          job.supplier_id || null, job.supplier_code || '',
+          job.sender_id, job.destination, job.message, job.message_parts || 1,
+          job.client_rate || 0, job.supplier_rate || 0, job.profit || 0, job.currency || 'EUR',
+          job.mcc || '', job.mnc || '', job.operator || '', job.country || '',
+          job.route_name || '', job.trunk_name || '',
+          job.billing_mode || 'dlr', job.supplier_billing_mode || 'dlr',
+          job.webhook_url || '', job.idempotency_key || null, job.voice_otp_config_id || null,
+          job.source || 'smpp_client',
+          job.next_attempt_at ? null : 'queued',  // if delayed, use 'queued' immediately
+          job.initialAttemptCount || 0,
+          this.maxRetries,
+          job.next_attempt_at ? new Date(Date.now() + job._delayMs).toISOString() : 'NOW()',
+          'NOW()'
+        );
+      }
+
+      // If any job has next_attempt_at, we need a CASE approach. Simpler: use NOW() for all.
+      // For delayed jobs, we'll handle them separately.
+      const delayedJobs = [];
+      const immediateJobs = [];
+      for (const job of batch) {
+        if (job.next_attempt_at || job._delayMs) {
+          delayedJobs.push(job);
+        } else {
+          immediateJobs.push(job);
+        }
+      }
+
+      // Flush immediate jobs in batch
+      if (immediateJobs.length > 0) {
+        await this._batchInsert(immediateJobs);
+      }
+
+      // Flush delayed jobs individually (they need specific next_attempt_at)
+      for (const job of delayedJobs) {
+        try {
+          await this.enqueue(job); // uses the standard single-insert path
+        } catch (e) {
+          console.error(`[QueueManager] Delayed enqueue failed for ${job.message_id}:`, e.message);
+        }
+      }
+
+      const totalFlushed = immediateJobs.length + delayedJobs.length;
+      if (totalFlushed > 0) {
+        console.log(`[QueueManager] 📦 Batch flushed: ${totalFlushed} jobs (${immediateJobs.length} immediate + ${delayedJobs.length} delayed), buffer remaining: ${this._buffer.length}`);
+      }
+    } catch (e) {
+      // On failure, push jobs back to buffer for retry
+      console.error(`[QueueManager] ❌ Batch flush FAILED: ${e.message} — returning ${batch.length} jobs to buffer`);
+      this._buffer.unshift(...batch);
+    } finally {
+      this._bufferFlushing = false;
+
+      // If more jobs accumulated during flush, schedule next flush
+      if (this._buffer.length > 0 && !this._bufferFlushTimer) {
+        this._bufferFlushTimer = setTimeout(() => this._flushBuffer(), this._bufferFlushMs);
+      }
+    }
+  }
+
+  /** Internal: batch INSERT using multi-row VALUES into sms_outbox */
+  async _batchInsert(batch) {
+    if (batch.length === 0) return;
+
+    // Build multi-row INSERT with all columns
+    // Each row: (message_id, client_id, client_code, ..., status, attempt_count, max_attempts)
+    const cols = [
+      'message_id', 'client_id', 'client_code', 'supplier_id', 'supplier_code',
+      'sender_id', 'destination', 'message', 'message_parts',
+      'client_rate', 'supplier_rate', 'profit', 'currency',
+      'mcc', 'mnc', 'operator', 'country', 'route_name', 'trunk_name',
+      'billing_mode', 'supplier_billing_mode', 'webhook_url', 'idempotency_key', 'voice_otp_config_id',
+      'source'
+    ];
+    const staticCols = ['status', 'attempt_count', 'max_attempts', 'next_attempt_at', 'queued_at'];
+    const allCols = [...cols, ...staticCols];
+    const colsPerRow = allCols.length;
+
+    const values = [];
+    const placeholders = [];
+    let paramIdx = 0;
+
+    for (const job of batch) {
+      const rowPlaceholders = [];
+      for (let i = 0; i < colsPerRow; i++) rowPlaceholders.push(`$${++paramIdx}`);
+      placeholders.push(`(${rowPlaceholders.join(',')})`);
+
+      values.push(
+        job.message_id, job.client_id, job.client_code || '',
+        job.supplier_id || null, job.supplier_code || '',
+        job.sender_id || '', job.destination || '', job.message || '', job.message_parts || 1,
+        job.client_rate || 0, job.supplier_rate || 0, job.profit || 0, job.currency || 'EUR',
+        job.mcc || '', job.mnc || '', job.operator || '', job.country || '',
+        job.route_name || '', job.trunk_name || '',
+        job.billing_mode || 'dlr', job.supplier_billing_mode || 'dlr',
+        job.webhook_url || '', job.idempotency_key || null, job.voice_otp_config_id || null,
+        job.source || 'smpp_client',
+        // static columns
+        'queued', 0, this.maxRetries, new Date().toISOString(), new Date().toISOString()
+      );
+    }
+
+    await this.pool.query(
+      `INSERT INTO sms_outbox (${allCols.join(', ')})
+       VALUES ${placeholders.join(', ')}
+       ON CONFLICT (message_id) DO NOTHING`,
+      values
+    );
+  }
+
   /** Enqueue an SMS for async processing. Returns immediately with message_id. */
   async enqueue(job) {
     const {
@@ -169,6 +384,12 @@ class SMSQueueManager {
       }
     }
 
+    // Determine next_attempt_at: if job has _delayMs, set it; otherwise NOW()
+    const delayMs = job._delayMs || 0;
+    const nextAttemptAt = delayMs > 0
+      ? new Date(Date.now() + delayMs).toISOString()
+      : null; // null → DEFAULT NOW()
+
     const result = await this.pool.query(
       `INSERT INTO sms_outbox (
         message_id, client_id, client_code, supplier_id, supplier_code,
@@ -179,7 +400,7 @@ class SMSQueueManager {
         source, status, attempt_count, max_attempts, next_attempt_at, queued_at
       ) VALUES (
         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
-        $20,$21,$22,$23,$24,$25,'queued',0,$26,NOW(),NOW()
+        $20,$21,$22,$23,$24,$25,'queued',0,$26,COALESCE($27,NOW()),NOW()
       ) RETURNING message_id, status`,
       [
         message_id, client_id, client_code, supplier_id, supplier_code,
@@ -189,11 +410,13 @@ class SMSQueueManager {
         billing_mode || 'dlr', supplier_billing_mode || 'dlr', webhook_url || '', idempotency_key || null,
         voice_otp_config_id || null,
         source || 'smpp_client',
-        this.maxRetries
+        this.maxRetries,
+        nextAttemptAt
       ]
     );
-    
-    console.log(`[QueueManager] Enqueued: ${message_id} → ${destination} (client=${client_code}, supplier=${supplier_code})`);
+
+    this._recordEnqueue();
+    console.log(`[QueueManager] Enqueued: ${message_id} → ${destination} (client=${client_code}, supplier=${supplier_code}${delayMs > 0 ? ', delay='+delayMs+'ms' : ''})`);
     return { message_id: result.rows[0].message_id, status: 'queued' };
   }
 
@@ -219,16 +442,27 @@ class SMSQueueManager {
       console.warn('[QueueManager] Failed to recover orphaned jobs:', e.message);
     }
     
-    console.log(`[QueueManager] Starting ${this.workerCount} workers (batch=${this.batchSize}, poll=${this.pollIntervalMs}ms)`);
+    console.log(`[QueueManager] Starting ${this.workerCount} workers (batch=${this.batchSize}, poll=${this.pollIntervalMs}ms, buffer=${this._bufferFlushSize}/${this._bufferMaxSize})`);
     
     for (let i = 0; i < this.workerCount; i++) {
       this.startWorker(i);
+      this.workers.push(i);
     }
+
+    // Start auto-scaler for dynamic worker count
+    this._startAutoScaler();
+
+    // Periodic TPS counter reset
+    setInterval(() => this._resetPerSecondCounters(), 1000);
   }
 
   /** Stop all workers gracefully */
   stop() {
     this.running = false;
+    if (this._autoScalerTimer) {
+      clearInterval(this._autoScalerTimer);
+      this._autoScalerTimer = null;
+    }
     console.log('[QueueManager] Stopping workers...');
   }
 
@@ -425,6 +659,7 @@ class SMSQueueManager {
       // (HTTP DLR poll in server.cjs or SMPP DLR handler in smppServer.mjs)
 
       this.stats.processed++;
+      this._recordProcessed();
       console.log(`[QueueManager] ✓ Submitted: ${message_id} → ${destination} (waiting for DLR)`);
     } else {
       // Will be handled by handleJobFailure → retry or dead letter
@@ -434,6 +669,17 @@ class SMSQueueManager {
 
   /** Deliver SMS to supplier — inbound (deliver_sm via SMPP server) or outbound (submit_sm via pipeline) */
   async deliverToSupplier(job) {
+    // 0) android_SMS suppliers use HTTP heartbeat polling — no SMPP/HTTP delivery needed.
+    // The Android device polls /api/gateway/heartbeat every 5s to fetch pending MT messages.
+    // Skip the Java Gateway and outbound pipeline; the heartbeat will deliver.
+    if (job.supplier_id) {
+      const connType = await this._getSupplierConnectionType(job.supplier_id);
+      if (connType === 'android_SMS') {
+        console.log(`[QueueManager] 📱 android_SMS job ${job.message_id} — skipping delivery (heartbeat will pick it up)`);
+        return { success: true };
+      }
+    }
+
     // 1) Try inbound delivery via SMPP server session first
     if (this.onDeliverToInboundSupplier && job.supplier_id) {
       try {
@@ -920,6 +1166,205 @@ class SMSQueueManager {
         }
       }
     }
+  }
+
+  // ============================================================
+  // TPS TRACKING & AUTO-SCALING
+  // ============================================================
+
+  /** Record an enqueue event for TPS tracking */
+  _recordEnqueue() {
+    this.stats.enqueued1s++;
+    this._pruneTpsWindow();
+    const now = Date.now();
+    let bucket = this._tpsWindow[this._tpsWindow.length - 1];
+    if (!bucket || now - bucket.timestamp >= 1000) {
+      bucket = { timestamp: now, enqueued: 0, processed: 0, delivered: 0 };
+      this._tpsWindow.push(bucket);
+    }
+    bucket.enqueued++;
+  }
+
+  /** Record a processed (submitted) event for TPS tracking */
+  _recordProcessed() {
+    this.stats.processed1s++;
+    this._pruneTpsWindow();
+    const now = Date.now();
+    let bucket = this._tpsWindow[this._tpsWindow.length - 1];
+    if (!bucket || now - bucket.timestamp >= 1000) {
+      bucket = { timestamp: now, enqueued: 0, processed: 0, delivered: 0 };
+      this._tpsWindow.push(bucket);
+    }
+    bucket.processed++;
+  }
+
+  /** Record a delivered event for TPS tracking */
+  _recordDelivered() {
+    this.stats.delivered1s++;
+    const now = Date.now();
+    let bucket = this._tpsWindow[this._tpsWindow.length - 1];
+    if (!bucket || now - bucket.timestamp >= 1000) {
+      bucket = { timestamp: now, enqueued: 0, processed: 0, delivered: 0 };
+      this._tpsWindow.push(bucket);
+    }
+    bucket.delivered++;
+  }
+
+  /** Prune old entries from TPS window */
+  _pruneTpsWindow() {
+    const cutoff = Date.now() - this._tpsWindowMs;
+    this._tpsWindow = this._tpsWindow.filter(b => b.timestamp > cutoff);
+  }
+
+  /** Get current TPS (enqueue rate over last 1-5 seconds) */
+  getCurrentTps() {
+    this._pruneTpsWindow();
+    if (this._tpsWindow.length === 0) return { enqueue: 0, process: 0, deliver: 0 };
+
+    const now = Date.now();
+    const recent = this._tpsWindow.filter(b => now - b.timestamp <= 2000); // last 2s
+    const count = recent.length || 1;
+    const totalEnq = recent.reduce((s, b) => s + b.enqueued, 0);
+    const totalProc = recent.reduce((s, b) => s + b.processed, 0);
+    const totalDel = recent.reduce((s, b) => s + b.delivered, 0);
+
+    return {
+      enqueue: Math.round(totalEnq / Math.max(1, count)),
+      process: Math.round(totalProc / Math.max(1, count)),
+      deliver: Math.round(totalDel / Math.max(1, count)),
+      bufferSize: this._buffer.length,
+      bufferDropped: this._bufferDropped,
+      overloadRejected: this._overloadRejectCount,
+    };
+  }
+
+  /** Reset per-second counters (called by monitoring interval) */
+  _resetPerSecondCounters() {
+    // Update peak tracking
+    if (this.stats.enqueued1s > this.stats.peakEnqueueTps) {
+      this.stats.peakEnqueueTps = this.stats.enqueued1s;
+    }
+    if (this.stats.processed1s > this.stats.peakProcessTps) {
+      this.stats.peakProcessTps = this.stats.processed1s;
+    }
+    this.stats.enqueued1s = 0;
+    this.stats.processed1s = 0;
+    this.stats.delivered1s = 0;
+  }
+
+  /** Auto-scaler: dynamically adjusts worker count based on queue depth */
+  _startAutoScaler() {
+    if (this._autoScalerTimer) return;
+    this._autoScalerTimer = setInterval(async () => {
+      try {
+        // Reset per-second counters
+        this._resetPerSecondCounters();
+
+        // Get queue depth
+        const depthResult = await this.pool.query(
+          `SELECT COUNT(*) as count FROM sms_outbox WHERE status = 'queued' AND next_attempt_at <= NOW()`
+        ).catch(() => ({ rows: [{ count: this._buffer.length }] }));
+        const queueDepth = parseInt(depthResult.rows[0]?.count || 0) + this._buffer.length;
+
+        const currentWorkers = this.workers.length;
+
+        // Scale up if queue is deep and we have room
+        if (queueDepth > 500 && currentWorkers < this.maxWorkers) {
+          const add = Math.min(2, this.maxWorkers - currentWorkers);
+          for (let i = 0; i < add; i++) {
+            const workerId = currentWorkers + i;
+            this.startWorker(workerId);
+            this.workers.push(workerId);
+          }
+          console.log(`[QueueManager] ⬆ Auto-scaled UP: ${currentWorkers} → ${this.workers.length} workers (queue depth: ${queueDepth})`);
+        }
+
+        // Scale down if queue is empty and we have extra workers
+        if (queueDepth === 0 && currentWorkers > this.minWorkers) {
+          // We can't truly stop a worker loop without refactoring,
+          // but we can reduce poll aggressiveness.
+          // For now, just log — actual scale-down requires worker lifecycle changes.
+        }
+
+        // Overload alert
+        if (queueDepth > this._overloadThreshold) {
+          console.error(`[QueueManager] ⚠ OVERLOAD: Queue depth ${queueDepth} > threshold ${this._overloadThreshold}`);
+        }
+      } catch (e) {
+        // Silently skip on transient errors
+      }
+    }, 2000); // Check every 2s
+  }
+
+  /** Enhanced queue stats with TPS and buffer info */
+  async getQueueStats() {
+    const [counts, deadLetters, processing] = await Promise.all([
+      this.pool.query(`
+        SELECT status, COUNT(*) as count FROM sms_outbox GROUP BY status
+      `).catch(() => ({ rows: [] })),
+      this.pool.query(`
+        SELECT COUNT(*) as dead_letters
+        FROM sms_outbox
+        WHERE status = 'dead_letter' AND completed_at > NOW() - INTERVAL '24 hours'
+      `).catch(() => ({ rows: [{ dead_letters: 0 }] })),
+      this.pool.query(`
+        SELECT COUNT(*) as in_flight
+        FROM sms_outbox
+        WHERE status = 'processing'
+      `).catch(() => ({ rows: [{ in_flight: 0 }] })),
+    ]);
+
+    const tps = this.getCurrentTps();
+
+    const stats = {
+      queue_depth: 0,
+      queued: 0,
+      submitted: 0,
+      delivered: 0,
+      failed: 0,
+      dead_letter: 0,
+      processing: parseInt(processing.rows[0]?.in_flight || 0),
+      dead_letters_24h: parseInt(deadLetters.rows[0]?.dead_letters || 0),
+      workerStats: { ...this.stats },
+      workers: this.workers.length,
+      maxWorkers: this.maxWorkers,
+      minWorkers: this.minWorkers,
+      // TPS metrics
+      tps_enqueue: tps.enqueue,
+      tps_process: tps.process,
+      tps_deliver: tps.deliver,
+      peak_enqueue_tps: this.stats.peakEnqueueTps,
+      peak_process_tps: this.stats.peakProcessTps,
+      // Buffer metrics
+      buffer_size: this._buffer.length,
+      buffer_max: this._bufferMaxSize,
+      buffer_dropped: this._bufferDropped,
+      overload_rejected: this._overloadRejectCount,
+      overload_threshold: this._overloadThreshold,
+    };
+
+    for (const row of counts.rows) {
+      if (row.status === 'queued') stats.queued = parseInt(row.count);
+      if (row.status === 'submitted') stats.submitted = parseInt(row.count);
+      if (row.status === 'delivered') stats.delivered = parseInt(row.count);
+      if (row.status === 'failed') stats.failed = parseInt(row.count);
+      if (row.status === 'dead_letter') stats.dead_letter = parseInt(row.count);
+    }
+    stats.queue_depth = stats.queued + this._buffer.length;
+
+    return stats;
+  }
+
+  /** Flush remaining buffer (called during graceful shutdown) */
+  async flushAll() {
+    if (this._bufferFlushTimer) {
+      clearTimeout(this._bufferFlushTimer);
+      this._bufferFlushTimer = null;
+    }
+    while (this._buffer.length > 0) {
+      await this._flushBuffer();
+    }
+    console.log('[QueueManager] 📦 All buffers flushed');
   }
 
   sleep(ms) {

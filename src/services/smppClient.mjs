@@ -23,7 +23,8 @@ class SmppClient {
     this.connected = false;
     this.bound = false;
     this.reconnectAttempts = 0;
-    this.maxReconnectAttempts = 10;
+    this.maxReconnectAttempts = 5;       // Reduced from 10 — faster to give up on broken connections
+    this._wasEverBound = false;          // Tracks whether we've ever successfully bound
     this._connecting = false; // guard against concurrent connect calls
     this._connectResolved = false; // guard against double-resolve in connect()
     this._unboundSynced = false; // guard against double _syncBindStatus('unbound')
@@ -77,6 +78,7 @@ class SmppClient {
             this.connected = true;
             this.bound = true;
             this.reconnectAttempts = 0;
+            this._wasEverBound = true;
             this._connectResolved = true;
             this._unboundSynced = false;
             const negotiatedVer = pdu.sc_interface_version || pdu.interface_version;
@@ -330,13 +332,37 @@ class SmppClient {
   }
 
   reconnect() {
+    // ── Anti-thundering-herd: add random jitter (±30%) so multiple
+    // pipelines from the same supplier don't reconnect simultaneously.
+    // Without jitter, 4 pipelines fire their reconnect timers at the
+    // same cadence and create 4× the event-loop pressure.
+    const jit = 1 + (Math.random() - 0.5) * 0.6; // 0.7x to 1.3x multiplier
+
+    // ── Bind-failure cool-down: if we've NEVER successfully bound
+    // after 3 retries, the failure is likely permanent (wrong credentials,
+    // max sessions reached, etc.). Use 60-120s delays instead of normal backoff.
+    // Kicks in on the 4th reconnect() call (after attempts 1-3 all failed).
+    const isPermanentFailure = !this._wasEverBound && this.reconnectAttempts >= 3;
+
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.log(`[SMPP-CLIENT] ${this.supplier.supplier_code}: Max reconnects reached`);
+      console.log(`[SMPP-CLIENT] ${this.supplier.supplier_code}: Max reconnects reached (${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
       return;
     }
+
     this.reconnectAttempts++;
-    const delay = Math.min(30000, 5000 * this.reconnectAttempts);
-    console.log(`[SMPP-CLIENT] ${this.supplier.supplier_code}: Reconnecting in ${delay/1000}s (${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+
+    // Base delay: 10s per attempt (was 5s). Cap at 60s (was 30s).
+    // Permanent bind failures: use 60s minimum after 3 failed binds.
+    let delay;
+    if (isPermanentFailure) {
+      delay = Math.min(120000, 60000 * (this.reconnectAttempts - 2));
+    } else {
+      delay = Math.min(60000, 10000 * this.reconnectAttempts);
+    }
+    delay = Math.round(delay * jit);
+
+    const tag = isPermanentFailure ? ' (perm-fail cool-down)' : '';
+    console.log(`[SMPP-CLIENT] ${this.supplier.supplier_code}: Reconnecting in ${Math.round(delay/1000)}s (${this.reconnectAttempts}/${this.maxReconnectAttempts})${tag}`);
     setTimeout(() => this.connect().catch(() => {}), delay);
   }
 

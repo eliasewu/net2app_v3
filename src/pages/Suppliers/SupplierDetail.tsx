@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Edit, Trash2, Wifi, WifiOff, RefreshCw, TestTube, Phone, Globe, Server, CheckCircle } from 'lucide-react';
+import { ArrowLeft, Edit, Trash2, Wifi, WifiOff, RefreshCw, TestTube, Phone, Globe, Server, CheckCircle, Download, Copy } from 'lucide-react';
 import { useData } from '../../store/DataContext';
 import { suppliersApi } from '../../services/api';
 import { Card } from '../../components/UI/Card';
@@ -64,7 +64,7 @@ export const SupplierDetail: React.FC = () => {
 
   const usageData = [{month:'Jan',sms:180000,cost:2700},{month:'Feb',sms:210000,cost:3150},{month:'Mar',sms:250000,cost:3750},{month:'Apr',sms:220000,cost:3300},{month:'May',sms:280000,cost:4200},{month:'Jun',sms:300000,cost:4500}];
 
-  const connLabel: Record<string,string> = {smpp:'SMPP',http:'HTTP API',ott_whatsapp:'WhatsApp',ott_telegram:'Telegram',voice_otp:'Voice OTP',local_bypass:'Local Bypass',rcs:'RCS',flash_sms:'Flash SMS'};
+  const connLabel: Record<string,string> = {smpp:'SMPP',http:'HTTP API',android_SMS:'Android SMS',ott_whatsapp:'WhatsApp',ott_telegram:'Telegram',voice_otp:'Voice OTP',local_bypass:'Local Bypass',rcs:'RCS',flash_sms:'Flash SMS'};
 
   return (
     <div className="space-y-6">
@@ -116,6 +116,20 @@ export const SupplierDetail: React.FC = () => {
           {supplier.connection_type==='voice_otp'&&<><div><p className="text-gray-500">Play Mode</p><Badge variant={supplier.voice_otp_mode==='local_international'?'info':supplier.voice_otp_mode==='local_2x'?'warning':supplier.voice_otp_mode==='local_1x'?'purple':'default'}>{supplier.voice_otp_mode==='local_1x'?'Local (Single)':supplier.voice_otp_mode==='local_2x'?'Local (Double)':supplier.voice_otp_mode==='local_international'?'Local + International':'Default (auto)'}</Badge></div><div><p className="text-gray-500">SIP Address</p><p className="font-mono">{supplier.dst_sip_address||'Not set'}</p></div><div><p className="text-gray-500">Codec</p><p>{supplier.audio_codec||'G729'}</p></div><div><p className="text-gray-500">Capacity</p><p>{supplier.capacity||10} concurrent</p></div><div><p className="text-gray-500">Reconnect Schedule</p><p className="font-mono text-xs">{supplier.reconnect_schedule||'0,1,2'}</p></div><div><p className="text-gray-500">Rate/sec</p><p>€{Number(supplier.rate_per_second||0).toFixed(6)}</p></div></>}
           {supplier.connection_type==='http'&&<><div><p className="text-gray-500">API URL</p><p className="text-xs font-mono">{supplier.api_url||'N/A'}</p></div><div><p className="text-gray-500">Method</p><p>{supplier.api_method||'POST'}</p></div></>}
           {supplier.connection_type==='ott_telegram'&&<div className="col-span-2"><p className="text-gray-500">Bot Token</p><p className="font-mono text-xs">{supplier.api_key?.slice(0,20)+'...'||'N/A'}</p></div>}
+          {supplier.connection_type==='android_SMS'&&<div className="col-span-2 mt-2 pt-3 border-t border-gray-100">
+            <p className="text-gray-500 text-sm mb-2">📱 Gateway APK Download</p>
+            <div className="flex items-center gap-2">
+              <a href="/download/net2app-gateway.apk" download className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 transition-colors">
+                <Download size={16} /> Download APK
+              </a>
+              <button onClick={()=>navigator.clipboard.writeText(window.location.origin+'/download/net2app-gateway.apk')} className="p-2 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors" title="Copy URL">
+                <Copy size={16} className="text-gray-600" />
+              </button>
+            </div>
+            <p className="text-xs text-gray-400 mt-2">
+              Use supplier code <strong className="font-mono">{supplier.supplier_code}</strong> as username and the configured password to connect.
+            </p>
+          </div>}
         </div></Card>
         <Card title="Contact Information"><div className="grid grid-cols-2 gap-4 text-sm">
           <div><p className="text-gray-500">Company</p><p className="font-medium">{supplier.company_name}</p></div>

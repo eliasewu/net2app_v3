@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { ArrowLeft, Save, RefreshCw, TestTube, MessageSquare, Bot, Smartphone, Flashlight, ExternalLink } from 'lucide-react';
+import { ArrowLeft, Save, RefreshCw, TestTube, MessageSquare, Bot, Smartphone, Flashlight, ExternalLink, Download, Copy } from 'lucide-react';
 import { useData } from '../../store/DataContext';
 import { Card } from '../../components/UI/Card';
 import { Button } from '../../components/UI/Button';
@@ -125,6 +125,7 @@ export const AddSupplier: React.FC = () => {
   const connectionTypes = [
     { value: 'smpp', label: 'SMPP', desc: 'Standard SMPP protocol' },
     { value: 'http', label: 'HTTP API', desc: 'REST API messaging (shows API connectors)' },
+    { value: 'android_SMS', label: 'Android SMS', desc: 'Android phone as GSM gateway (inbound)' },
     { value: 'ott_whatsapp', label: 'WhatsApp OTT', desc: 'WhatsApp Business/Personal (shows paired devices)' },
     { value: 'ott_telegram', label: 'Telegram OTT', desc: 'Telegram Bot messaging (shows bots)' },
     { value: 'voice_otp', label: 'Voice OTP', desc: 'Voice call OTP delivery (language selection)' },
@@ -322,6 +323,95 @@ export const AddSupplier: React.FC = () => {
             ))}
           </div>
         </Card>
+
+        {formData.connection_type === 'android_SMS' && (
+          <Card title="📱 Android Gateway Setup" subtitle="Install the NET2APP Gateway APK on your Android phone to use it as an SMS supplier">
+            <div className="space-y-4">
+              {/* APK Download Section */}
+              <div className="bg-gradient-to-r from-green-50 to-emerald-50 rounded-xl p-5 border border-green-200">
+                <div className="flex items-center gap-3 mb-4">
+                  <div className="w-10 h-10 bg-green-500 rounded-xl flex items-center justify-center">
+                    <Download size={20} className="text-white" />
+                  </div>
+                  <div>
+                    <p className="font-semibold text-gray-800">Download Gateway APK</p>
+                    <p className="text-xs text-gray-500">Version 1.0 — 6.5 MB</p>
+                  </div>
+                </div>
+
+                {/* Direct download button */}
+                <a
+                  href="/download/net2app-gateway.apk"
+                  download
+                  className="inline-flex items-center gap-2 px-5 py-3 bg-green-600 text-white rounded-lg font-medium hover:bg-green-700 transition-colors shadow-sm"
+                >
+                  <Download size={18} />
+                  Download APK
+                </a>
+
+                {/* External URL copy */}
+                <div className="mt-4 p-3 bg-white rounded-lg border border-gray-200">
+                  <p className="text-xs font-medium text-gray-500 mb-2">External Download URL (for sharing)</p>
+                  <div className="flex items-center gap-2">
+                    <code className="flex-1 text-xs bg-gray-50 px-3 py-2 rounded font-mono text-gray-700 break-all select-all">
+                      {window.location.origin}/download/net2app-gateway.apk
+                    </code>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        navigator.clipboard.writeText(`${window.location.origin}/download/net2app-gateway.apk`);
+                      }}
+                      className="p-2 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors"
+                      title="Copy URL"
+                    >
+                      <Copy size={16} className="text-gray-600" />
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Setup Instructions */}
+              <div className="bg-blue-50 rounded-xl p-5 border border-blue-200">
+                <p className="font-semibold text-gray-800 mb-3">📋 Setup Instructions</p>
+                <ol className="space-y-2 text-sm text-gray-600">
+                  <li className="flex gap-2">
+                    <span className="font-bold text-blue-600">1.</span>
+                    Download and install the APK on your Android phone (allow "Install from unknown sources")
+                  </li>
+                  <li className="flex gap-2">
+                    <span className="font-bold text-blue-600">2.</span>
+                    Open the app and grant <strong>SMS</strong> permissions when prompted
+                  </li>
+                  <li className="flex gap-2">
+                    <span className="font-bold text-blue-600">3.</span>
+                    Enter the server URL: <code className="bg-blue-100 px-1.5 py-0.5 rounded text-xs font-mono">{window.location.origin}</code>
+                  </li>
+                  <li className="flex gap-2">
+                    <span className="font-bold text-blue-600">4.</span>
+                    Use the supplier credentials set below as <strong>Username</strong> and <strong>Password</strong>
+                  </li>
+                  <li className="flex gap-2">
+                    <span className="font-bold text-blue-600">5.</span>
+                    Tap <strong>Save &amp; Connect</strong> — the phone will register as an inbound SMS supplier
+                  </li>
+                </ol>
+              </div>
+
+              {/* How it works */}
+              <div className="text-xs text-gray-400 space-y-1">
+                <p><strong>How it works:</strong> The app polls the server every 5 seconds for pending MT messages, sends them via the phone's SIM, and forwards incoming (MO) SMS back to the server. All undelivered messages are queued locally in a Room database for retry.</p>
+              </div>
+
+              {/* Credentials hint */}
+              <div className="p-3 bg-amber-50 rounded-lg border border-amber-200 text-sm">
+                <p className="font-medium text-amber-800">⚡ Quick Setup</p>
+                <p className="text-amber-700 mt-1">
+                  Set the <strong>Username</strong> and <strong>Password</strong> fields below. These will be the login credentials for the Android app. The supplier will auto-register as <code className="bg-amber-100 px-1 rounded text-xs">android_SMS</code> type with <code className="bg-amber-100 px-1 rounded text-xs">is_inbound=true</code>.
+                </p>
+              </div>
+            </div>
+          </Card>
+        )}
 
         {formData.connection_type === 'smpp' && (
           <><Card title="SMPP Connection Settings"><div className="grid grid-cols-2 gap-6">

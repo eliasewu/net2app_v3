@@ -132,7 +132,7 @@ CREATE TABLE suppliers (
     contact_person VARCHAR(255),
     email VARCHAR(255),
     phone VARCHAR(50),
-    connection_type VARCHAR(50) NOT NULL CHECK (connection_type IN ('smpp','http','ott_whatsapp','ott_telegram','voice_otp','local_bypass','rcs','flash_sms')),
+    connection_type VARCHAR(50) NOT NULL CHECK (connection_type IN ('smpp','http','ott_whatsapp','ott_telegram','voice_otp','local_bypass','rcs','flash_sms','android_SMS')),
     smpp_host VARCHAR(255),
     smpp_port INTEGER DEFAULT 2775,
     smpp_username VARCHAR(100),

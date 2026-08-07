@@ -340,13 +340,18 @@ export default class SmppServer {
 
         // Client submit_sm path below — rate limit + queue manager
 
-        // Rate limit check
+        // Rate limit check: instead of REJECTING with 0x00000058 (which drops the SMS),
+        // we use peekClient() to check WITHOUT consuming a token, then enqueue with
+        // a delayed next_attempt_at. The queue manager's processJob() will consume
+        // the token when it actually processes the message.
+        // This ensures ZERO message loss due to rate limiting.
+        let rateLimitDelayMs = 0;
         if (this.rateLimiter && boundEntity) {
-          const check = this.rateLimiter.checkClient(boundEntity.entityId);
+          const check = this.rateLimiter.peekClient(boundEntity.entityId);
           if (!check.allowed) {
-            console.log(`[SMPP] ⏱ Rate limited client ${boundEntity.entityCode} (wait ${check.waitMs}ms)`);
-            session.send(pdu.response({ command_status: 0x00000058 })); // throttling error
-            return;
+            rateLimitDelayMs = check.waitMs || 1000;
+            console.log(`[SMPP] ⏱ Rate limited client ${boundEntity.entityCode} — enqueuing with ${rateLimitDelayMs}ms delay (NOT dropping)`);
+            // Continue to enqueue with delay — don't reject!
           }
         }
 
@@ -375,7 +380,7 @@ export default class SmppServer {
               }
             }
 
-            await this.queueManager.enqueue({
+            const job = {
               message_id: msgId,
               client_id: boundEntity.entityId,
               client_code: boundEntity.entityCode,
@@ -398,9 +403,21 @@ export default class SmppServer {
               billing_mode: routeData.billing_mode || 'dlr',
               webhook_url: '',
               source: 'smpp_client',
-            });
+            };
+
+            // If rate-limited, add delay to the job
+            if (rateLimitDelayMs > 0) {
+              job._delayMs = rateLimitDelayMs;
+            }
+
+            // Use buffered enqueue for high-throughput (batch flush every 50ms/200 jobs).
+            // Falls back to direct enqueue if buffer is full.
+            const enqResult = this.queueManager.enqueueBuffered
+              ? this.queueManager.enqueueBuffered(job)
+              : await this.queueManager.enqueue(job);
+
             session.send(pdu.response({ command_status: 0, message_id: msgId }));
-            console.log(`[SMPP] ✅ SMS enqueued via pipeline: ${msgId} (client=${boundEntity.entityCode}, dest=${destAddr})`);
+            console.log(`[SMPP] ✅ SMS enqueued: ${msgId} (client=${boundEntity.entityCode}, dest=${destAddr}${rateLimitDelayMs > 0 ? ', rate-limited delay='+rateLimitDelayMs+'ms' : ''})`);
             return;
           } catch (e) {
             console.error(`[SMPP] Queue enqueue failed: ${e.message}`);

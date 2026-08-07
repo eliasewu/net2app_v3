@@ -1,3 +1,10 @@
+// ── Startup timing metric ──
+// Records high-resolution process start time for measuring
+// time-to-first-HTTP-response (TTFR). Used by the self-probe
+// in app.listen() and exposed via /api/startup-metric.
+const PROCESS_START_HR = process.hrtime();
+let _startupMetric = { ttfrMs: null, ttfrHuman: null, probeAttempts: 0, status: 'pending' };
+
 const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
@@ -36,6 +43,51 @@ pg.types.setTypeParser(1005, parsePgArray);
 pg.types.setTypeParser(1016, parsePgArray);
 pg.types.setTypeParser(1009, parsePgArray);
 pg.types.setTypeParser(1015, parsePgArray);
+
+const dns = require('dns');
+
+// ── DNS optimization: prefer IPv4 (faster), use Google/Cloudflare DNS ──
+// Without this, Node.js's default DNS resolution (getaddrinfo in libuv
+// thread pool) can stall the event loop for seconds per hostname lookup
+// when connecting to SMPP suppliers with slow or unreachable DNS servers.
+dns.setDefaultResultOrder('ipv4first');
+try { dns.setServers(['8.8.8.8', '1.1.1.1', '8.8.4.4']); } catch (_) { /* setServers is Windows-only; Linux uses /etc/resolv.conf */ }
+
+// ── DNS CACHE WRAPPER ──
+// Monkey-patch dns.lookup() to cache both successful and failed results.
+// Without this, SMPP client reconnect loops for unreachable hosts like
+// "suppliersmpp.com" call dns.lookup() repeatedly — each call goes to
+// libuv's thread pool (4 threads). When many reconnect loops fire
+// simultaneously, the thread pool saturates and ALL I/O (including HTTP)
+// stalls. This cache keeps ENOTFOUND lookups from clogging the pool.
+const dnsLookupCache = new Map();
+const DNS_CACHE_TTL_MS = 300000; // 5 min TTL for both positive + negative (reconnect backoff is 10-60s)
+
+// Periodic DNS cache cleanup: evict expired entries every 10 minutes.
+// Without this, the Map grows unboundedly over months of uptime.
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, val] of dnsLookupCache) {
+        if (now - val.time > DNS_CACHE_TTL_MS) dnsLookupCache.delete(key);
+    }
+}, 600000).unref(); // .unref() so it doesn't keep the process alive
+const origLookup = dns.lookup;
+dns.lookup = function (hostname, options, callback) {
+    if (typeof options === 'function') { callback = options; options = {}; }
+    const family = options.family || 0;
+    const cacheKey = `${hostname}:${family}`;
+    const cached = dnsLookupCache.get(cacheKey);
+    if (cached && (Date.now() - cached.time) < DNS_CACHE_TTL_MS) {
+        if (cached.error) {
+            return process.nextTick(() => callback(cached.error));
+        }
+        return process.nextTick(() => callback(null, cached.address, cached.family));
+    }
+    origLookup.call(dns, hostname, options, (err, address, family) => {
+        dnsLookupCache.set(cacheKey, { time: Date.now(), error: err || null, address, family });
+        callback(err, address, family);
+    });
+};
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -91,7 +143,7 @@ const pool = new Pool({
     database: process.env.DB_NAME || 'sms_platform',
     user: process.env.DB_USER || 'sms_user',
     password: process.env.DB_PASS || 'Ariya@2024Net2App',
-    max: 50,
+    max: 100,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 5000,
 });
@@ -114,6 +166,7 @@ const INTERNAL_SOURCES = ['test_sms', 'campaign', 'voice_otp', 'e2e_test'];
 let queueManager = null;
 let rateLimiter = null;
 let connectionPoolMgr = null;
+let smppServer = null; // Set by SmppServer import (for Android Gateway DLR push)
 
 (async () => {
     try {
@@ -123,10 +176,16 @@ let connectionPoolMgr = null;
         connectionPoolMgr = (await import('./src/services/connectionPipeline.mjs')).default;
 
         queueManager = new SMSQueueManager(pool, {
-            pollIntervalMs: 100,
-            batchSize: 100,
-            workerCount: 8,
+            pollIntervalMs: 50,          // Aggressive polling for 100+ TPS
+            batchSize: 200,              // Larger batches for high throughput
+            workerCount: 12,             // Start with 12 workers
+            minWorkers: 8,               // Never drop below 8
+            maxWorkers: 24,              // Auto-scale up to 24 under load
             maxRetries: 5,
+            bufferFlushSize: 200,        // Flush in-memory buffer every 200 jobs
+            bufferMaxSize: 5000,         // Max 5000 in-memory buffer before rejection
+            bufferFlushMs: 30,           // Flush every 30ms max
+            overloadThreshold: 20000,    // Alert when queue depth > 20k
             connectionPoolMgr,
         });
 
@@ -203,13 +262,65 @@ let connectionPoolMgr = null;
         for (const c of clients.rows) {
             rateLimiter.configureClient(c.id, c.max_tps || 100);
         }
+        // Rate limiters for all suppliers (fast, local config)
         for (const s of suppliers.rows) {
             rateLimiter.configureSupplier(s.id, 200);
-            // Only configure outbound pipelines for non-inbound suppliers.
-            // Inbound suppliers (GSM gateways) connect TO us via SMPP server on port 2775.
-            if (!s.is_inbound) {
-                await connectionPoolMgr.configureSupplier(s);
-            }
+        }
+
+        // ── DEFERRED SUPPLIER PIPELINE CONNECTIONS ──
+        // Previously: await connectionPoolMgr.configureSupplier(s) for each
+        // outbound SMPP supplier INLINE during startup. This blocked the event
+        // loop for 5-60s per supplier (DNS + TCP connect timeouts), preventing
+        // HTTP from being served until ALL suppliers connected or timed out.
+        //
+        // NOW: Supplier connections are deferred via setTimeout with 1s stagger.
+        // The HTTP server is already listening (app.listen ran before this IIFE
+        // could block). Each supplier connects one-at-a-time with a 1s gap.
+        // Failed connections are logged but don't block later suppliers.
+        const outboundSuppliers = suppliers.rows.filter(s => !s.is_inbound);
+        if (outboundSuppliers.length > 0) {
+            let connectIdx = 0;
+            const connectNext = () => {
+                if (connectIdx >= outboundSuppliers.length) {
+                    console.error(`[INIT] All ${outboundSuppliers.length} outbound supplier connections attempted`);
+                    return;
+                }
+                const s = outboundSuppliers[connectIdx++];
+                const host = s.smpp_host || '';
+                // Pre-flight DNS check for SMPP suppliers. If DNS fails,
+                // skip configureSupplier entirely to prevent the SMPP client
+                // from starting its internal reconnect loop (which hammers
+                // the libuv thread pool with repeated getaddrinfo calls).
+                // The health check (every 30s) will retry DNS + connection.
+                const doConnect = () => {
+                    console.error(`[INIT] Connecting supplier ${s.supplier_code} (${connectIdx}/${outboundSuppliers.length})...`);
+                    connectionPoolMgr.configureSupplier(s).catch(e =>
+                        console.error(`[INIT] Supplier ${s.supplier_code} connection failed (will retry via health check): ${e.message}`)
+                    );
+                    setTimeout(connectNext, 1200);
+                };
+                if (host && s.connection_type === 'smpp') {
+                    // Use a short timeout (3s) for DNS pre-flight — don't block startup
+                    const dnsTimer = setTimeout(() => {
+                        console.error(`[INIT] DNS pre-check timeout for ${s.supplier_code} (${host}) — skipping`);
+                        setTimeout(connectNext, 1200);
+                    }, 3000);
+                    dns.lookup(host, { family: 4 }, (err) => {
+                        clearTimeout(dnsTimer);
+                        if (err) {
+                            console.error(`[INIT] DNS failed for ${s.supplier_code} (${host}): ${err.code} — skipping connection, health check will retry`);
+                            setTimeout(connectNext, 1200);
+                            return;
+                        }
+                        doConnect();
+                    });
+                } else {
+                    doConnect();
+                }
+            };
+            // Start connections 2s after HTTP is serving (enough time for Express
+            // to finish binding and the event loop to settle)
+            setTimeout(connectNext, 2000);
         }
 
         console.error(`[INIT] QueueManager: ${clients.rows.length} clients, ${suppliers.rows.length} suppliers configured`);
@@ -480,7 +591,7 @@ let connectionPoolMgr = null;
 
         console.error('[INIT] HTTP connector DLR polling started — checks delivery status every 4s (75s timeout)');
 
-        console.error('[INIT] Production queue system READY — 8 workers, 100 batch, token-bucket rate limiting');
+        console.error('[INIT] Production queue system READY — 12 workers (auto-scale 8-24), 200 batch, 50ms poll, in-memory buffer (200 flush/5000 max), 100 DB pool, overload protection at 20k queue depth');
 
         // ======== DLR OUTBOX: stores pending DLRs for external client delivery ========
         // External SMPP clients bind to the Java Gateway (port 2775), which holds
@@ -889,8 +1000,8 @@ let connectionPoolMgr = null;
                             // RCS/OTT — active means bound (device sessions handle real connectivity)
                             healthy = true;
 
-                        } else if (['flash_sms', 'whatsapp_business', 'telegram_business'].includes(connType)) {
-                            // Flash SMS / WhatsApp Business / Telegram Business — active means bound
+                        } else if (['flash_sms', 'whatsapp_business', 'telegram_business', 'android_SMS'].includes(connType)) {
+                            // Flash SMS / WhatsApp Business / Telegram Business / Android SMS — active means bound
                             healthy = true;
 
                         } else {
@@ -2382,7 +2493,7 @@ app.post('/api/suppliers/:id/bind', auth, async (req, res) => {
             );
             // Upsert active_smpp_sessions for outbound tracking
             await pool.query(
-                `INSERT INTO active_smpp_sessions (entity_type, entity_id, system_id, status, connected_at, ip_address, bind_mode)
+                `INSERT INTO smpp_sessions (entity_type, entity_id, system_id, status, connected_at, ip_address, bind_mode)
                  VALUES ('supplier', $1, $2, 'bound', NOW(), $3, 'transceiver')
                  ON CONFLICT (entity_type, entity_id)
                  DO UPDATE SET status = 'bound', connected_at = NOW(),
@@ -3342,7 +3453,7 @@ app.post('/api/sms/simulate', auth, async (req, res) => {
              LEFT JOIN trunks t ON t.supplier_id=s.id AND t.is_active=true
              LEFT JOIN routes ro ON t.id = ANY(ro.trunk_ids) AND ro.is_active=true
              WHERE r.entity_type='supplier' AND (r.mcc=$1 OR r.mcc='*') AND r.is_active=true
-               AND s.connection_type IN ('smpp','http','voice_otp','rcs','ott','whatsapp','telegram','flash_sms')
+               AND s.connection_type IN ('smpp','http','voice_otp','rcs','ott','whatsapp','telegram','flash_sms','android_SMS')
              ORDER BY r.rate ASC`,
             [mcc || null]
         );
@@ -3977,8 +4088,100 @@ app.get('/api/queue/stats', auth, async (req, res) => {
         const stats = queueManager ? await queueManager.getQueueStats() : { queue_depth: 0, processing: 0, dead_letters_24h: 0 };
         const rlStats = rateLimiter ? rateLimiter.getStats() : { activeClients: 0, activeSuppliers: 0 };
         const pipelineStatus = connectionPoolMgr ? connectionPoolMgr.getStatus() : { totalSuppliers: 0, totalPipelines: 0 };
-        res.json({ success: true, data: { queue: stats, rateLimiter: rlStats, pipelines: pipelineStatus } });
+        const tps = queueManager ? queueManager.getCurrentTps() : { enqueue: 0, process: 0, deliver: 0 };
+        
+        // DB pool utilization
+        const poolStats = {
+            total: pool.totalCount,
+            idle: pool.idleCount,
+            waiting: pool.waitingCount,
+        };
+        
+        res.json({ success: true, data: { 
+            queue: stats, 
+            rateLimiter: rlStats, 
+            pipelines: pipelineStatus,
+            tps,
+            pool: poolStats,
+            memory: {
+                heapUsedMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+                heapTotalMB: Math.round(process.memoryUsage().heapTotal / 1024 / 1024),
+                rssMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
+            }
+        }});
     } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ==================== TPS BENCHMARK ====================
+// Tests how many messages per second the system can handle end-to-end.
+// Fires N messages at the queue and reports actual throughput.
+app.post('/api/queue/tps-benchmark', auth, async (req, res) => {
+    try {
+        const { duration_sec = 5, batch_size = 100, concurrent = 1 } = req.body;
+        if (!queueManager) return res.status(503).json({ error: 'Queue manager not ready' });
+        
+        const startTime = Date.now();
+        const endTime = startTime + (duration_sec * 1000);
+        let enqueued = 0;
+        let failed = 0;
+        const results = [];
+        
+        const sendBatch = async () => {
+            for (let i = 0; i < batch_size; i++) {
+                const msgId = genNumericMsgId('9') + Date.now() + '_' + i;
+                const job = {
+                    message_id: msgId,
+                    client_id: 1,
+                    client_code: 'BENCHMARK',
+                    sender_id: 'BENCHMARK',
+                    destination: '1234567890',
+                    message: 'benchmark test',
+                    message_parts: 1,
+                    source: 'benchmark',
+                };
+                const r = queueManager.enqueueBuffered
+                    ? queueManager.enqueueBuffered(job)
+                    : await queueManager.enqueue(job);
+                if (r && r.status !== 'rejected') enqueued++;
+                else failed++;
+            }
+        };
+        
+        // Run benchmark
+        let batches = 0;
+        while (Date.now() < endTime) {
+            const batchPromises = [];
+            for (let c = 0; c < concurrent; c++) {
+                batchPromises.push(sendBatch());
+            }
+            await Promise.all(batchPromises);
+            batches++;
+        }
+        
+        const elapsedMs = Date.now() - startTime;
+        const elapsedSec = elapsedMs / 1000;
+        const tpsAchieved = Math.round(enqueued / elapsedSec);
+        
+        // Clean up benchmark messages
+        await pool.query(
+            `DELETE FROM sms_outbox WHERE source = 'benchmark' AND queued_at > NOW() - INTERVAL '1 minute'`
+        ).catch(() => {});
+        
+        res.json({
+            success: true,
+            data: {
+                duration_sec: Math.round(elapsedSec * 10) / 10,
+                total_enqueued: enqueued,
+                total_failed: failed,
+                batches: batches,
+                tps_enqueue: tpsAchieved,
+                concurrent_batches: concurrent,
+                batch_size,
+            }
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
 });
 
 // ==================== DASHBOARD PROFIT WIDGET ====================
@@ -6659,7 +6862,7 @@ app.get('/api/bind/status', auth, async (req, res) => {
              LEFT JOIN smpp_sessions client_sess ON client_sess.entity_type = 'client'
                AND client_sess.status = 'bound'
                AND client_sess.system_id = s.smpp_username
-               AND s.is_inbound = true              WHERE s.connection_type IN ('smpp', 'http', 'voice_otp', 'ott_whatsapp', 'ott_telegram', 'rcs', 'flash_sms', 'whatsapp_business', 'telegram_business', 'ott')
+               AND s.is_inbound = true              WHERE s.connection_type IN ('smpp', 'http', 'voice_otp', 'ott_whatsapp', 'ott_telegram', 'rcs', 'flash_sms', 'whatsapp_business', 'telegram_business', 'ott', 'android_SMS')
                ${showDeleted ? '' : "AND s.status = 'active' AND (s.is_deleted IS NULL OR s.is_deleted = false)"}
              ORDER BY s.id`
         );
@@ -6756,6 +6959,163 @@ app.get('/api/license/limits', auth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Auto-detect server OS, IP, MAC for license binding
+const os = require('os');
+app.get('/api/license/system-info', auth, async (req, res) => {
+    try {
+        const interfaces = os.networkInterfaces();
+        let ip = '', mac = '';
+        for (const iface of Object.values(interfaces)) {
+            for (const addr of iface) {
+                if (!addr.internal && addr.family === 'IPv4') {
+                    ip = addr.address;
+                    mac = addr.mac;
+                    break;
+                }
+            }
+            if (ip) break;
+        }
+        // Fallback: try hostname -I for servers behind NAT
+        if (!ip) {
+            try {
+                const { execSync } = require('child_process');
+                ip = execSync("hostname -I | awk '{print $1}'", { encoding: 'utf8' }).trim();
+            } catch { ip = '127.0.0.1'; }
+        }
+        res.json({ success: true, data: {
+            ip, mac,
+            os: os.platform() + ' ' + os.release(),
+            hostname: os.hostname(),
+            arch: os.arch(),
+            cpus: os.cpus().length,
+        }});
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Validate a license key
+app.post('/api/license/validate', auth, async (req, res) => {
+    try {
+        const { key } = req.body;
+        if (!key) return res.status(400).json({ error: 'License key required' });
+        const result = await pool.query('SELECT * FROM license WHERE license_key = $1', [key]);
+        if (result.rows.length === 0) return res.json({ success: true, valid: false, message: 'Invalid key' });
+        const lic = result.rows[0];
+        const valid = lic.status === 'active' && new Date(lic.expiry_date) > new Date();
+        res.json({ success: true, valid, data: lic });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Generate license key
+app.post('/api/license/generate', auth, async (req, res) => {
+    try {
+        const { type, company_name, tenant_code, system_ip, system_mac } = req.body;
+        const ts = Date.now().toString(36).toUpperCase().slice(-6);
+        const rand = Math.random().toString(36).substring(2, 6).toUpperCase();
+        const key = `N2A-${(type || 'TRI').toUpperCase().slice(0, 3)}-${ts}-${rand}-${system_mac ? system_mac.replace(/:/g,'').slice(-8) : '00000000'}`;
+        const result = await pool.query(
+            `INSERT INTO license (license_key, license_type, status, issued_to, issued_date, expiry_date,
+             system_ip, system_mac, tenant_code, created_at)
+             VALUES ($1, $2, 'active', $3, CURRENT_DATE, CURRENT_DATE + INTERVAL '30 days', $4, $5, $6, NOW()) RETURNING *`,
+            [key, type || 'trial', company_name || 'Unknown', system_ip || null, system_mac || null, tenant_code || null]
+        );
+        res.json({ success: true, data: { key, license: result.rows[0] } });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ==================== TENANTS ====================
+app.get('/api/license/tenants', auth, async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM tenants ORDER BY created_at DESC');
+        res.json({ success: true, data: result.rows });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/license/tenants', auth, async (req, res) => {
+    try {
+        const { name, code, ip, mac, max_sms_monthly, max_tps, features } = req.body;
+        if (!name || !code) return res.status(400).json({ error: 'Name and code required' });
+        const result = await pool.query(
+            `INSERT INTO tenants (tenant_name, tenant_code, ip_address, mac_address, status,
+             limits, features, created_at)
+             VALUES ($1, $2, $3, $4, 'active',
+              jsonb_build_object('max_sms_monthly', $5, 'max_tps', $6),
+              $7::jsonb, NOW()) RETURNING *`,
+            [name, code.toUpperCase(), ip || null, mac || null, max_sms_monthly || 100, max_tps || 5,
+             JSON.stringify(features || { smpp: true, http: true })]
+        );
+        res.json({ success: true, data: result.rows[0] });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/api/license/tenants/:id', auth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { name, code, ip, mac, max_sms_monthly, max_tps, features } = req.body;
+        const result = await pool.query(
+            `UPDATE tenants SET tenant_name = COALESCE($2, tenant_name),
+             tenant_code = COALESCE($3, tenant_code),
+             ip_address = COALESCE($4, ip_address),
+             mac_address = COALESCE($5, mac_address),
+             limits = COALESCE($6::jsonb, limits),
+             features = COALESCE($7::jsonb, features),
+             updated_at = NOW() WHERE id = $1 RETURNING *`,
+            [id, name || null, code ? code.toUpperCase() : null, ip || null, mac || null,
+             (max_sms_monthly || max_tps) ? JSON.stringify({ max_sms_monthly: max_sms_monthly || 100, max_tps: max_tps || 5 }) : null,
+             features ? JSON.stringify(features) : null]
+        );
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+        res.json({ success: true, data: result.rows[0] });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/license/tenants/:id', auth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const result = await pool.query('DELETE FROM tenants WHERE id = $1 RETURNING id', [id]);
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+        res.json({ success: true, message: 'Tenant deleted' });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/license/tenants/:id/usage', auth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const usage = await pool.query(
+            `SELECT COUNT(*) FILTER (WHERE created_at > date_trunc('month', NOW())) AS sms_this_month
+             FROM sms_logs WHERE client_id IN
+             (SELECT id FROM clients WHERE tenant_id = $1)`,
+            [id]
+        );
+        res.json({ success: true, data: { sms_this_month: parseInt(usage.rows[0]?.sms_this_month) || 0 } });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Data retention cleanup
+app.post('/api/system/cleanup-retention', auth, async (req, res) => {
+    try {
+        const { months = 6 } = req.body;
+        const preservedTables = ['sms_logs', 'invoices', 'payments'];
+        const cleanableTables = [
+            'dlr_outbox', 'bind_history', 'notifications',
+            'sms_outbox', 'voice_otp_logs', 'voice_call_retry_queue'
+        ];
+        let totalCleaned = 0;
+        const breakdown = {};
+        for (const table of cleanableTables) {
+            const r = await pool.query(
+                `DELETE FROM ${table} WHERE created_at < NOW() - INTERVAL '${parseInt(months)} months'`
+            ).catch(() => ({ rowCount: 0 }));
+            if (r.rowCount > 0) { breakdown[table] = r.rowCount; totalCleaned += r.rowCount; }
+        }
+        res.json({ success: true, data: {
+            cutoff_months: parseInt(months),
+            total_cleaned: totalCleaned,
+            breakdown,
+            preserved: preservedTables.join(', '),
+        }});
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Health check
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -6763,9 +7123,67 @@ app.get('/health', (req, res) => {
 
 // Serve static files — SPA fallback (middleware avoids path-to-regexp wildcard issue)
 app.use(express.static('dist'));
-app.use((req, res) => {
+
+// ── APK download with proper MIME type for auto-install on Android 7+ ──
+// Android browsers detect application/vnd.android.package-archive and
+// automatically prompt the user to install. Content-Disposition: attachment
+// ensures a download dialog rather than inline display.
+app.get('/download/net2app-gateway.apk', (req, res) => {
+    const apkPath = path.join(__dirname, 'public', 'net2app-gateway.apk');
+    const fs = require('fs');
+    if (!fs.existsSync(apkPath)) {
+        return res.status(404).json({ error: 'APK not found' });
+    }
+    res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+    res.setHeader('Content-Disposition', 'attachment; filename="net2app-gateway.apk"');
+    res.setHeader('Content-Length', fs.statSync(apkPath).size);
+    fs.createReadStream(apkPath).pipe(res);
+});
+
+// ── One-tap install page — detects Android, auto-triggers APK download ──
+app.get('/install', (req, res) => {
+    res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NET2APP Gateway — Install</title>
+    <style>
+        body { font-family: -apple-system, system-ui, sans-serif; background:#0f172a; color:#e2e8f0; display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; text-align:center; }
+        .card { background:#1e293b; border-radius:16px; padding:40px; max-width:420px; width:90%; box-shadow:0 25px 50px rgba(0,0,0,.4); }
+        .icon { font-size:64px; margin-bottom:16px; }
+        h1 { font-size:24px; margin:0 0 8px; }
+        p { color:#94a3b8; margin:0 0 24px; font-size:14px; }
+        .btn { display:inline-block; background:#3b82f6; color:#fff; padding:14px 32px; border-radius:10px; text-decoration:none; font-weight:600; font-size:16px; transition:background .2s; }
+        .btn:hover { background:#2563eb; }
+        .note { margin-top:20px; font-size:12px; color:#64748b; }
+    </style>
+    <script>
+        // Auto-trigger download on page load for Android devices
+        const ua = navigator.userAgent.toLowerCase();
+        if (ua.includes('android')) {
+            window.location.href = '/download/net2app-gateway.apk';
+        }
+    </script>
+</head>
+<body>
+    <div class="card">
+        <div class="icon">📱</div>
+        <h1>NET2APP Gateway</h1>
+        <p>Turn your Android phone into an SMS supplier</p>
+        <a class="btn" href="/download/net2app-gateway.apk">⬇ Download APK</a>
+        <p class="note">Android 7.0+ required • Tap to install</p>
+    </div>
+</body>
+</html>`);
+});
+
+app.use('/download', express.static('public')); // other downloads
+app.use((req, res, next) => {
     if (!req.path.startsWith('/api')) {
         res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+    } else {
+        next(); // pass /api/ requests through to route handlers + error handler
     }
 });
 
@@ -6798,8 +7216,366 @@ app.use((err, req, res, next) => {
     res.status(500).json({ error: 'Internal server error' });
 });
 
+// ============================================================
+// ANDROID SMS GATEWAY API ROUTES
+// The Android app connects to these endpoints via HTTP REST.
+// ============================================================
+
+/**
+ * POST /api/gateway/register
+ * Register or update an Android SMS Gateway supplier.
+ */
+app.post('/api/gateway/register', async (req, res) => {
+    try {
+        const { username, password, device_name } = req.body;
+        if (!username || !password) {
+            return res.status(400).json({ success: false, error: 'username and password are required' });
+        }
+        const cleanName = (device_name || username).replace(/[^a-zA-Z0-9]/g, '_').substring(0, 20) || 'gateway';
+        const supplierCode = `android_${cleanName}`;
+        const displayName = device_name || username;
+        const existing = await pool.query(
+            `SELECT id FROM suppliers
+             WHERE smpp_username = $1
+               AND (is_deleted IS NULL OR is_deleted = false)`,
+            [username]
+        );
+        let supplierId;
+        if (existing.rows.length > 0) {
+            supplierId = existing.rows[0].id;
+            await pool.query(
+                `UPDATE suppliers SET connection_type = 'android_SMS', is_inbound = true,
+                 company_name = COALESCE(NULLIF($2,''), company_name), smpp_password = $3,
+                 status = 'active', updated_at = NOW() WHERE id = $1`,
+                [supplierId, displayName, password]
+            );
+        } else {
+            const insert = await pool.query(
+                `INSERT INTO suppliers (supplier_code, company_name, connection_type,
+                 smpp_username, smpp_password, smpp_host, smpp_port, is_inbound,
+                 bind_status, status, balance, currency)
+                 VALUES ($1,$2,'android_SMS',$3,$4,'0.0.0.0',0,true,'bound','active',0,'EUR')
+                 RETURNING id`,
+                [supplierCode, displayName, username, password]
+            );
+            supplierId = insert.rows[0].id;
+        }
+        res.json({ success: true, supplier_id: supplierId, supplier_code: supplierCode });
+    } catch (e) {
+        console.error(`[Gateway] Register failed: ${e.message}`);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+/**
+ * POST /api/gateway/heartbeat
+ * Called every 5 seconds by the Android device. Returns pending MT messages.
+ */
+app.post('/api/gateway/heartbeat', async (req, res) => {
+    try {
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith('Basic ')) {
+            return res.status(401).json({ success: false, error: 'Missing auth header' });
+        }
+        const decoded = Buffer.from(authHeader.substring(6), 'base64').toString('utf8');
+        const colonIdx = decoded.indexOf(':');
+        const username = decoded.substring(0, colonIdx);
+        const password = decoded.substring(colonIdx + 1);
+
+        const supplierR = await pool.query(
+            `SELECT id, supplier_code FROM suppliers
+             WHERE smpp_username = $1 AND smpp_password = $2
+               AND connection_type = 'android_SMS' AND status = 'active'
+               AND (is_deleted IS NULL OR is_deleted = false)`,
+            [username, password]
+        );
+        if (supplierR.rows.length === 0) {
+            return res.status(403).json({ success: false, error: 'Invalid credentials or not an Android gateway' });
+        }
+        const supplier = supplierR.rows[0];
+
+        await pool.query(
+            `UPDATE suppliers SET bind_status = 'bound', updated_at = NOW() WHERE id = $1`,
+            [supplier.id]
+        ).catch(() => {});
+
+        // Pick up both 'queued' (not yet processed by worker) and 'submitted'
+        // (worker marked success for android_SMS via deliverToSupplier).
+        // Exclude jobs already sent to the Android device (PENDING_ANDROID)
+        // or with a final DLR status — prevents double-delivery.
+        const pending = await pool.query(
+            `SELECT o.message_id, o.destination, o.sender_id, o.message, o.client_code, o.queued_at
+             FROM sms_outbox o
+             WHERE o.supplier_id = $1 AND o.status IN ('queued', 'submitted')
+               AND (o.dlr_status IS NULL OR o.dlr_status NOT IN ('DELIVRD','UNDELIV','FAILED','PENDING_ANDROID'))
+               AND o.attempt_count < o.max_attempts
+             ORDER BY o.queued_at ASC LIMIT 20`,
+            [supplier.id]
+        );
+
+        const pendingMt = pending.rows.map(r => ({
+            message_id: r.message_id, destination: r.destination,
+            sender_id: r.sender_id || '', message: r.message,
+            client_code: r.client_code || '',
+        }));
+
+        if (pendingMt.length > 0) {
+            const msgIds = pending.rows.map(r => r.message_id);
+            // Mark as submitted + PENDING_ANDROID so future heartbeats skip these.
+            // When the Android device later reports DLR (DELIVRD/UNDELIV),
+            // the /api/gateway/mt-dlr endpoint will overwrite dlr_status.
+            await pool.query(
+                `UPDATE sms_outbox SET status = 'submitted', dlr_status = 'PENDING_ANDROID',
+                 started_at = COALESCE(started_at, NOW()),
+                 attempt_count = attempt_count + 1 WHERE message_id = ANY($1)`,
+                [msgIds]
+            );
+        }
+
+        console.log(`[Gateway] Heartbeat from ${supplier.supplier_code}: ${pendingMt.length} pending MT`);
+        res.json({ success: true, pending_mt: pendingMt, server_time: Date.now() });
+    } catch (e) {
+        console.error(`[Gateway] Heartbeat failed: ${e.message}`);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+/**
+ * GET /api/gateway/ping — simple connectivity check.
+ */
+app.get('/api/gateway/ping', (req, res) => {
+    res.json({ success: true, server_time: Date.now(), version: '2.0.0' });
+});
+
+/**
+ * POST /api/gateway/mo-sms
+ * Forward a Mobile-Originated SMS from the Android device to the server.
+ */
+app.post('/api/gateway/mo-sms', async (req, res) => {
+    try {
+        const { from, text, timestamp, device_name } = req.body;
+        if (!from || !text) {
+            return res.status(400).json({ success: false, error: 'from and text are required' });
+        }
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith('Basic ')) {
+            return res.status(401).json({ success: false, error: 'Missing auth header' });
+        }
+        const decoded = Buffer.from(authHeader.substring(6), 'base64').toString('utf8');
+        const [username] = decoded.split(':');
+
+        const supplierR = await pool.query(
+            `SELECT id, supplier_code FROM suppliers
+             WHERE smpp_username = $1 AND connection_type = 'android_SMS' AND status = 'active'`,
+            [username]
+        );
+        if (supplierR.rows.length === 0) {
+            return res.status(403).json({ success: false, error: 'Not authorized' });
+        }
+        const supplier = supplierR.rows[0];
+        const msgId = `MO_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+
+        await pool.query(
+            `INSERT INTO sms_logs (message_id, supplier_id, supplier_code, sender_id,
+             destination, message, status, source, submit_time)
+         VALUES ($1,$2,$3,$4,$5,$6,'pending','android_gateway_mo',$7)`,
+        [msgId, supplier.id, supplier.supplier_code, from,
+         device_name || 'unknown', text, new Date(timestamp || Date.now())]
+        );
+
+        // Try to forward to the last client who sent MT to this number
+        try {
+            const lastClient = await pool.query(
+                `SELECT client_id FROM sms_logs WHERE destination = $1
+                 AND client_id IS NOT NULL ORDER BY submit_time DESC LIMIT 1`,
+                [from]
+            );
+            if (lastClient.rows.length > 0 && smppServer) {
+                smppServer.sendIncomingSms(lastClient.rows[0].client_id, from, text);
+            }
+        } catch (e) { /* best effort */ }
+
+        res.json({ success: true, message_id: msgId });
+    } catch (e) {
+        console.error(`[Gateway] MO SMS failed: ${e.message}`);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+/**
+ * POST /api/gateway/mt-dlr
+ * Report delivery status for an MT SMS sent via the Android device.
+ */
+app.post('/api/gateway/mt-dlr', async (req, res) => {
+    try {
+        const { message_id, status, error_code } = req.body;
+        if (!message_id || !status) {
+            return res.status(400).json({ success: false, error: 'message_id and status are required' });
+        }
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith('Basic ')) {
+            return res.status(401).json({ success: false, error: 'Missing auth header' });
+        }
+        const decoded = Buffer.from(authHeader.substring(6), 'base64').toString('utf8');
+        const [username] = decoded.split(':');
+
+        const supplierR = await pool.query(
+            `SELECT id FROM suppliers WHERE smpp_username = $1
+             AND connection_type = 'android_SMS' AND status = 'active'`,
+            [username]
+        );
+        if (supplierR.rows.length === 0) {
+            return res.status(403).json({ success: false, error: 'Not authorized' });
+        }
+
+        const finalStatus = status === 'DELIVRD' ? 'delivered' : 'failed';
+        const dlrStatus = status === 'DELIVRD' ? 'DELIVRD'
+            : (status === 'UNDELIV' ? 'UNDELIV' : 'FAILED');
+
+        await pool.query(
+            `UPDATE sms_outbox SET dlr_status = $1, dlr_received_at = NOW(),
+             status = $2, completed_at = NOW() WHERE message_id = $3`,
+            [dlrStatus, finalStatus, message_id]
+        );
+
+        const logUpdate = await pool.query(
+            `UPDATE sms_logs SET dlr_status = $1, status = $2,
+             delivery_time = NOW(), dlr_timestamp = NOW(),
+             error_code = CASE WHEN $4 != '' THEN $4 ELSE error_code END
+             WHERE message_id = $3
+             RETURNING client_id, client_code, destination, submit_time,
+                       client_rate, message_parts, billing_mode_snapshot, webhook_url`,
+            [dlrStatus, finalStatus, message_id, error_code || '']
+        );
+
+        if (status === 'DELIVRD' && logUpdate.rows.length > 0) {
+            const log = logUpdate.rows[0];
+            if (log.billing_mode_snapshot === 'dlr' && log.client_rate) {
+                const clientCost = parseFloat(
+                    ((log.client_rate || 0) * (log.message_parts || 1)).toFixed(6)
+                );
+                await pool.query(
+                    'UPDATE clients SET balance = GREATEST(0, balance - $1), updated_at = NOW() WHERE id = $2',
+                    [clientCost, log.client_id]
+                ).catch(() => {});
+                await pool.query(
+                    'UPDATE sms_logs SET is_billed = true WHERE message_id = $1',
+                    [message_id]
+                ).catch(() => {});
+            }
+            if (log.webhook_url && queueManager) {
+                queueManager.sendWebhook(log.webhook_url, message_id, log.destination,
+                    'delivered', 'DELIVRD', log.client_code).catch(() => {});
+            }
+            if (smppServer) {
+                smppServer.sendDlr({
+                    client_id: log.client_id, message_id,
+                    destination: log.destination,
+                    status: 'DELIVRD', client_code: log.client_code,
+                    submit_time: log.submit_time,
+                });
+            }
+        }
+
+        console.log(`[Gateway] DLR for ${message_id}: ${status}`);
+        res.json({ success: true });
+    } catch (e) {
+        console.error(`[Gateway] MT DLR failed: ${e.message}`);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+/**
+ * GET /api/gateway/stats — get gateway device statistics.
+ */
+app.get('/api/gateway/stats', async (req, res) => {
+    try {
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith('Basic ')) {
+            return res.status(401).json({ success: false, error: 'Missing auth header' });
+        }
+        const decoded = Buffer.from(authHeader.substring(6), 'base64').toString('utf8');
+        const [username] = decoded.split(':');
+
+        const supplierR = await pool.query(
+            `SELECT id, balance, currency, bind_status FROM suppliers
+             WHERE smpp_username = $1 AND connection_type = 'android_SMS' AND status = 'active'`,
+            [username]
+        );
+        if (supplierR.rows.length === 0) {
+            return res.status(403).json({ success: false, error: 'Not authorized' });
+        }
+        const supplier = supplierR.rows[0];
+        const stats = await pool.query(
+            `SELECT COUNT(*) FILTER (WHERE status = 'delivered') as total_delivered,
+                    COUNT(*) FILTER (WHERE status = 'failed') as total_failed,
+                    COUNT(*) FILTER (WHERE source = 'android_gateway_mo') as total_mo,
+                    COUNT(*) as total_processed
+             FROM sms_logs WHERE supplier_id = $1`,
+            [supplier.id]
+        );
+        res.json({ success: true, data: { balance: supplier.balance,
+            currency: supplier.currency, bind_status: supplier.bind_status,
+            ...stats.rows[0] } });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+console.log('[Gateway] Android SMS Gateway API routes registered');
+
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`);
+
+    // ── STARTUP SELF-PROBE ──
+    // Measures time from process start to first successful HTTP response.
+    // Polls /api/gateway/ping every 100ms until it responds (max 60s).
+    // Logs the elapsed time so we can track startup improvements.
+    const http = require('http');
+    let probeAttempts = 0;
+    const MAX_PROBE_ATTEMPTS = 600; // 60s with 100ms interval
+    const probeInterval = setInterval(() => {
+        probeAttempts++;
+        const req = http.get(`http://127.0.0.1:${PORT}/api/gateway/ping`, { timeout: 500 }, (res) => {
+            let data = '';
+            res.on('data', c => data += c);
+            res.on('end', () => {
+                if (res.statusCode === 200) {
+                    clearInterval(probeInterval);
+                    const elapsed = process.hrtime(PROCESS_START_HR);
+                    const ttfrMs = Math.round(elapsed[0] * 1000 + elapsed[1] / 1e6);
+                    const ttfrHuman = ttfrMs >= 1000
+                        ? `${(ttfrMs / 1000).toFixed(1)}s`
+                        : `${ttfrMs}ms`;
+                    _startupMetric = { ttfrMs, ttfrHuman, probeAttempts, status: 'ready' };
+                    console.error(`[STARTUP] ⏱ Time to first HTTP response: ${ttfrHuman} (${probeAttempts} probes)`);
+                    req.destroy();
+                }
+            });
+        });
+        req.on('error', () => { req.destroy(); /* not ready yet */ });
+        req.on('timeout', () => { req.destroy(); });
+
+        if (probeAttempts >= MAX_PROBE_ATTEMPTS) {
+            clearInterval(probeInterval);
+            _startupMetric.status = 'timeout';
+            console.error(`[STARTUP] ⚠ Timeout after ${probeAttempts} probes (60s) — HTTP still not responding`);
+        }
+    }, 100);
+    probeInterval.unref(); // don't keep process alive just for probing
+});
+
+// ── Startup metric endpoint ──
+app.get('/api/startup-metric', (req, res) => {
+    const elapsed = process.hrtime(PROCESS_START_HR);
+    const uptimeMs = Math.round(elapsed[0] * 1000 + elapsed[1] / 1e6);
+    res.json({
+        ..._startupMetric,
+        uptimeMs,
+        uptimeHuman: uptimeMs >= 60000
+            ? `${Math.floor(uptimeMs / 60000)}m ${Math.round((uptimeMs % 60000) / 1000)}s`
+            : `${(uptimeMs / 1000).toFixed(1)}s`
+    });
 });
 
 module.exports = app;

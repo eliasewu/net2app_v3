@@ -36,6 +36,12 @@ class TokenBucket {
     return Math.ceil((1 - this.tokens) / this.refillRate * 1000);
   }
 
+  /** Check if tokens are available without consuming */
+  peek(count = 1) {
+    this.refill();
+    return this.tokens >= count;
+  }
+
   getAvailable() {
     this.refill();
     return Math.floor(this.tokens);
@@ -81,7 +87,30 @@ class RateLimiter {
     }
   }
 
-  /** Check if a client can send more messages. Returns { allowed, waitMs } */
+  /** Check if client can send WITHOUT consuming a token.
+   * Used by SMPP server to decide whether to enqueue with delay vs immediately. */
+  peekClient(clientId) {
+    let bucket = this.clientBuckets.get(clientId);
+    if (!bucket) {
+      bucket = new TokenBucket(this.defaultClientTPS, this.defaultClientTPS);
+      this.clientBuckets.set(clientId, bucket);
+    }
+    bucket.refill();
+    return { allowed: bucket.tokens >= 1, waitMs: bucket.tokens >= 1 ? 0 : bucket.getWaitMs() };
+  }
+
+  /** Check if supplier can handle more WITHOUT consuming a token. */
+  peekSupplier(supplierId) {
+    let bucket = this.supplierBuckets.get(supplierId);
+    if (!bucket) {
+      bucket = new TokenBucket(this.defaultSupplierTPS, this.defaultSupplierTPS);
+      this.supplierBuckets.set(supplierId, bucket);
+    }
+    bucket.refill();
+    return { allowed: bucket.tokens >= 1, waitMs: bucket.tokens >= 1 ? 0 : bucket.getWaitMs() };
+  }
+
+  /** Check if a client can send more messages (consumes a token). Returns { allowed, waitMs } */
   checkClient(clientId) {
     let bucket = this.clientBuckets.get(clientId);
     if (!bucket) {
@@ -93,7 +122,7 @@ class RateLimiter {
     return { allowed, waitMs: allowed ? 0 : bucket.getWaitMs() };
   }
 
-  /** Check if a supplier pipeline can send more messages */
+  /** Check if a supplier pipeline can send more messages (consumes a token) */
   checkSupplier(supplierId) {
     let bucket = this.supplierBuckets.get(supplierId);
     if (!bucket) {

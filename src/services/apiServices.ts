@@ -51,6 +51,12 @@ export const smsService = {
 
 // ==================== RATE API (convenience export for ClientRates.tsx) ====================
 export const ratesApi = {
+  getRateHistory: async (entity_type: string, entity_id: string | number, mcc?: string, mnc?: string) => {
+    const params = new URLSearchParams({ entity_type, entity_id: String(entity_id) });
+    if (mcc) params.append('mcc', mcc);
+    if (mnc) params.append('mnc', mnc);
+    return api.get<any>(`/rates/history?${params.toString()}`);
+  },
 };
 
 // ==================== RATE MANAGEMENT WITH NOTIFICATION ====================
