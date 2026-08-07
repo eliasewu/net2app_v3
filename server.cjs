@@ -2640,7 +2640,7 @@ app.post('/api/clients/:id/send-welcome', auth, async (req, res) => {
         const result = await pool.query('SELECT * FROM clients WHERE id = $1', [id]);
         if (result.rows.length === 0) return res.status(404).json({ error: 'Client not found' });
         const client = result.rows[0];
-        await sendWelcomeEmail('client', client);
+        await sendWelcomeEmail('client', client).catch(e => console.error('[WELCOME] Client welcome email failed:', e.message));
         res.json({ success: true, message: `Welcome email sent to ${client.email}` });
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -2661,7 +2661,7 @@ app.post('/api/portal/toggle', auth, async (req, res) => {
         const entity = result.rows[0];
         if (entity.portal_access) {
             const fullR = await pool.query(`SELECT * FROM ${table} WHERE id = $1`, [entity_id]);
-            await ensurePortalUser(entity_type, fullR.rows[0]).catch(() => {});
+            await ensurePortalUser(entity_type, fullR.rows[0]).catch(e => console.error('[PORTAL] Toggle portal user creation failed:', e.message));
             await sendWelcomeEmail(entity_type, fullR.rows[0]).catch(e => console.error('[WELCOME] Portal toggle welcome email failed:', e.message));
         }
         res.json({ success: true, data: entity });
@@ -2674,11 +2674,11 @@ app.post('/api/portal/sync-all', auth, async (req, res) => {
         let clientCount = 0, supplierCount = 0;
         const clients = await pool.query("SELECT * FROM clients WHERE status='active' AND portal_access=true AND smpp_password IS NOT NULL AND (is_deleted IS NULL OR is_deleted=false)");
         for (const c of clients.rows) {
-            try { await ensurePortalUser('client', c); clientCount++; } catch {}
+            try { await ensurePortalUser('client', c); clientCount++; } catch(e) { console.error('[PORTAL] Sync-all client user creation failed for', c.client_code, ':', e.message); }
         }
         const suppliers = await pool.query("SELECT * FROM suppliers WHERE status='active' AND portal_access=true AND smpp_password IS NOT NULL AND (is_deleted IS NULL OR is_deleted=false)");
         for (const s of suppliers.rows) {
-            try { await ensurePortalUser('supplier', s); supplierCount++; } catch {}
+            try { await ensurePortalUser('supplier', s); supplierCount++; } catch(e) { console.error('[PORTAL] Sync-all supplier user creation failed for', s.supplier_code, ':', e.message); }
         }
         res.json({ success: true, data: { clients_synced: clientCount, suppliers_synced: supplierCount } });
     } catch (e) { res.status(500).json({ error: e.message }); }
