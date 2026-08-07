@@ -2157,20 +2157,176 @@ async function sendWelcomeEmail(entityType, entity) {
             auth: { user: smtp.username, pass: smtp.password },
             tls: { rejectUnauthorized: false },
         });
-        const html = `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px">
-<h2 style="color:#1a56db">Welcome to NET2APP Hub!</h2>
-<p>Your ${entityType} account has been created:</p>
-<table style="border-collapse:collapse;width:100%;margin:16px 0">
-<tr><td style="padding:8px;background:#f3f4f6;font-weight:bold">${entityType === 'client' ? 'Client' : 'Supplier'} Code</td><td style="padding:8px">${code}</td></tr>
-<tr><td style="padding:8px;background:#f3f4f6;font-weight:bold">SMPP Username</td><td style="padding:8px">${entity.smpp_username}</td></tr>
-<tr><td style="padding:8px;background:#f3f4f6;font-weight:bold">SMPP Password</td><td style="padding:8px">${entity.smpp_password}</td></tr>
-<tr><td style="padding:8px;background:#f3f4f6;font-weight:bold">SMPP Server IP</td><td style="padding:8px">${serverIP}</td></tr>
-<tr><td style="padding:8px;background:#f3f4f6;font-weight:bold">SMPP Port</td><td style="padding:8px">2775</td></tr>
-<tr><td style="padding:8px;background:#f3f4f6;font-weight:bold">Web Portal</td><td style="padding:8px"><a href="http://${serverIP}:3001">http://${serverIP}:3001</a></td></tr>
-<tr><td style="padding:8px;background:#f3f4f6;font-weight:bold">Portal Login</td><td style="padding:8px">Username: <b>${code}</b> / Password: <b>${entity.smpp_password}</b></td></tr>
-</table>
-<p style="color:#6b7280;font-size:14px">Use these credentials to bind your SMPP client and access the web portal.</p>
-</div>`;
+        const smtpFromName = smtp.from_name || 'NET2APP';
+        const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="light">
+<title>Welcome to NET2APP Hub</title>
+<style>
+  /* Reset & Base */
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background:#f1f5f9; color:#1e293b; line-height:1.6; -webkit-text-size-adjust:100%; -ms-text-size-adjust:100%; }
+  
+  /* Container */
+  .email-wrapper { max-width:600px; margin:0 auto; background:#ffffff; }
+  
+  /* Header */
+  .header { background: linear-gradient(135deg, #1e3a5f 0%, #1a56db 50%, #3b82f6 100%); padding:32px 24px; text-align:center; }
+  .header .logo { display:inline-block; background:rgba(255,255,255,0.15); border-radius:16px; padding:14px 24px; margin-bottom:12px; }
+  .header .logo-icon { font-size:32px; line-height:1; display:block; }
+  .header .logo-text { color:#ffffff; font-size:22px; font-weight:800; letter-spacing:-0.5px; margin-top:4px; }
+  .header .subtitle { color:rgba(255,255,255,0.85); font-size:14px; margin-top:6px; font-weight:400; }
+  
+  /* Body */
+  .body-content { padding:28px 24px 20px; }
+  .greeting { font-size:20px; font-weight:700; color:#1e293b; margin-bottom:6px; }
+  .greeting-emoji { font-size:24px; }
+  .intro { font-size:15px; color:#475569; margin-bottom:8px; line-height:1.7; }
+  .entity-badge { display:inline-block; background:#dbeafe; color:#1e40af; font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:0.5px; padding:4px 12px; border-radius:20px; margin-bottom:20px; }
+  
+  /* Credentials Card */
+  .creds-card { background:#f8fafc; border:1px solid #e2e8f0; border-radius:12px; overflow:hidden; margin-bottom:24px; }
+  .creds-card .card-header { background:#e8f0fe; padding:14px 20px; font-size:13px; font-weight:700; color:#1e40af; text-transform:uppercase; letter-spacing:0.5px; border-bottom:1px solid #cbd5e1; }
+  .creds-table { width:100%; border-collapse:collapse; }
+  .creds-table td { padding:12px 20px; font-size:14px; border-bottom:1px solid #e2e8f0; }
+  .creds-table tr:last-child td { border-bottom:none; }
+  .creds-table .label { color:#64748b; font-weight:600; font-size:13px; width:40%; white-space:nowrap; }
+  .creds-table .value { color:#1e293b; font-family:'SF Mono', 'Fira Code', 'Courier New', monospace; font-size:13px; word-break:break-all; }
+  .creds-table .value a { color:#1a56db; text-decoration:none; font-weight:600; }
+  
+  /* Quick Start */
+  .quickstart { background:linear-gradient(135deg, #eff6ff, #dbeafe); border-radius:12px; padding:20px 24px; margin-bottom:24px; border:1px solid #bfdbfe; }
+  .quickstart h3 { font-size:16px; font-weight:700; color:#1e40af; margin-bottom:12px; }
+  .quickstart ol { padding-left:20px; margin:0; }
+  .quickstart li { font-size:14px; color:#334155; margin-bottom:8px; padding-left:4px; }
+  .quickstart li::marker { color:#3b82f6; font-weight:700; }
+  .quickstart code { background:#ffffff; border:1px solid #cbd5e1; border-radius:4px; padding:1px 6px; font-size:13px; color:#1e40af; }
+  
+  /* CTA Button */
+  .cta-wrap { text-align:center; margin-bottom:8px; }
+  .cta-button { display:inline-block; background:linear-gradient(135deg, #1a56db, #2563eb); color:#ffffff; text-decoration:none; padding:14px 36px; border-radius:8px; font-size:15px; font-weight:700; letter-spacing:0.3px; box-shadow:0 2px 8px rgba(26,86,219,0.3); }
+  
+  /* Footer */
+  .footer { background:#f1f5f9; padding:20px 24px; text-align:center; border-top:1px solid #e2e8f0; }
+  .footer .brand { font-size:13px; font-weight:700; color:#475569; margin-bottom:4px; }
+  .footer .copy { font-size:11px; color:#94a3b8; }
+  .footer .help { font-size:12px; color:#64748b; margin-top:8px; }
+  .footer .help a { color:#1a56db; text-decoration:none; }
+  
+  /* Mobile Responsive */
+  @media only screen and (max-width:480px) {
+    .header { padding:24px 16px; }
+    .header .logo-text { font-size:19px; }
+    .body-content { padding:20px 16px 16px; }
+    .greeting { font-size:18px; }
+    .creds-table .label { width:35%; font-size:12px; }
+    .creds-table .value { font-size:12px; }
+    .creds-table td { padding:10px 14px; }
+    .quickstart { padding:16px 18px; }
+    .cta-button { padding:12px 28px; font-size:14px; display:block; }
+    .footer { padding:16px; }
+  }
+  
+  /* Dark mode support */
+  @media (prefers-color-scheme:dark) {
+    body { background:#0f172a; }
+    .email-wrapper { background:#1e293b; }
+    .greeting, .intro { color:#e2e8f0; }
+    .creds-card { background:#1e293b; border-color:#334155; }
+    .creds-card .card-header { background:#1e3a5f; color:#93c5fd; border-color:#334155; }
+    .creds-table td { border-color:#334155; }
+    .creds-table .label { color:#94a3b8; }
+    .creds-table .value { color:#e2e8f0; }
+    .quickstart { background:linear-gradient(135deg, #1e293b, #1e3a5f); border-color:#334155; }
+    .quickstart h3 { color:#93c5fd; }
+    .quickstart li { color:#cbd5e1; }
+    .quickstart code { background:#0f172a; border-color:#475569; color:#93c5fd; }
+    .footer { background:#0f172a; border-color:#334155; }
+    .footer .brand { color:#94a3b8; }
+  }
+</style>
+</head>
+<body>
+<div class="email-wrapper">
+  <!-- Branded Header -->
+  <div class="header">
+    <div class="logo">
+      <span class="logo-icon">📡</span>
+      <div class="logo-text">${smtpFromName}</div>
+    </div>
+    <div class="subtitle">Enterprise SMS Platform</div>
+  </div>
+  
+  <!-- Body Content -->
+  <div class="body-content">
+    <div class="greeting"><span class="greeting-emoji">👋</span> Welcome aboard!</div>
+    <p class="intro">Your <strong>${entityType}</strong> account has been created and is ready to use. Below are your connection credentials and portal access details.</p>
+    <span class="entity-badge">${entityType === 'client' ? '🗂 Client Account' : '📦 Supplier Account'}</span>
+    
+    <!-- Credentials Card -->
+    <div class="creds-card">
+      <div class="card-header">🔐 Connection Credentials</div>
+      <table class="creds-table" role="presentation">
+        <tr>
+          <td class="label">${entityType === 'client' ? 'Client' : 'Supplier'} Code</td>
+          <td class="value">${code}</td>
+        </tr>
+        <tr>
+          <td class="label">SMPP Username</td>
+          <td class="value">${entity.smpp_username || '—'}</td>
+        </tr>
+        <tr>
+          <td class="label">SMPP Password</td>
+          <td class="value">${entity.smpp_password || '—'}</td>
+        </tr>
+        <tr>
+          <td class="label">SMPP Server IP</td>
+          <td class="value">${serverIP}</td>
+        </tr>
+        <tr>
+          <td class="label">SMPP Port</td>
+          <td class="value">2775</td>
+        </tr>
+        <tr>
+          <td class="label">Web Portal</td>
+          <td class="value"><a href="http://${serverIP}:3001">http://${serverIP}:3001</a></td>
+        </tr>
+        <tr>
+          <td class="label">Portal Login</td>
+          <td class="value">Username: <strong>${code}</strong> / Password: <strong>${entity.smpp_password || '—'}</strong></td>
+        </tr>
+      </table>
+    </div>
+    
+    <!-- Quick Start Guide -->
+    <div class="quickstart">
+      <h3>🚀 Quick Start</h3>
+      <ol>
+        <li>Configure your SMPP client with the <strong>Server IP</strong> and <strong>Port</strong> above</li>
+        <li>Bind using <code>${entity.smpp_username || 'your-username'}</code> as <strong>system_id</strong></li>
+        <li>Log in to the <a href="http://${serverIP}:3001">Web Portal</a> using your <strong>${entityType} code</strong> and <strong>SMPP password</strong></li>
+        <li>Start sending SMS through the platform! 🎉</li>
+      </ol>
+    </div>
+    
+    <!-- CTA -->
+    <div class="cta-wrap">
+      <a href="http://${serverIP}:3001" class="cta-button">🚪 Go to Portal →</a>
+    </div>
+  </div>
+  
+  <!-- Footer -->
+  <div class="footer">
+    <div class="brand">${smtpFromName}</div>
+    <div class="copy">© ${new Date().getFullYear()} ${smtpFromName}. All rights reserved.</div>
+    <div class="help">Need help? Contact <a href="mailto:${smtp.from_email}">${smtp.from_email}</a></div>
+  </div>
+</div>
+</body>
+</html>`;
         await transporter.sendMail({
             from: `"${smtp.from_name || 'NET2APP'}" <${smtp.from_email}>`,
             to: email,
