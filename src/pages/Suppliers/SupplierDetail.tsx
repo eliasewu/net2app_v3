@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Edit, Trash2, Wifi, WifiOff, RefreshCw, TestTube, Phone, Globe, Server, CheckCircle, Download, Copy, ToggleLeft, ToggleRight } from 'lucide-react';
+import { ArrowLeft, Edit, Trash2, Wifi, WifiOff, RefreshCw, TestTube, Phone, Globe, Server, CheckCircle, Download, Copy, ToggleLeft, ToggleRight, Send } from 'lucide-react';
 import { useData } from '../../store/DataContext';
 import { suppliersApi, portalApi } from '../../services/api';
 import { Card } from '../../components/UI/Card';
@@ -23,6 +23,8 @@ export const SupplierDetail: React.FC = () => {
   const [editingQueue, setEditingQueue] = useState(false);
   const [queueSize, setQueueSize] = useState(supplier?.max_queue_size ?? 1000);
   const [togglingPortal, setTogglingPortal] = useState(false);
+  const [sendingWelcome, setSendingWelcome] = useState(false);
+  const [welcomeSent, setWelcomeSent] = useState(false);
 
   if (!supplier) {
     return <div className="text-center py-12"><p className="text-gray-600 text-lg">Supplier not found</p><Button variant="secondary" onClick={() => navigate('/suppliers')} className="mt-4">Back to Suppliers</Button></div>;
@@ -127,6 +129,34 @@ export const SupplierDetail: React.FC = () => {
           <p className="text-[10px] text-gray-400 mt-1">
             {(supplier as any).portal_access ? 'Supplier can log in with SMPP creds' : 'Click to enable portal login'}
           </p>
+          <button
+            onClick={async (e) => {
+              e.stopPropagation();
+              setSendingWelcome(true);
+              setWelcomeSent(false);
+              try {
+                await suppliersApi.sendWelcomeEmail(supplier.id);
+                setWelcomeSent(true);
+                setTimeout(() => setWelcomeSent(false), 3000);
+              } catch (e) { console.error('Resend welcome failed:', e); }
+              setSendingWelcome(false);
+            }}
+            disabled={sendingWelcome}
+            className={`mt-2 w-full py-1.5 px-3 rounded-lg text-xs font-medium transition-all flex items-center justify-center gap-1.5 ${
+              welcomeSent
+                ? 'bg-green-100 text-green-700 border border-green-300'
+                : 'bg-blue-50 text-blue-600 hover:bg-blue-100 border border-blue-200'
+            }`}
+          >
+            {sendingWelcome ? (
+              <span className="w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
+            ) : welcomeSent ? (
+              <CheckCircle size={14} />
+            ) : (
+              <Send size={14} />
+            )}
+            {welcomeSent ? 'Sent!' : 'Resend Welcome Email'}
+          </button>
         </div></div>
       </div>
 

@@ -1,13 +1,13 @@
 import React, { useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Edit, Trash2, Send, CreditCard, BarChart3, MessageSquare, Radio, PhoneCall, ToggleLeft, ToggleRight, Wifi, WifiOff, RefreshCw, Globe } from 'lucide-react';
+import { ArrowLeft, Edit, Trash2, Send, CreditCard, BarChart3, MessageSquare, Radio, PhoneCall, ToggleLeft, ToggleRight, Wifi, WifiOff, RefreshCw, Globe, CheckCircle } from 'lucide-react';
 import { useData } from '../../store/DataContext';
 import { Card } from '../../components/UI/Card';
 import { Button } from '../../components/UI/Button';
 import { Badge } from '../../components/UI/Badge';
 import { Modal } from '../../components/UI/Modal';
 import { Input } from '../../components/UI/Input';
-import { voiceOtpApi, bindApi, portalApi } from '../../services/api';
+import { voiceOtpApi, bindApi, portalApi, clientsApi } from '../../services/api';
 
 export const ClientDetail: React.FC = () => {
   const { id } = useParams<{ id: string }>();
@@ -23,6 +23,8 @@ export const ClientDetail: React.FC = () => {
   const [testingOtp, setTestingOtp] = useState(false);
   const [testResult, setTestResult] = useState<any>(null);
   const [togglingPortal, setTogglingPortal] = useState(false);
+  const [sendingWelcome, setSendingWelcome] = useState(false);
+  const [welcomeSent, setWelcomeSent] = useState(false);
 
   if (!client) {
     return (
@@ -157,6 +159,34 @@ export const ClientDetail: React.FC = () => {
             <p className="text-[10px] text-gray-400 mt-1">
               {(client as any).portal_access ? 'Client can log in with SMPP creds' : 'Click to enable portal login'}
             </p>
+            <button
+              onClick={async (e) => {
+                e.stopPropagation();
+                setSendingWelcome(true);
+                setWelcomeSent(false);
+                try {
+                  await clientsApi.sendWelcomeEmail(client.id);
+                  setWelcomeSent(true);
+                  setTimeout(() => setWelcomeSent(false), 3000);
+                } catch (e) { console.error('Resend welcome failed:', e); }
+                setSendingWelcome(false);
+              }}
+              disabled={sendingWelcome}
+              className={`mt-2 w-full py-1.5 px-3 rounded-lg text-xs font-medium transition-all flex items-center justify-center gap-1.5 ${
+                welcomeSent
+                  ? 'bg-green-100 text-green-700 border border-green-300'
+                  : 'bg-blue-50 text-blue-600 hover:bg-blue-100 border border-blue-200'
+              }`}
+            >
+              {sendingWelcome ? (
+                <span className="w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
+              ) : welcomeSent ? (
+                <CheckCircle size={14} />
+              ) : (
+                <Send size={14} />
+              )}
+              {welcomeSent ? 'Sent!' : 'Resend Welcome Email'}
+            </button>
           </div>
         </div>
       </div>

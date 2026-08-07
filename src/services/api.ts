@@ -192,6 +192,7 @@ export const suppliersApi = {
   unbind: (id: string) => api.post(`/suppliers/${id}/unbind`, {}),
   testConnection: (id: string) => api.post<any>(`/suppliers/${id}/test`, {}),
   resetFailures: (id: string) => api.post(`/suppliers/${id}/reset-failures`, {}),
+  sendWelcomeEmail: (id: string) => api.post(`/suppliers/${id}/send-welcome`, {}),
 };
 
 // ==================== RATES API ====================
