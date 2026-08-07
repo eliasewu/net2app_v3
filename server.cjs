@@ -134,6 +134,47 @@ function genNumericMsgId(prefix) {
   return (prefix || '0') + ts + rand;
 }
 
+// ── SMS Message Parts Calculator ──
+// Detects whether a message uses GSM-7 or Unicode (UCS-2) encoding
+// and returns the correct number of SMS segments per 3GPP TS 23.038.
+//
+// GSM-7 (160-char single, 153-char multi-part with 7-byte UDH)
+// Unicode/UCS-2 (70-char single, 67-char multi-part with 6-byte UDH)
+//
+// Any character outside the GSM-7 basic set forces Unicode encoding.
+function calculateMessageParts(message) {
+    if (!message) return 1;
+    // GSM-7 basic character set (3GPP TS 23.038)
+    // Build a Set for O(1) lookup per character
+    const GSM7_CHARS = new Set([
+        '@','£','$','¥','è','é','ù','ì','ò','Ç','\n','Ø','ø','\r','Å','å',
+        'Δ','_','Φ','Γ','Λ','Ω','Π','Ψ','Σ','Θ','Ξ','\x1B','Æ','æ','ß','É',
+        ' ','!','"','#','¤','%','&','\'','(',')','*','+',',','-','.','/',
+        '0','1','2','3','4','5','6','7','8','9',':',';','<','=','>','?',
+        '¡','A','B','C','D','E','F','G','H','I','J','K','L','M','N','O',
+        'P','Q','R','S','T','U','V','W','X','Y','Z','Ä','Ö','Ñ','Ü','§',
+        '¿','a','b','c','d','e','f','g','h','i','j','k','l','m','n','o',
+        'p','q','r','s','t','u','v','w','x','y','z','ä','ö','ñ','ü','à',
+        // Extended GSM-7 (count as 2 chars for length but still GSM encoding)
+        '\f','^','{','}','\\','[','~',']','|','€',
+    ]);
+    let isGSM7 = true;
+    for (let i = 0; i < message.length; i++) {
+        if (!GSM7_CHARS.has(message[i])) {
+            isGSM7 = false;
+            break;
+        }
+    }
+    if (isGSM7) {
+        if (message.length <= 160) return 1;
+        return Math.ceil(message.length / 153);
+    } else {
+        // Unicode (UCS-2): 70 chars/single, 67/multi-part (6-byte UDH)
+        if (message.length <= 70) return 1;
+        return Math.ceil(message.length / 67);
+    }
+}
+
 // PRODUCTION-TUNED POOL: 50 connections for 1000+ clients/suppliers
 // idleTimeoutMillis: release idle connections after 30s
 // connectionTimeoutMillis: fail fast if DB is slow
@@ -1201,6 +1242,38 @@ let smppServer = null; // Set by SmppServer import (for Android Gateway DLR push
                                 continue;
                             }
                             client = clientR.rows[0];
+
+                            // Tenant checks: expiry + SMS quota
+                            if (client.tenant_id) {
+                                const tR = await pool.query('SELECT * FROM tenants WHERE id = $1', [client.tenant_id]);
+                                if (tR.rows.length > 0) {
+                                    const t = tR.rows[0];
+                                    // Check expiry
+                                    if (t.expiry_date && new Date(t.expiry_date) < new Date()) {
+                                        console.error('[SMPP-RELAY] Blocked ' + log.message_id + ': tenant ' + t.code + ' expired');
+                                        await pool.query('UPDATE sms_logs SET error_code=$1,error_message=$2,status=$3 WHERE id=$4', ['TENANT_EXPIRED','Tenant licence expired ('+t.code+')','failed',log.id]);
+                                        await pushInboundSupplierDlr(log, 'TENANT_EXPIRED', 'Tenant licence expired');
+                                        continue;
+                                    }
+                                    // Check SMS quota
+                                    const maxSMS = (t.limits && t.limits.max_sms_monthly) ? parseInt(t.limits.max_sms_monthly) : 0;
+                                    if (maxSMS > 0) {
+                                        const usedR = await pool.query(
+                                            `SELECT COALESCE(SUM(COALESCE(message_parts,1)),0)::int AS used FROM sms_logs
+                                             WHERE client_id IN (SELECT id FROM clients WHERE tenant_id=$1)
+                                               AND created_at > date_trunc('month',NOW())`,
+                                            [client.tenant_id]
+                                        );
+                                        const used = parseInt(usedR.rows[0]?.used) || 0;
+                                        if (used >= maxSMS) {
+                                            console.error('[SMPP-RELAY] Blocked ' + log.message_id + ': tenant ' + t.code + ' quota exceeded ('+used+'/'+maxSMS+')');
+                                            await pool.query('UPDATE sms_logs SET error_code=$1,error_message=$2,status=$3 WHERE id=$4', ['TENANT_QUOTA_EXCEEDED','Monthly SMS limit reached ('+t.code+': '+used+'/'+maxSMS+')','failed',log.id]);
+                                            await pushInboundSupplierDlr(log, 'TENANT_QUOTA_EXCEEDED', 'Monthly SMS limit reached');
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
                         }
 
                         // Resolve route (MCC/MNC → supplier, trunk, supplier_rate)
@@ -1307,7 +1380,7 @@ let smppServer = null; // Set by SmppServer import (for Android Gateway DLR push
                             console.error(`[SMPP-RELAY] ⚠ ${log.message_id}: Queue manager not available — will retry next cycle`);
                             continue; // Don't set error_code — retry when queue is ready
                         }
-                        const parts = Math.max(1, Math.ceil((translated.message || '').length / 160));
+                        const parts = calculateMessageParts(translated.message);
                         await queueManager.enqueue({
                                 message_id: log.message_id,
                                 client_id: log.client_id,
@@ -1800,6 +1873,34 @@ const auth = async (req, res, next) => {
         if (!token) return res.status(401).json({ error: 'No token provided' });
         const decoded = jwt.verify(token, JWT_SECRET);
         req.user = decoded;
+        // Resolve client_id/supplier_id for portal users
+        if (decoded.role === 'client') {
+            const cR = await pool.query(
+                'SELECT id FROM clients WHERE (client_code = $1 OR smpp_username = $1) AND status = $2 AND (is_deleted IS NULL OR is_deleted = false)',
+                [decoded.username, 'active']
+            );
+            if (cR.rows.length > 0) req.user.client_id = cR.rows[0].id;
+        } else if (decoded.role === 'supplier') {
+            const sR = await pool.query(
+                'SELECT id FROM suppliers WHERE (supplier_code = $1 OR smpp_username = $1) AND status = $2 AND (is_deleted IS NULL OR is_deleted = false)',
+                [decoded.username, 'active']
+            );
+            if (sR.rows.length > 0) req.user.supplier_id = sR.rows[0].id;
+        }
+        next();
+    } catch (error) {
+        return res.status(401).json({ error: 'Invalid token' });
+    }
+};
+
+// Super Admin only — gates license, tenant, and system-level operations
+const superAuth = async (req, res, next) => {
+    try {
+        const token = extractToken(req);
+        if (!token) return res.status(401).json({ error: 'No token provided' });
+        const decoded = jwt.verify(token, JWT_SECRET);
+        if (decoded.role !== 'super_admin') return res.status(403).json({ error: 'Super Admin access required' });
+        req.user = decoded;
         next();
     } catch (error) {
         return res.status(401).json({ error: 'Invalid token' });
@@ -1810,21 +1911,51 @@ const auth = async (req, res, next) => {
 app.post('/api/auth/login', async (req, res) => {
     try {
         const { username, password } = req.body;
+        // 1. Try users table first (admins, support, etc.)
         const result = await pool.query('SELECT * FROM users WHERE username = $1 OR email = $1', [username]);
-        if (result.rows.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
-        const user = result.rows[0];
-        const validPassword = await bcrypt.compare(password, user.password_hash);
-        if (!validPassword) return res.status(401).json({ error: 'Invalid credentials' });
-        const token = jwt.sign(
-            { id: user.id, username: user.username, role: user.role },
-            JWT_SECRET,
-            { expiresIn: '24h' }
+        if (result.rows.length > 0) {
+            const user = result.rows[0];
+            const validPassword = await bcrypt.compare(password, user.password_hash);
+            if (validPassword) {
+                const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET, { expiresIn: '24h' });
+                res.cookie('token', token, COOKIE_OPTIONS);
+                return res.json({ success: true, token, user });
+            }
+        }
+        // 2. Fallback: try client portal login (client_code + smpp_password)
+        const clientR = await pool.query(
+            'SELECT * FROM clients WHERE (client_code = $1 OR smpp_username = $1) AND smpp_password = $2 AND portal_access = true AND status = $3 AND (is_deleted IS NULL OR is_deleted = false)',
+            [username, password, 'active']
         );
-        // Set httpOnly cookie for session-based auth
-        res.cookie('token', token, COOKIE_OPTIONS);
-        // Also return token in body for backward compatibility with api.ts setToken
-        res.json({ success: true, token, user });
+        if (clientR.rows.length > 0) {
+            const c = clientR.rows[0];
+            // Auto-create user if not exists
+            const uid = await ensurePortalUser('client', c);
+            if (uid) {
+                const userR = await pool.query('SELECT * FROM users WHERE id = $1', [uid]);
+                const token = jwt.sign({ id: uid, username: c.client_code, role: 'client' }, JWT_SECRET, { expiresIn: '24h' });
+                res.cookie('token', token, COOKIE_OPTIONS);
+                return res.json({ success: true, token, user: userR.rows[0] });
+            }
+        }
+        // 3. Fallback: try supplier portal login (supplier_code + smpp_password)
+        const suppR = await pool.query(
+            'SELECT * FROM suppliers WHERE (supplier_code = $1 OR smpp_username = $1) AND smpp_password = $2 AND portal_access = true AND status = $3 AND (is_deleted IS NULL OR is_deleted = false)',
+            [username, password, 'active']
+        );
+        if (suppR.rows.length > 0) {
+            const s = suppR.rows[0];
+            const uid = await ensurePortalUser('supplier', s);
+            if (uid) {
+                const userR = await pool.query('SELECT * FROM users WHERE id = $1', [uid]);
+                const token = jwt.sign({ id: uid, username: s.supplier_code, role: 'supplier' }, JWT_SECRET, { expiresIn: '24h' });
+                res.cookie('token', token, COOKIE_OPTIONS);
+                return res.json({ success: true, token, user: userR.rows[0] });
+            }
+        }
+        return res.status(401).json({ error: 'Invalid credentials' });
     } catch (error) {
+        console.error('[AUTH] Login error:', error.message, error.stack);
         res.status(500).json({ error: 'Internal server error' });
     }
 });
@@ -1838,6 +1969,14 @@ app.get('/api/auth/me', auth, async (req, res) => {
         );
         if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
         const user = result.rows[0];
+        // For client/supplier portal users, resolve entity IDs
+        if (user.role === 'client') {
+            const cR = await pool.query('SELECT id FROM clients WHERE (client_code = $1 OR smpp_username = $1) AND status = $2 AND (is_deleted IS NULL OR is_deleted = false)', [user.username, 'active']);
+            if (cR.rows.length > 0) user.client_id = cR.rows[0].id;
+        } else if (user.role === 'supplier') {
+            const sR = await pool.query('SELECT id FROM suppliers WHERE (supplier_code = $1 OR smpp_username = $1) AND status = $2 AND (is_deleted IS NULL OR is_deleted = false)', [user.username, 'active']);
+            if (sR.rows.length > 0) user.supplier_id = sR.rows[0].id;
+        }
         res.json({ success: true, data: user });
     } catch (error) {
         res.status(500).json({ error: 'Internal server error' });
@@ -1958,6 +2097,86 @@ app.get('/api/clients/:id', auth, async (req, res) => {
     }
 });
 
+// ── Portal User Helper ──
+// Creates a portal user account for a client or supplier if portal_access is true.
+// Username = client_code or supplier_code, password = smpp_password (bcrypt hashed).
+// Skips if user already exists (idempotent).
+async function ensurePortalUser(entityType, entity) {
+    const username = entity.client_code || entity.supplier_code;
+    const password = entity.smpp_password;
+    const email = entity.email || '';
+    if (!username || !password) return null;
+    const role = entityType === 'client' ? 'client' : 'supplier';
+    // Check if user already exists
+    const existing = await pool.query('SELECT id FROM users WHERE username = $1', [username]);
+    if (existing.rows.length > 0) {
+        // Update password hash to match current smpp_password
+        const hash = await bcrypt.hash(password, 10);
+        await pool.query('UPDATE users SET password_hash = $1, email = CASE WHEN $2 = \'\' THEN email ELSE $2 END, role = $3 WHERE username = $4', [hash, email, role, username]);
+        return existing.rows[0].id;
+    }
+    const hash = await bcrypt.hash(password, 10);
+    const result = await pool.query(
+        `INSERT INTO users (username, password_hash, email, role, name, is_active, created_at)
+         VALUES ($1, $2, $3, $4, $5, true, NOW()) RETURNING id`,
+        [username, hash, email, role, entity.company_name || username]
+    );
+    return result.rows[0].id;
+}
+
+// ── Welcome Email Helper ──
+// Sends welcome email with SMPP credentials + server info via configured SMTP.
+async function sendWelcomeEmail(entityType, entity) {
+    try {
+        const smtpR = await pool.query("SELECT * FROM smtp_config WHERE is_active = true LIMIT 1");
+        if (!smtpR.rows.length) { console.error('[WELCOME] No active SMTP config — skipping email'); return; }
+        const smtp = smtpR.rows[0];
+        const code = entity.client_code || entity.supplier_code;
+        const email = entity.email;
+        if (!email) { console.error('[WELCOME] No email for ' + code + ' — skipping'); return; }
+        // Get server IP
+        const os = require('os');
+        let serverIP = '127.0.0.1';
+        try {
+            const ifaces = os.networkInterfaces();
+            for (const iface of Object.values(ifaces)) {
+                for (const addr of iface) {
+                    if (!addr.internal && addr.family === 'IPv4') { serverIP = addr.address; break; }
+                }
+                if (serverIP !== '127.0.0.1') break;
+            }
+        } catch {}
+        const transporter = nodemailer.createTransport({
+            host: smtp.host, port: parseInt(smtp.port) || 587,
+            secure: smtp.encryption === 'ssl',
+            auth: { user: smtp.username, pass: smtp.password },
+        });
+        const html = `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px">
+<h2 style="color:#1a56db">Welcome to NET2APP Hub!</h2>
+<p>Your ${entityType} account has been created:</p>
+<table style="border-collapse:collapse;width:100%;margin:16px 0">
+<tr><td style="padding:8px;background:#f3f4f6;font-weight:bold">${entityType === 'client' ? 'Client' : 'Supplier'} Code</td><td style="padding:8px">${code}</td></tr>
+<tr><td style="padding:8px;background:#f3f4f6;font-weight:bold">SMPP Username</td><td style="padding:8px">${entity.smpp_username}</td></tr>
+<tr><td style="padding:8px;background:#f3f4f6;font-weight:bold">SMPP Password</td><td style="padding:8px">${entity.smpp_password}</td></tr>
+<tr><td style="padding:8px;background:#f3f4f6;font-weight:bold">SMPP Server IP</td><td style="padding:8px">${serverIP}</td></tr>
+<tr><td style="padding:8px;background:#f3f4f6;font-weight:bold">SMPP Port</td><td style="padding:8px">2775</td></tr>
+<tr><td style="padding:8px;background:#f3f4f6;font-weight:bold">Web Portal</td><td style="padding:8px"><a href="http://${serverIP}:3001">http://${serverIP}:3001</a></td></tr>
+<tr><td style="padding:8px;background:#f3f4f6;font-weight:bold">Portal Login</td><td style="padding:8px">Username: <b>${code}</b> / Password: <b>${entity.smpp_password}</b></td></tr>
+</table>
+<p style="color:#6b7280;font-size:14px">Use these credentials to bind your SMPP client and access the web portal.</p>
+</div>`;
+        await transporter.sendMail({
+            from: `"${smtp.from_name || 'NET2APP'}" <${smtp.from_email}>`,
+            to: email,
+            subject: `Welcome to NET2APP Hub — ${entityType === 'client' ? 'Client' : 'Supplier'} Account`,
+            html,
+        });
+        console.error(`[WELCOME] Email sent to ${email} (${code})`);
+    } catch (e) {
+        console.error(`[WELCOME] Failed to send email: ${e.message}`);
+    }
+}
+
 app.post('/api/clients', auth, async (req, res) => {
     try {
         const b = req.body || {};
@@ -1965,20 +2184,27 @@ app.post('/api/clients', auth, async (req, res) => {
         if (!b.company_name) return res.status(400).json({ error: 'company_name is required' });
         if (!b.smpp_username) return res.status(400).json({ error: 'smpp_username is required' });
         if (!b.smpp_password) return res.status(400).json({ error: 'smpp_password is required' });
+        const portalAccess = b.portal_access !== undefined ? b.portal_access : false;
         const result = await pool.query(
             `INSERT INTO clients (client_code, company_name, contact_person, email, phone, address, country,
              smpp_username, smpp_password, smpp_ip, smpp_port, system_type, max_tps,
              billing_mode, currency, balance, credit_limit,
-             api_enabled, webhook_url, force_dlr, routing_plan_id, rate_plan_id, status, created_at, updated_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,NOW(),NOW()) RETURNING *`,
+             api_enabled, webhook_url, force_dlr, routing_plan_id, rate_plan_id, portal_access, status, created_at, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,NOW(),NOW()) RETURNING *`,
             [
                 b.client_code, b.company_name, b.contact_person || '', b.email || '', b.phone || '', b.address || '', b.country || '',
                 b.smpp_username, b.smpp_password, b.smpp_ip || '0.0.0.0', b.smpp_port || 2775, b.system_type || 'SMPP', b.max_tps || 100,
                 b.billing_mode || 'dlr', b.currency || 'EUR', b.balance || 0, b.credit_limit || 0,
-                b.api_enabled || false, b.webhook_url || '', b.force_dlr !== undefined ? b.force_dlr : true, b.routing_plan_id || null, b.rate_plan_id || null, b.status || 'active'
+                b.api_enabled || false, b.webhook_url || '', b.force_dlr !== undefined ? b.force_dlr : true, b.routing_plan_id || null, b.rate_plan_id || null, portalAccess, b.status || 'active'
             ]
         );
-        res.json({ success: true, data: result.rows[0] });
+        const client = result.rows[0];
+        // Auto-create portal user if requested
+        if (portalAccess) {
+            await ensurePortalUser('client', client).catch(e => console.error('[PORTAL] Failed to create client user:', e.message));
+            sendWelcomeEmail('client', client).catch(() => {});
+        }
+        res.json({ success: true, data: client });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -2129,7 +2355,7 @@ app.post('/api/suppliers', auth, async (req, res) => {
                 whatsapp_device_ids, telegram_device_ids,
                 dst_sip_address, reconnect_schedule, rate_per_second, audio_codec, capacity,
                 balance, credit_limit, currency, billing_mode,
-                bind_status, consecutive_failures, force_dlr, status,
+                bind_status, consecutive_failures, force_dlr, status, portal_access,
                 created_at, updated_at
             ) VALUES (
                 $1,$2,$3,$4,$5,
@@ -2141,7 +2367,7 @@ app.post('/api/suppliers', auth, async (req, res) => {
                 $25,$26,
                 $27,$28,$29,$30,$31,
                 $32,$33,$34,
-                $35,$36,$37,$38,$39,
+                $35,$36,$37,$38,$39,$40,
                 NOW(), NOW()
             ) RETURNING *`,
             [
@@ -2183,10 +2409,16 @@ app.post('/api/suppliers', auth, async (req, res) => {
                 b.bind_status || 'unbound',
                 b.consecutive_failures || 0,
                 b.force_dlr !== undefined ? b.force_dlr : false,
-                b.status || 'active'
+                b.status || 'active',
+                b.portal_access !== undefined ? b.portal_access : false
             ]
         );
-        res.json({ success: true, data: result.rows[0] });
+        const supplier = result.rows[0];
+        if (supplier.portal_access) {
+            await ensurePortalUser('supplier', supplier).catch(e => console.error('[PORTAL] Failed to create supplier user:', e.message));
+            sendWelcomeEmail('supplier', supplier).catch(() => {});
+        }
+        res.json({ success: true, data: supplier });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -2400,11 +2632,49 @@ app.post('/api/clients/:id/send-welcome', auth, async (req, res) => {
         const { id } = req.params;
         const result = await pool.query('SELECT * FROM clients WHERE id = $1', [id]);
         if (result.rows.length === 0) return res.status(404).json({ error: 'Client not found' });
-        // In production, send actual email via SMTP or email service
-        res.json({ success: true, message: `Welcome email queued for ${result.rows[0].company_name}` });
+        const client = result.rows[0];
+        await sendWelcomeEmail('client', client);
+        res.json({ success: true, message: `Welcome email sent to ${client.email}` });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
+});
+
+// Toggle portal access for client or supplier
+app.post('/api/portal/toggle', auth, async (req, res) => {
+    try {
+        const { entity_type, entity_id } = req.body;
+        if (!entity_type || !entity_id) return res.status(400).json({ error: 'entity_type and entity_id required' });
+        const table = entity_type === 'client' ? 'clients' : 'suppliers';
+        const result = await pool.query(
+            `UPDATE ${table} SET portal_access = NOT COALESCE(portal_access, false), updated_at = NOW() WHERE id = $1 RETURNING id, ${entity_type === 'client' ? 'client_code AS code' : 'supplier_code AS code'}, portal_access`,
+            [entity_id]
+        );
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+        const entity = result.rows[0];
+        if (entity.portal_access) {
+            const fullR = await pool.query(`SELECT * FROM ${table} WHERE id = $1`, [entity_id]);
+            await ensurePortalUser(entity_type, fullR.rows[0]).catch(() => {});
+            await sendWelcomeEmail(entity_type, fullR.rows[0]).catch(() => {});
+        }
+        res.json({ success: true, data: entity });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Sync all existing clients/suppliers as portal users (one-time migration)
+app.post('/api/portal/sync-all', auth, async (req, res) => {
+    try {
+        let clientCount = 0, supplierCount = 0;
+        const clients = await pool.query("SELECT * FROM clients WHERE status='active' AND portal_access=true AND smpp_password IS NOT NULL AND (is_deleted IS NULL OR is_deleted=false)");
+        for (const c of clients.rows) {
+            try { await ensurePortalUser('client', c); clientCount++; } catch {}
+        }
+        const suppliers = await pool.query("SELECT * FROM suppliers WHERE status='active' AND portal_access=true AND smpp_password IS NOT NULL AND (is_deleted IS NULL OR is_deleted=false)");
+        for (const s of suppliers.rows) {
+            try { await ensurePortalUser('supplier', s); supplierCount++; } catch {}
+        }
+        res.json({ success: true, data: { clients_synced: clientCount, suppliers_synced: supplierCount } });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ==================== SUPPLIER USAGE & CDR ====================
@@ -3527,6 +3797,77 @@ app.post('/api/sms/send', auth, async (req, res) => {
         const c = clientR.rows[0];
         sendDbg('[SMS-SEND] ✅ GATE 1/7: AUTH — Client "' + c.client_code + '" (id=' + c.id + ') balance=' + (c.balance || 0) + ' credit=' + (c.credit_limit || 0));
 
+        // 1.5 TENANT CHECKS — expiry + SMS quota enforcement
+        if (c.tenant_id) {
+            const tenantR = await pool.query(
+                `SELECT t.*, COALESCE(SUM(COALESCE(sl.message_parts, 1)) FILTER (
+                   WHERE sl.created_at > date_trunc('month', NOW()) AND sl.client_id IN (
+                     SELECT id FROM clients WHERE tenant_id = t.id)), 0)::int AS sms_used_this_month
+                 FROM tenants t LEFT JOIN sms_logs sl ON sl.client_id IN (
+                   SELECT id FROM clients WHERE tenant_id = t.id)
+                 WHERE t.id = $1 GROUP BY t.id`,
+                [c.tenant_id]
+            );
+            if (tenantR.rows.length > 0) {
+                const t = tenantR.rows[0];
+                const maxSMS = (t.limits && t.limits.max_sms_monthly) ? parseInt(t.limits.max_sms_monthly) : 0;
+                const used = parseInt(t.sms_used_this_month) || 0;
+
+                // EXPIRY CHECK
+                if (t.expiry_date && new Date(t.expiry_date) < new Date()) {
+                    sendDbg('[SMS-SEND] ❌ GATE TENANT: EXPIRED — ' + t.code + ' expired ' + new Date(t.expiry_date).toISOString().slice(0,10));
+                    const rejId = genNumericMsgId('2');
+                    await pool.query(
+                        `INSERT INTO sms_logs (message_id, client_id, client_code, destination, sender_id, message, status, error_code, error_message, source, submit_time)
+                         VALUES ($1,$2,$3,$4,$5,$6,'failed','TENANT_EXPIRED',$7,$8,NOW())`,
+                        [rejId, client_id, c.client_code, destination, sender_id || '', message,
+                         `Tenant licence expired (${t.code}, expired ${new Date(t.expiry_date).toISOString().slice(0,10)})`, customSource || 'external_api']
+                    ).catch(() => {});
+                    return res.status(402).json({ success: false, error: 'Tenant licence expired', code: 'TENANT_EXPIRED', tenant: t.code });
+                }
+
+                // SMS QUOTA CHECK — block if monthly limit exceeded
+                if (maxSMS > 0 && used >= maxSMS) {
+                    sendDbg('[SMS-SEND] ❌ GATE TENANT: QUOTA — ' + t.code + ' used ' + used + '/' + maxSMS);
+                    const rejId = genNumericMsgId('2');
+                    await pool.query(
+                        `INSERT INTO sms_logs (message_id, client_id, client_code, destination, sender_id, message, status, error_code, error_message, source, submit_time)
+                         VALUES ($1,$2,$3,$4,$5,$6,'failed','TENANT_QUOTA_EXCEEDED',$7,$8,NOW())`,
+                        [rejId, client_id, c.client_code, destination, sender_id || '', message,
+                         `Monthly SMS limit reached (${t.code}: ${used}/${maxSMS})`, customSource || 'external_api']
+                    ).catch(() => {});
+                    // Send notification if not already sent this month
+                    await pool.query(
+                        `INSERT INTO notifications (title, message, type, entity_type, entity_id, is_read, created_at)
+                         SELECT $1, $2, 'alert', 'tenant', $3, false, NOW()
+                         WHERE NOT EXISTS (
+                           SELECT 1 FROM notifications WHERE entity_type='tenant' AND entity_id=$3
+                             AND type='alert' AND message LIKE $4 AND created_at > date_trunc('month', NOW())
+                         )`,
+                        ['SMS Quota Exceeded: ' + t.code,
+                         `Tenant ${t.name || t.code} has reached its monthly SMS limit (${used}/${maxSMS}). Upgrade package to continue.`,
+                         c.tenant_id, `%${used}/${maxSMS}%`]
+                    ).catch(() => {});
+                    return res.status(402).json({ success: false, error: 'Monthly SMS limit reached', code: 'TENANT_QUOTA_EXCEEDED', tenant: t.code, used, limit: maxSMS });
+                }
+
+                // 80% WARNING notification
+                if (maxSMS > 0 && used >= maxSMS * 0.8 && used < maxSMS) {
+                    await pool.query(
+                        `INSERT INTO notifications (title, message, type, entity_type, entity_id, is_read, created_at)
+                         SELECT $1, $2, 'warning', 'tenant', $3, false, NOW()
+                         WHERE NOT EXISTS (
+                           SELECT 1 FROM notifications WHERE entity_type='tenant' AND entity_id=$3
+                             AND type='warning' AND message LIKE $4 AND created_at > date_trunc('month', NOW())
+                         )`,
+                        ['SMS Quota 80%: ' + t.code,
+                         `Tenant ${t.name || t.code} has used ${used}/${maxSMS} SMS (${Math.round(used/maxSMS*100)}%). Consider upgrading.`,
+                         c.tenant_id, `%${Math.round(used/maxSMS*100)}%%`]
+                    ).catch(() => {});
+                }
+            }
+        }
+
         // 2. Fast route resolution (must come BEFORE rate lookup — route.mcc/route.mnc needed)
         const route = await resolveRoute(c, destination);
         if (!route.supplier_id) {
@@ -3575,7 +3916,7 @@ app.post('/api/sms/send', auth, async (req, res) => {
         sendDbg('[SMS-SEND] ✅ GATE 4/7: SUPPLIER_RATE — €' + route.supplier_rate);
 
         // 5. Profit check
-        const parts = Math.max(1, Math.ceil((message || '').length / 160));
+        const parts = calculateMessageParts(message);
         const profit = parseFloat((clientRate - route.supplier_rate).toFixed(6));
         if (profit <= 0) {
             sendDbg('[SMS-SEND] ❌ GATE 5/7: PROFIT — client=€' + clientRate + ' supplier=€' + route.supplier_rate + ' profit=€' + profit + ' (BLOCKED)');
@@ -3863,6 +4204,9 @@ app.post('/api/sms/logs', auth, async (req, res) => {
         const pageOffset = parseInt(f.offset) || 0;
         let q = 'SELECT * FROM sms_logs WHERE 1=1';
         const p = []; let i = 1;
+        // Portal user scoping: client sees only own, supplier sees only own
+        if (req.user.client_id) { q += ` AND client_id = $${i++}`; p.push(req.user.client_id); }
+        if (req.user.supplier_id) { q += ` AND supplier_id = $${i++}`; p.push(req.user.supplier_id); }
         // Soft-delete filter: hide deleted by default, show with include_deleted=true
         if (f.include_deleted !== true && f.include_deleted !== 'true') {
             q += ' AND (is_deleted IS NULL OR is_deleted = false)';
@@ -4136,7 +4480,7 @@ app.post('/api/queue/tps-benchmark', auth, async (req, res) => {
                     sender_id: 'BENCHMARK',
                     destination: '1234567890',
                     message: 'benchmark test',
-                    message_parts: 1,
+                    message_parts: calculateMessageParts('benchmark test'),
                     source: 'benchmark',
                 };
                 const r = queueManager.enqueueBuffered
@@ -4218,7 +4562,22 @@ app.get('/api/dashboard/profit', auth, async (req, res) => {
             profit: parseFloat((Number(acc.revenue) + Number(r.revenue) - Number(acc.cost) - Number(r.cost)).toFixed(4)),
         }), { total_sms: 0, billed_sms: 0, delivered: 0, failed: 0, revenue: 0, cost: 0, profit: 0 });
 
-        res.json({ success: true, data: { clients: result.rows, totals } });
+        // Tenant quota status — for dashboard alerts
+        const tenantsR = await pool.query(
+            `SELECT t.id, t.name, t.code, t.status, t.expiry_date,
+               COALESCE(t.limits->>'max_sms_monthly','0')::int AS max_sms,
+               COALESCE(SUM(COALESCE(sl.message_parts,1)) FILTER (
+                 WHERE sl.created_at > date_trunc('month',NOW())), 0)::int AS used
+             FROM tenants t
+             LEFT JOIN clients c ON c.tenant_id = t.id AND c.status='active'
+             LEFT JOIN sms_logs sl ON sl.client_id = c.id
+             WHERE t.status = 'active'
+             GROUP BY t.id
+             HAVING COALESCE(t.limits->>'max_sms_monthly','0')::int > 0
+             ORDER BY used DESC`
+        ).catch(() => ({ rows: [] }));
+
+        res.json({ success: true, data: { clients: result.rows, totals, tenants: tenantsR.rows } });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -6919,28 +7278,86 @@ app.get('/api/bind/history', auth, async (req, res) => {
 });
 
 // ==================== LICENSE ====================
-app.get('/api/license/info', auth, async (req, res) => {
+app.get('/api/license/info', superAuth, async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM license ORDER BY id DESC LIMIT 1');
         if (result.rows.length === 0) return res.json({ success: true, data: null, message: 'No license found' });
-        res.json({ success: true, data: result.rows[0] });
+        const lic = result.rows[0];
+        // Attach real-time usage: count SMS parts (multi-part = multiple),
+        // Voice OTP calls, RCS, Flash SMS, WhatsApp, Telegram this month
+        const usageR = await pool.query(
+            `SELECT
+               COALESCE(SUM(CASE WHEN source IN ('voice_otp','rcs','whatsapp_business','telegram_business','flash_sms')
+                 THEN 1 ELSE COALESCE(message_parts, 1) END) FILTER (
+                 WHERE created_at > date_trunc('month', NOW())), 0)::int AS sms_this_month,
+               COALESCE(COUNT(*) FILTER (
+                 WHERE created_at > date_trunc('month', NOW())), 0)::int AS total_messages
+             FROM sms_logs`
+        );
+        lic.usage = usageR.rows[0] || { sms_this_month: 0, total_messages: 0 };
+        lic.usage.days_used = Math.max(1, Math.ceil((Date.now() - new Date(lic.issued_date || lic.created_at).getTime()) / 86400000));
+        res.json({ success: true, data: lic });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/license/activate', auth, async (req, res) => {
+// Package definitions for license key generation & activation.
+// Maps license_type → { days, features, limits }
+const LICENSE_PACKAGES = {
+  trial:         { days: 30,   features: { smpp:true, http:true, ott:false, rcs:false, voice_otp:false, whatsapp:false, telegram:false, flash_sms:false, email:false, voip:false }, limits: { max_clients:999999, max_suppliers:999999, max_sms_monthly:1000,      max_tps:30 } },
+  volume_100k:   { days: 30,   features: { smpp:true, http:true, ott:true,  rcs:false, voice_otp:true,  whatsapp:true,  telegram:false, flash_sms:true,  email:false, voip:false }, limits: { max_clients:999999, max_suppliers:999999, max_sms_monthly:100000,    max_tps:100 } },
+  volume_1m:     { days: 30,   features: { smpp:true, http:true, ott:true,  rcs:true,  voice_otp:true,  whatsapp:true,  telegram:true,  flash_sms:true,  email:true,  voip:false }, limits: { max_clients:999999, max_suppliers:999999, max_sms_monthly:1000000,   max_tps:300 } },
+  volume_5m:     { days: 30,   features: { smpp:true, http:true, ott:true,  rcs:true,  voice_otp:true,  whatsapp:true,  telegram:true,  flash_sms:true,  email:true,  voip:true  }, limits: { max_clients:999999, max_suppliers:999999, max_sms_monthly:5000000,   max_tps:800 } },
+  volume_10m:    { days: 30,   features: { smpp:true, http:true, ott:true,  rcs:true,  voice_otp:true,  whatsapp:true,  telegram:true,  flash_sms:true,  email:true,  voip:true  }, limits: { max_clients:999999, max_suppliers:999999, max_sms_monthly:10000000,  max_tps:1500 } },
+  volume_15m:    { days: 30,   features: { smpp:true, http:true, ott:true,  rcs:true,  voice_otp:true,  whatsapp:true,  telegram:true,  flash_sms:true,  email:true,  voip:true  }, limits: { max_clients:999999, max_suppliers:999999, max_sms_monthly:15000000,  max_tps:2500 } },
+  volume_30m:    { days: 30,   features: { smpp:true, http:true, ott:true,  rcs:true,  voice_otp:true,  whatsapp:true,  telegram:true,  flash_sms:true,  email:true,  voip:true  }, limits: { max_clients:999999, max_suppliers:999999, max_sms_monthly:30000000,  max_tps:4000 } },
+  unlimited:     { days: 365,  features: { smpp:true, http:true, ott:true,  rcs:true,  voice_otp:true,  whatsapp:true,  telegram:true,  flash_sms:true,  email:true,  voip:true  }, limits: { max_clients:999999, max_suppliers:999999, max_sms_monthly:999999999, max_tps:10000 } },
+};
+
+// Parse license key format: N2A-{TYPE}-{TS}-{RAND}-{MAC}
+function parseLicenseKey(key) {
+    const parts = (key || '').split('-');
+    if (parts.length < 5 || parts[0] !== 'N2A') return null;
+    const type = parts[1].toLowerCase();
+    if (!LICENSE_PACKAGES[type]) return null;
+    return { type, ts: parts[2], rand: parts[3], mac: parts.slice(4).join('-') };
+}
+
+app.post('/api/license/activate', superAuth, async (req, res) => {
     try {
-        const { key } = req.body;
+        const { key, system_ip, system_mac } = req.body;
         if (!key) return res.status(400).json({ error: 'License key is required' });
+        
+        // Parse key to extract type
+        const parsed = parseLicenseKey(key);
+        const pkg = parsed ? LICENSE_PACKAGES[parsed.type] : null;
+        const licenseType = parsed ? parsed.type : 'trial';
+        const days = pkg ? pkg.days : 30;
+        const features = pkg ? pkg.features : LICENSE_PACKAGES.trial.features;
+        const limits = pkg ? pkg.limits : LICENSE_PACKAGES.trial.limits;
+        
+        // Upsert: activate or re-activate an existing license key
         const result = await pool.query(
-            `INSERT INTO license (license_key, license_type, status, issued_to, issued_date, expiry_date, created_at)
-             VALUES ($1, 'enterprise', 'active', $2, CURRENT_DATE, CURRENT_DATE + INTERVAL '1 year', NOW()) RETURNING *`,
-            [key, req.user?.username || 'unknown']
+            `INSERT INTO license (license_key, license_type, status, issued_to, issued_date, expiry_date,
+             system_ip, system_mac, features, limits, created_at)
+             VALUES ($1, $2, 'active', $3, CURRENT_DATE, CURRENT_DATE + INTERVAL '${days} days', $4, $5, $6::jsonb, $7::jsonb, NOW())
+             ON CONFLICT (license_key) DO UPDATE SET
+               status = 'active',
+               system_ip = COALESCE($4, license.system_ip),
+               system_mac = COALESCE($5, license.system_mac),
+               features = COALESCE($6::jsonb, license.features),
+               limits = COALESCE($7::jsonb, license.limits),
+               issued_date = CURRENT_DATE,
+               expiry_date = CURRENT_DATE + INTERVAL '${days} days',
+               issued_to = EXCLUDED.issued_to
+             RETURNING *`,
+            [key, licenseType, req.user?.username || 'unknown', system_ip || null, system_mac || null,
+             JSON.stringify(features), JSON.stringify(limits)]
         );
         res.json({ success: true, data: result.rows[0], message: 'License activated' });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/license/deactivate', auth, async (req, res) => {
+app.post('/api/license/deactivate', superAuth, async (req, res) => {
     try {
         const result = await pool.query(
             `UPDATE license SET status = 'expired' WHERE status = 'active' RETURNING id, license_key, status`
@@ -6950,7 +7367,7 @@ app.post('/api/license/deactivate', auth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/license/limits', auth, async (req, res) => {
+app.get('/api/license/limits', superAuth, async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM license ORDER BY id DESC LIMIT 1');
         if (result.rows.length === 0) return res.json({ success: true, data: { max_clients: 10, max_suppliers: 5, max_sms_monthly: 100000, max_tps: 100 } });
@@ -6961,7 +7378,7 @@ app.get('/api/license/limits', auth, async (req, res) => {
 
 // Auto-detect server OS, IP, MAC for license binding
 const os = require('os');
-app.get('/api/license/system-info', auth, async (req, res) => {
+app.get('/api/license/system-info', superAuth, async (req, res) => {
     try {
         const interfaces = os.networkInterfaces();
         let ip = '', mac = '';
@@ -6993,7 +7410,7 @@ app.get('/api/license/system-info', auth, async (req, res) => {
 });
 
 // Validate a license key
-app.post('/api/license/validate', auth, async (req, res) => {
+app.post('/api/license/validate', superAuth, async (req, res) => {
     try {
         const { key } = req.body;
         if (!key) return res.status(400).json({ error: 'License key required' });
@@ -7006,69 +7423,92 @@ app.post('/api/license/validate', auth, async (req, res) => {
 });
 
 // Generate license key
-app.post('/api/license/generate', auth, async (req, res) => {
+app.post('/api/license/generate', superAuth, async (req, res) => {
     try {
         const { type, company_name, tenant_code, system_ip, system_mac } = req.body;
+        const licenseType = (type || 'trial').toLowerCase();
+        const pkg = LICENSE_PACKAGES[licenseType] || LICENSE_PACKAGES.trial;
         const ts = Date.now().toString(36).toUpperCase().slice(-6);
         const rand = Math.random().toString(36).substring(2, 6).toUpperCase();
-        const key = `N2A-${(type || 'TRI').toUpperCase().slice(0, 3)}-${ts}-${rand}-${system_mac ? system_mac.replace(/:/g,'').slice(-8) : '00000000'}`;
+        const macSuffix = system_mac ? system_mac.replace(/:/g,'').slice(-8).toUpperCase() : '00000000';
+        const key = `N2A-${licenseType.toUpperCase()}-${ts}-${rand}-${macSuffix}`;
         const result = await pool.query(
             `INSERT INTO license (license_key, license_type, status, issued_to, issued_date, expiry_date,
-             system_ip, system_mac, tenant_code, created_at)
-             VALUES ($1, $2, 'active', $3, CURRENT_DATE, CURRENT_DATE + INTERVAL '30 days', $4, $5, $6, NOW()) RETURNING *`,
-            [key, type || 'trial', company_name || 'Unknown', system_ip || null, system_mac || null, tenant_code || null]
+             system_ip, system_mac, features, limits, created_at)
+             VALUES ($1, $2, 'active', $3, CURRENT_DATE, CURRENT_DATE + INTERVAL '${pkg.days} days',
+              $4, $5, $6::jsonb, $7::jsonb, NOW()) RETURNING *`,
+            [key, licenseType, company_name || 'Unknown', system_ip || null, system_mac || null,
+             JSON.stringify(pkg.features), JSON.stringify(pkg.limits)]
         );
+        // If generating for a tenant, also update/create the tenant record
+        if (tenant_code) {
+            await pool.query(
+                `INSERT INTO tenants (name, code, ip, mac, status, features, limits, created_at)
+                 VALUES ($1, $2, $3, $4, 'active', $5::jsonb, $6::jsonb, NOW())
+                 ON CONFLICT (code) DO UPDATE SET
+                   ip = COALESCE(EXCLUDED.ip, tenants.ip),
+                   mac = COALESCE(EXCLUDED.mac, tenants.mac),
+                   features = EXCLUDED.features,
+                   limits = EXCLUDED.limits,
+                   updated_at = NOW()`,
+                [company_name || tenant_code, tenant_code.toUpperCase(), system_ip || null, system_mac || null,
+                 JSON.stringify(pkg.features), JSON.stringify(pkg.limits)]
+            ).catch(() => {});
+        }
         res.json({ success: true, data: { key, license: result.rows[0] } });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ==================== TENANTS ====================
-app.get('/api/license/tenants', auth, async (req, res) => {
+app.get('/api/license/tenants', superAuth, async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM tenants ORDER BY created_at DESC');
         res.json({ success: true, data: result.rows });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/license/tenants', auth, async (req, res) => {
+app.post('/api/license/tenants', superAuth, async (req, res) => {
     try {
-        const { name, code, ip, mac, max_sms_monthly, max_tps, features } = req.body;
+        const { name, code, ip, mac, max_sms_monthly, max_tps, features, expiry_date } = req.body;
         if (!name || !code) return res.status(400).json({ error: 'Name and code required' });
+        // Default expiry: 30 days from now if not specified
+        const expiry = expiry_date || new Date(Date.now() + 30 * 86400000).toISOString();
         const result = await pool.query(
-            `INSERT INTO tenants (tenant_name, tenant_code, ip_address, mac_address, status,
-             limits, features, created_at)
+            `INSERT INTO tenants (name, code, ip, mac, status,
+             limits, features, expiry_date, created_at)
              VALUES ($1, $2, $3, $4, 'active',
-              jsonb_build_object('max_sms_monthly', $5, 'max_tps', $6),
-              $7::jsonb, NOW()) RETURNING *`,
+              jsonb_build_object('max_sms_monthly', $5::int, 'max_tps', $6::int),
+              $7::jsonb, $8, NOW()) RETURNING *`,
             [name, code.toUpperCase(), ip || null, mac || null, max_sms_monthly || 100, max_tps || 5,
-             JSON.stringify(features || { smpp: true, http: true })]
+             JSON.stringify(features || { smpp: true, http: true }), expiry]
         );
         res.json({ success: true, data: result.rows[0] });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.put('/api/license/tenants/:id', auth, async (req, res) => {
+app.put('/api/license/tenants/:id', superAuth, async (req, res) => {
     try {
         const { id } = req.params;
-        const { name, code, ip, mac, max_sms_monthly, max_tps, features } = req.body;
+        const { name, code, ip, mac, max_sms_monthly, max_tps, features, expiry_date } = req.body;
         const result = await pool.query(
-            `UPDATE tenants SET tenant_name = COALESCE($2, tenant_name),
-             tenant_code = COALESCE($3, tenant_code),
-             ip_address = COALESCE($4, ip_address),
-             mac_address = COALESCE($5, mac_address),
+            `UPDATE tenants SET name = COALESCE($2, name),
+             code = COALESCE($3, code),
+             ip = COALESCE($4, ip),
+             mac = COALESCE($5, mac),
              limits = COALESCE($6::jsonb, limits),
              features = COALESCE($7::jsonb, features),
+             expiry_date = COALESCE($8::timestamp, expiry_date),
              updated_at = NOW() WHERE id = $1 RETURNING *`,
             [id, name || null, code ? code.toUpperCase() : null, ip || null, mac || null,
              (max_sms_monthly || max_tps) ? JSON.stringify({ max_sms_monthly: max_sms_monthly || 100, max_tps: max_tps || 5 }) : null,
-             features ? JSON.stringify(features) : null]
+             features ? JSON.stringify(features) : null, expiry_date || null]
         );
         if (result.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
         res.json({ success: true, data: result.rows[0] });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.delete('/api/license/tenants/:id', auth, async (req, res) => {
+app.delete('/api/license/tenants/:id', superAuth, async (req, res) => {
     try {
         const { id } = req.params;
         const result = await pool.query('DELETE FROM tenants WHERE id = $1 RETURNING id', [id]);
@@ -7077,16 +7517,61 @@ app.delete('/api/license/tenants/:id', auth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/license/tenants/:id/usage', auth, async (req, res) => {
+// Extend tenant licence expiry — super admin can grant extra days when tenant delays payment
+app.post('/api/license/tenants/:id/extend', superAuth, async (req, res) => {
     try {
         const { id } = req.params;
+        const { days } = req.body; // number of days to extend (e.g. 7, 15, 30)
+        if (!days || days <= 0) return res.status(400).json({ error: 'days must be a positive number' });
+        // Extend from current expiry_date, or from today if not set
+        const result = await pool.query(
+            `UPDATE tenants SET
+               expiry_date = COALESCE(expiry_date, NOW()) + ($2::int * INTERVAL '1 day'),
+               updated_at = NOW()
+             WHERE id = $1 RETURNING *`,
+            [id, parseInt(days)]
+        );
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+        res.json({ success: true, data: result.rows[0], message: `Extended by ${days} days` });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/license/tenants/:id/usage', superAuth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        // Count SMS parts (not just rows) — multi-part messages count as multiple.
+        // Includes: SMS (all sources: external_api, test_sms, campaign, smpp, etc.),
+        // Voice OTP calls, RCS, Flash SMS, WhatsApp, Telegram.
         const usage = await pool.query(
-            `SELECT COUNT(*) FILTER (WHERE created_at > date_trunc('month', NOW())) AS sms_this_month
-             FROM sms_logs WHERE client_id IN
-             (SELECT id FROM clients WHERE tenant_id = $1)`,
+            `SELECT
+               COALESCE(SUM(CASE WHEN source IN ('voice_otp','rcs','whatsapp_business','telegram_business','flash_sms')
+                 THEN 1 ELSE COALESCE(message_parts, 1) END) FILTER (
+                 WHERE created_at > date_trunc('month', NOW())
+                   AND client_id IN (SELECT id FROM clients WHERE tenant_id = $1)), 0)::int AS sms_this_month,
+               COALESCE(SUM(COALESCE(message_parts, 1)) FILTER (
+                 WHERE created_at > date_trunc('month', NOW())
+                   AND source IN ('external_api','test_sms','campaign','smpp','smpp_client','e2e_test')
+                   AND client_id IN (SELECT id FROM clients WHERE tenant_id = $1)), 0)::int AS sms_parts,
+               COALESCE(COUNT(*) FILTER (
+                 WHERE created_at > date_trunc('month', NOW())
+                   AND source IN ('voice_otp')
+                   AND client_id IN (SELECT id FROM clients WHERE tenant_id = $1)), 0)::int AS voice_otp_calls,
+               COALESCE(COUNT(*) FILTER (
+                 WHERE created_at > date_trunc('month', NOW())
+                   AND source IN ('rcs','whatsapp_business','telegram_business','flash_sms')
+                   AND client_id IN (SELECT id FROM clients WHERE tenant_id = $1)), 0)::int AS channel_msgs
+             FROM sms_logs`,
             [id]
         );
-        res.json({ success: true, data: { sms_this_month: parseInt(usage.rows[0]?.sms_this_month) || 0 } });
+        const row = usage.rows[0] || {};
+        // sms_this_month = total all-message counting (parts for SMS, 1 per OTT/RCS/VoiceOTP)
+        const total = (row.sms_this_month || 0);
+        res.json({ success: true, data: {
+            sms_this_month: total,
+            sms_parts: row.sms_parts || 0,
+            voice_otp_calls: row.voice_otp_calls || 0,
+            channel_msgs: row.channel_msgs || 0,
+        }});
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

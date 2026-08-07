@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { Shield, CheckCircle, AlertTriangle, Copy, Plus, Edit, Trash2, Monitor, RefreshCw, Clock } from 'lucide-react';
+import { Shield, CheckCircle, AlertTriangle, Copy, Plus, Edit, Trash2, Monitor, RefreshCw, Clock, Lock, Calendar } from 'lucide-react';
 import { useAuth } from '../../store/AuthContext';
 import { Card } from '../../components/UI/Card';
 import { Button } from '../../components/UI/Button';
@@ -48,7 +48,7 @@ interface LicenseInfo {
 interface Tenant {
   id: string; name: string; code: string; status: string;
   features?: any; limits?: any; usage?: any;
-  ip?: string; mac?: string; license_expiry?: string; created_at?: string;
+  ip?: string; mac?: string; license_expiry?: string; expiry_date?: string; created_at?: string;
 }
 
 export const License: React.FC = () => {
@@ -78,13 +78,46 @@ export const License: React.FC = () => {
     [tenants, featureFilter]
   );
 
-  const [tenantForm, setTenantForm] = useState({ name:'', code:'', ip:'', mac:'', max_sms_monthly:100, max_tps:5, features: { smpp: true, http: true, ott: false, rcs: false, voice_otp: false, whatsapp: false, telegram: false, flash_sms: false, email: false, voip: false } as Record<string,boolean> });
+  const [tenantForm, setTenantForm] = useState({ name:'', code:'', ip:'', mac:'', expiry_date:'', max_sms_monthly:100, max_tps:5, features: { smpp: true, http: true, ott: false, rcs: false, voice_otp: false, whatsapp: false, telegram: false, flash_sms: false, email: false, voip: false } as Record<string,boolean> });
 
   // Retention cleanup state
   const [retentionLoading, setRetentionLoading] = useState(false);
   const [retentionMonths, setRetentionMonths] = useState(6);
   const [retentionResult, setRetentionResult] = useState<{ cutoff_months: number; total_cleaned: number; breakdown: Record<string, number>; preserved: string } | null>(null);
   const [retentionError, setRetentionError] = useState('');
+
+  // Extend tenant expiry
+  const [showExtendModal, setShowExtendModal] = useState(false);
+  const [extendTarget, setExtendTarget] = useState<Tenant | null>(null);
+  const [extendDays, setExtendDays] = useState(7);
+
+  const handleExtend = async () => {
+    if (!extendTarget) return;
+    setSaving(true); setError('');
+    try {
+      await licenseApi.extendTenant(extendTarget.id, extendDays);
+      setShowExtendModal(false);
+      await loadData();
+    } catch (e: any) { setError(e.message); }
+    setSaving(false);
+  };
+
+  const openExtend = (t: Tenant) => {
+    setExtendTarget(t);
+    setExtendDays(7);
+    setShowExtendModal(true);
+  };
+
+  // Block non-super-admin from accessing this page entirely (MUST be after ALL hooks)
+  if (!isSuperUser) return (
+    <div className="flex items-center justify-center min-h-[60vh]">
+      <div className="text-center p-12 bg-red-50 rounded-xl border border-red-200 max-w-md">
+        <Lock size={48} className="mx-auto mb-3 text-red-500" />
+        <h2 className="text-xl font-bold text-red-700">Access Denied</h2>
+        <p className="text-sm text-red-600 mt-1">Only Super Admin can access License Management.</p>
+      </div>
+    </div>
+  );
 
   const loadData = async () => {
     try {
@@ -141,7 +174,7 @@ export const License: React.FC = () => {
     if (!licenseKeyInput) { setError('Please enter a license key'); return; }
     setSaving(true); setError('');
     try {
-      await licenseApi.activate(licenseKeyInput);
+      await licenseApi.activate(licenseKeyInput, { ip: serverIP, mac: serverMAC });
       setShowActivate(false);
       await loadData();
     } catch (e: any) { setError(e.message); }
@@ -162,8 +195,8 @@ export const License: React.FC = () => {
 
   const openTenant = (t?: Tenant) => {
     const defaultFeatures = { smpp: true, http: true, ott: false, rcs: false, voice_otp: false, whatsapp: false, telegram: false, flash_sms: false, email: false, voip: false };
-    if (t) { setEditingTenant(t); setTenantForm({ name:t.name, code:t.code, ip:t.ip||'', mac:t.mac||'', max_sms_monthly:t.limits?.max_sms_monthly||100, max_tps:t.limits?.max_tps||5, features: { ...defaultFeatures, ...(t.features || {}) } }); }
-    else { setEditingTenant(null); setTenantForm({ name:'', code:'', ip:'', mac:'', max_sms_monthly:100, max_tps:5, features: defaultFeatures }); }
+    if (t) { setEditingTenant(t); setTenantForm({ name:t.name, code:t.code, ip:t.ip||'', mac:t.mac||'', expiry_date:t.expiry_date||t.license_expiry||'', max_sms_monthly:t.limits?.max_sms_monthly||100, max_tps:t.limits?.max_tps||5, features: { ...defaultFeatures, ...(t.features || {}) } }); }
+    else { setEditingTenant(null); setTenantForm({ name:'', code:'', ip:'', mac:'', expiry_date:'', max_sms_monthly:100, max_tps:5, features: defaultFeatures }); }
     setShowTenantModal(true);
   };
 
@@ -208,8 +241,22 @@ export const License: React.FC = () => {
     </div>;
   } },
 { key:'ip', header:'IP', render:(t:Tenant) => <span className="font-mono text-[10px]">{t.ip||'-'}</span> },
-    { key:'expiry', header:'Expires', render:(t:Tenant) => <span className="text-xs">{t.license_expiry||'-'}</span> },
-    { key:'actions', header:'', render:(t:Tenant) => <div className="flex gap-1"><button onClick={()=>openTenant(t)} className="p-1 rounded hover:bg-gray-100"><Edit size={14} className="text-gray-500"/></button><button onClick={()=>deleteTenant(t.id)} className="p-1 rounded hover:bg-gray-100"><Trash2 size={14} className="text-red-500"/></button></div> },
+    { key:'expiry', header:'Expires', render:(t:Tenant) => {
+      const exp = t.expiry_date || t.license_expiry;
+      if (!exp) return <span className="text-xs text-gray-400">—</span>;
+      const expDate = new Date(exp);
+      const daysLeft = Math.ceil((expDate.getTime() - Date.now()) / 86400000);
+      const expired = daysLeft <= 0;
+      return <div>
+        <span className={`text-xs ${expired ? 'text-red-600 font-semibold' : daysLeft < 7 ? 'text-amber-600' : 'text-gray-600'}`}>
+          {expDate.toLocaleDateString()}
+        </span>
+        <span className={`text-[10px] ml-1 ${expired ? 'text-red-500' : daysLeft < 7 ? 'text-amber-500' : 'text-gray-400'}`}>
+          ({expired ? 'expired' : `${daysLeft}d`})
+        </span>
+      </div>;
+    } },
+    { key:'actions', header:'', render:(t:Tenant) => <div className="flex gap-1">{isSuperUser && <button onClick={()=>openExtend(t)} className="p-1 rounded hover:bg-blue-50" title="Extend expiry"><Calendar size={14} className="text-blue-500"/></button>}<button onClick={()=>openTenant(t)} className="p-1 rounded hover:bg-gray-100"><Edit size={14} className="text-gray-500"/></button><button onClick={()=>deleteTenant(t.id)} className="p-1 rounded hover:bg-gray-100"><Trash2 size={14} className="text-red-500"/></button></div> },
   ];
 
   
@@ -395,7 +442,7 @@ export const License: React.FC = () => {
 
     <Modal isOpen={showTenantModal} onClose={()=>setShowTenantModal(false)} title={editingTenant?'Edit Tenant':'Add Tenant'} footer={<div className="flex justify-end gap-3"><Button variant="secondary" onClick={()=>setShowTenantModal(false)}>Cancel</Button><Button onClick={saveTenant} loading={saving}>Save</Button></div>}>
       {error && <div className="p-3 bg-red-50 text-red-700 rounded-lg text-sm mb-3">{error}</div>}
-      <div className="space-y-3"><div className="grid grid-cols-2 gap-3"><Input label="Name" value={tenantForm.name} onChange={e=>setTenantForm(p=>({...p,name:e.target.value}))} required/><Input label="Code" value={tenantForm.code} onChange={e=>setTenantForm(p=>({...p,code:e.target.value.toUpperCase()}))} required/></div><div className="grid grid-cols-2 gap-3"><Input label="IP" value={tenantForm.ip} onChange={e=>setTenantForm(p=>({...p,ip:e.target.value}))}/><Input label="MAC" value={tenantForm.mac} onChange={e=>setTenantForm(p=>({...p,mac:e.target.value}))}/></div><div className="grid grid-cols-2 gap-3"><Input label="Monthly SMS Limit" type="number" value={tenantForm.max_sms_monthly} onChange={e=>setTenantForm(p=>({...p,max_sms_monthly:parseInt(e.target.value)||0}))}/><Input label="Max TPS" type="number" value={tenantForm.max_tps} onChange={e=>setTenantForm(p=>({...p,max_tps:parseInt(e.target.value)||0}))}/></div>
+      <div className="space-y-3"><div className="grid grid-cols-2 gap-3"><Input label="Name" value={tenantForm.name} onChange={e=>setTenantForm(p=>({...p,name:e.target.value}))} required/><Input label="Code" value={tenantForm.code} onChange={e=>setTenantForm(p=>({...p,code:e.target.value.toUpperCase()}))} required/></div><div className="grid grid-cols-2 gap-3"><Input label="IP" value={tenantForm.ip} onChange={e=>setTenantForm(p=>({...p,ip:e.target.value}))}/><Input label="MAC" value={tenantForm.mac} onChange={e=>setTenantForm(p=>({...p,mac:e.target.value}))}/></div><div className="grid grid-cols-2 gap-3"><Input label="Monthly SMS Limit" type="number" value={tenantForm.max_sms_monthly} onChange={e=>setTenantForm(p=>({...p,max_sms_monthly:parseInt(e.target.value)||0}))}/><Input label="Max TPS" type="number" value={tenantForm.max_tps} onChange={e=>setTenantForm(p=>({...p,max_tps:parseInt(e.target.value)||0}))}/></div><div className="grid grid-cols-2 gap-3"><Input label="Expiry Date" type="date" value={tenantForm.expiry_date ? new Date(tenantForm.expiry_date).toISOString().split('T')[0] : ''} onChange={e=>setTenantForm(p=>({...p,expiry_date:e.target.value ? new Date(e.target.value).toISOString() : ''}))}/><div/></div><div className="grid grid-cols-2 gap-3"><Input label="Expiry Date" type="date" value={tenantForm.expiry_date ? new Date(tenantForm.expiry_date).toISOString().split('T')[0] : ''} onChange={e=>setTenantForm(p=>({...p,expiry_date:e.target.value ? new Date(e.target.value).toISOString() : ''}))}/><div/></div>
         <div>
           <p className="text-sm font-medium text-gray-700 mb-2">Feature Toggles</p>
           <div className="grid grid-cols-2 gap-x-4 gap-y-2 p-3 bg-gray-50 rounded-lg border">
@@ -412,6 +459,41 @@ export const License: React.FC = () => {
               </label>
             ))}
           </div>
+        </div>
+      </div>
+    </Modal>
+
+    {/* Extend Tenant Expiry Modal */}
+    <Modal isOpen={showExtendModal} onClose={() => setShowExtendModal(false)} title={`Extend: ${extendTarget?.name || ''}`} footer={<div className="flex justify-end gap-3"><Button variant="secondary" onClick={() => setShowExtendModal(false)}>Cancel</Button><Button onClick={handleExtend} loading={saving}>Extend</Button></div>}>
+      {error && <div className="p-3 bg-red-50 text-red-700 rounded-lg text-sm mb-3">{error}</div>}
+      <div className="space-y-4">
+        <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
+          <p className="text-sm text-blue-800">
+            Current expiry: <span className="font-semibold">{extendTarget?.expiry_date || extendTarget?.license_expiry ? new Date(extendTarget!.expiry_date || extendTarget!.license_expiry!).toLocaleDateString() : 'Not set'}</span>
+          </p>
+        </div>
+        <p className="text-sm text-gray-600">Extend licence validity by:</p>
+        <div className="grid grid-cols-4 gap-2">
+          {[3, 7, 15, 30].map(d => (
+            <button key={d} onClick={() => setExtendDays(d)}
+              className={`px-3 py-2 rounded-lg text-sm font-medium transition ${extendDays === d ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}>
+              +{d}d
+            </button>
+          ))}
+        </div>
+        <div className="grid grid-cols-4 gap-2">
+          {[60, 90, 180, 365].map(d => (
+            <button key={d} onClick={() => setExtendDays(d)}
+              className={`px-3 py-2 rounded-lg text-sm font-medium transition ${extendDays === d ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}>
+              +{d}d
+            </button>
+          ))}
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-sm text-gray-500">Custom:</span>
+          <input type="number" value={extendDays} onChange={e => setExtendDays(Math.max(1, parseInt(e.target.value) || 1))}
+            className="w-24 px-3 py-1.5 border border-gray-300 rounded-lg text-sm" min={1} />
+          <span className="text-sm text-gray-400">days</span>
         </div>
       </div>
     </Modal>

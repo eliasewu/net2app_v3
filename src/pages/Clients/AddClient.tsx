@@ -18,6 +18,7 @@ export const AddClient: React.FC = () => {
     smpp_username: '', smpp_password: '', smpp_ip: '', smpp_port: 2775, system_type: 'SMPP', max_tps: 100,
     billing_mode: 'dlr' as BillingMode, currency: 'EUR' as Currency, balance: 0, credit_limit: 0,
     api_enabled: false, webhook_url: '', force_dlr: true, routing_plan_id: '', rate_plan_id: '',
+    portal_access: false,
     status: 'active' as const,
   };
 
@@ -32,7 +33,8 @@ export const AddClient: React.FC = () => {
     balance: existingClient.balance, credit_limit: existingClient.credit_limit,
     api_enabled: existingClient.api_enabled, webhook_url: existingClient.webhook_url,
     force_dlr: existingClient.force_dlr, routing_plan_id: existingClient.routing_plan_id || '',
-    rate_plan_id: existingClient.rate_plan_id || '', status: existingClient.status as 'active'|'inactive'|'suspended',
+    rate_plan_id: existingClient.rate_plan_id || '', portal_access: (existingClient as any).portal_access || false,
+    status: existingClient.status as 'active'|'inactive'|'suspended',
   } : defaultForm;
 
   const [formData, setFormData] = useState(initForm);
@@ -328,6 +330,15 @@ export const AddClient: React.FC = () => {
                   className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
                 />
                 <span className="text-sm text-gray-700">Force DLR</span>
+              </label>
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={(formData as any).portal_access || false}
+                  onChange={(e) => updateField('portal_access', e.target.checked)}
+                  className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                />
+                <span className="text-sm text-gray-700">Portal Access</span>
               </label>
             </div>
             <Input

@@ -10,6 +10,40 @@ const { Pool } = pg;
 // Format: PREFIX + timestamp(ms) + 5-digit random → ~19-digit pure numeric ID
 const genNumericMsgId = (prefix) => `${prefix}${Date.now()}${String(Math.floor(Math.random() * 100000)).padStart(5, '0')}`;
 
+// Detects Unicode (non-GSM7) → returns SMPP data_coding: 0=GSM7, 8=UCS2
+const getDataCoding = (message) => {
+    if (!message) return 0;
+    const GSM7 = new Set('@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞ\x1BÆæßÉ !"#¤%&\'()*+,-./0123456789:;<=>?¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà\f^{}\\[~]|€');
+    for (const ch of message) { if (!GSM7.has(ch)) return 8; }
+    return 0;
+};
+
+// ── SMS Message Parts Calculator (mirrors server.cjs) ──
+const calculateMessageParts = (message) => {
+    if (!message) return 1;
+    const GSM7_CHARS = new Set([
+        '@','£','$','¥','è','é','ù','ì','ò','Ç','\n','Ø','ø','\r','Å','å',
+        'Δ','_','Φ','Γ','Λ','Ω','Π','Ψ','Σ','Θ','Ξ','\x1B','Æ','æ','ß','É',
+        ' ','!','"','#','¤','%','&','\'','(',')','*','+',',','-','.','/',
+        '0','1','2','3','4','5','6','7','8','9',':',';','<','=','>','?',
+        '¡','A','B','C','D','E','F','G','H','I','J','K','L','M','N','O',
+        'P','Q','R','S','T','U','V','W','X','Y','Z','Ä','Ö','Ñ','Ü','§',
+        '¿','a','b','c','d','e','f','g','h','i','j','k','l','m','n','o',
+        'p','q','r','s','t','u','v','w','x','y','z','ä','ö','ñ','ü','à',
+        '\f','^','{','}','\\','[','~',']','|','€',
+    ]);
+    let isGSM7 = true;
+    for (let i = 0; i < message.length; i++) {
+        if (!GSM7_CHARS.has(message[i])) { isGSM7 = false; break; }
+    }
+    if (isGSM7) {
+        if (message.length <= 160) return 1;
+        return Math.ceil(message.length / 153);
+    }
+    if (message.length <= 70) return 1;
+    return Math.ceil(message.length / 67);
+};
+
 // Server-supported SMPP versions (highest to lowest)
 const SUPPORTED_VERSIONS = [0x50, 0x34, 0x33]; // 5.0, 3.4, 3.3
 
@@ -371,7 +405,16 @@ export default class SmppServer {
                   'SELECT * FROM clients WHERE id = $1', [boundEntity.entityId]
                 );
                 if (clientLookup.rows.length) {
-                  const resolved = await this.resolveRoute(clientLookup.rows[0], destAddr);
+                  const cl = clientLookup.rows[0];
+                  // Tenant expiry check — block if tenant licence expired
+                  if (cl.tenant_id) {
+                    const tR = await db.query('SELECT expiry_date, code FROM tenants WHERE id = $1 AND expiry_date IS NOT NULL AND expiry_date < NOW()', [cl.tenant_id]);
+                    if (tR.rows.length > 0) {
+                      console.log('[SMPP] Blocked ' + msgId + ': tenant ' + tR.rows[0].code + ' expired');
+                      return;
+                    }
+                  }
+                  const resolved = await this.resolveRoute(cl, destAddr);
                   // resolved now returns snake_case keys with operator + country included
                   Object.assign(routeData, resolved);
                 }
@@ -389,7 +432,7 @@ export default class SmppServer {
               sender_id: sourceAddr,
               destination: destAddr,
               message,
-              message_parts: Math.max(1, Math.ceil((message || '').length / 160)),
+              message_parts: calculateMessageParts(message),
               client_rate: routeData.client_rate || 0,
               supplier_rate: routeData.supplier_rate || 0,
               profit: parseFloat((parseFloat(routeData.client_rate || 0) - parseFloat(routeData.supplier_rate || 0)).toFixed(6)),
@@ -539,7 +582,7 @@ export default class SmppServer {
         short_message: job.message || '',
         esm_class: 0x00,       // Default SMSC Mode
         registered_delivery: 1, // Request DLR
-        data_coding: 0,
+        data_coding: getDataCoding(job.message || ''),
       }, (respPdu) => {
         if (respPdu && respPdu.command_status !== 0) {
           console.error(`[SMPP] ❌ deliver_sm (MT) to supplier #${supplierId} failed: status=${respPdu.command_status}`);
@@ -615,7 +658,7 @@ export default class SmppServer {
         short_message: message,
         esm_class: 0x00,
         registered_delivery: 0,
-        data_coding: 0,
+        data_coding: getDataCoding(message),
       }, (respPdu) => {
         if (respPdu && respPdu.command_status !== 0) {
           console.error(`[SMPP] deliver_sm (MO) failed: status=${respPdu.command_status}`);

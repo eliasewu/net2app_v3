@@ -2,6 +2,15 @@ import smpp from 'smpp';
 import dotenv from 'dotenv';
 dotenv.config();
 
+// Detects Unicode (non-GSM7) characters in message, returns correct SMPP data_coding
+// data_coding: 0 = GSM-7 (default), 8 = UCS-2 (Unicode)
+const getDataCoding = (message) => {
+    if (!message) return 0;
+    const GSM7 = new Set('@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞ\x1BÆæßÉ !"#¤%&\'()*+,-./0123456789:;<=>?¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà\f^{}\\[~]|€');
+    for (const ch of message) { if (!GSM7.has(ch)) return 8; }
+    return 0;
+};
+
 /**
  * SMPP Client (ESME) — connects TO a remote SMSC as a supplier.
  *
@@ -310,7 +319,7 @@ class SmppClient {
         dest_addr_npi: 0x01,
         short_message: job.message,
         registered_delivery: 1,
-        data_coding: 0,
+        data_coding: getDataCoding(job.message),
       }, (pdu) => {
         if (pdu.command_status === 0) {
           resolve({ success: true, message_id: pdu.message_id });

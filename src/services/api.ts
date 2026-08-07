@@ -306,6 +306,12 @@ export const bindApi = {
   },
 };
 
+// ==================== PORTAL ACCESS API ====================
+export const portalApi = {
+  toggle: (entity_type: 'client'|'supplier', entity_id: string) => api.post<any>('/portal/toggle', { entity_type, entity_id }),
+  syncAll: () => api.post<any>('/portal/sync-all', {}),
+};
+
 // ==================== OTT DEVICES API ====================
 export const ottApi = {
   getDevices: () => api.get<any[]>('/ott/devices'),
@@ -373,7 +379,7 @@ export const systemApi = {
 export const licenseApi = {
   getInfo: () => api.get<any>('/license/info'),
   getLimits: () => api.get<any>('/license/limits'),
-  activate: (key: string) => api.post<any>('/license/activate', { key }),
+  activate: (key: string, systemInfo?: { ip?: string; mac?: string }) => api.post<any>('/license/activate', { key, system_ip: systemInfo?.ip, system_mac: systemInfo?.mac }),
   deactivate: () => api.post('/license/deactivate', {}),
   validateKey: (key: string) => api.post<any>('/license/validate', { key }),
   
@@ -383,6 +389,7 @@ export const licenseApi = {
   updateTenant: (id: string, data: any) => api.put<any>(`/license/tenants/${id}`, data),
   deleteTenant: (id: string) => api.delete(`/license/tenants/${id}`),
   getTenantUsage: (id: string) => api.get<any>(`/license/tenants/${id}/usage`),
+  extendTenant: (id: string, days: number) => api.post<any>(`/license/tenants/${id}/extend`, { days }),
   getSystemInfo: () => api.get<{ ip: string; mac: string; hostname: string }>('/license/system-info'),
   
   // License Key Generation (for admin)

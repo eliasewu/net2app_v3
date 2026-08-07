@@ -116,6 +116,7 @@ export const AddSupplier: React.FC = () => {
     reconnect_schedule: existingSupplier?.reconnect_schedule || '0,1,2',
     max_queue_size: existingSupplier?.max_queue_size ?? 1000,
     dlr_timeout: existingSupplier?.dlr_timeout ?? 300,
+    portal_access: (existingSupplier as any)?.portal_access || false,
   });
 
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -458,6 +459,12 @@ export const AddSupplier: React.FC = () => {
   <Input label="Credit Limit" type="number" value={formData.credit_limit} onChange={e => updateField('credit_limit', parseFloat(e.target.value))} />
   <Input label="Max Queue Size" type="number" value={formData.max_queue_size} onChange={e => updateField('max_queue_size', parseInt(e.target.value)||1000)} hint="Max pending SMS queue depth for inbound gateways (0=unlimited)" min={0} />
   <Input label="DLR Timeout (sec)" type="number" value={formData.dlr_timeout} onChange={e => updateField('dlr_timeout', parseInt(e.target.value)||300)} hint="Time before inbound messages are reported as EXPIRED" min={30} />
+  <div className="flex items-center pt-2">
+    <label className="flex items-center gap-2 cursor-pointer">
+      <input type="checkbox" checked={(formData as any).portal_access || false} onChange={e => updateField('portal_access', e.target.checked)} className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500" />
+      <span className="text-sm text-gray-700">Enable Portal Access</span>
+    </label>
+  </div>
         </div></Card>
 
         {formData.connection_type === 'smpp' && (

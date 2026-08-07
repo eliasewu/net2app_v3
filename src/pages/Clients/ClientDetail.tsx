@@ -1,13 +1,13 @@
 import React, { useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Edit, Trash2, Send, CreditCard, BarChart3, MessageSquare, Radio, PhoneCall, ToggleLeft, ToggleRight, Wifi, WifiOff, RefreshCw } from 'lucide-react';
+import { ArrowLeft, Edit, Trash2, Send, CreditCard, BarChart3, MessageSquare, Radio, PhoneCall, ToggleLeft, ToggleRight, Wifi, WifiOff, RefreshCw, Globe } from 'lucide-react';
 import { useData } from '../../store/DataContext';
 import { Card } from '../../components/UI/Card';
 import { Button } from '../../components/UI/Button';
 import { Badge } from '../../components/UI/Badge';
 import { Modal } from '../../components/UI/Modal';
 import { Input } from '../../components/UI/Input';
-import { voiceOtpApi, bindApi } from '../../services/api';
+import { voiceOtpApi, bindApi, portalApi } from '../../services/api';
 
 export const ClientDetail: React.FC = () => {
   const { id } = useParams<{ id: string }>();
@@ -22,6 +22,7 @@ export const ClientDetail: React.FC = () => {
   const [testDestination, setTestDestination] = useState('');
   const [testingOtp, setTestingOtp] = useState(false);
   const [testResult, setTestResult] = useState<any>(null);
+  const [togglingPortal, setTogglingPortal] = useState(false);
 
   if (!client) {
     return (
@@ -128,6 +129,35 @@ export const ClientDetail: React.FC = () => {
           <p className="text-sm text-gray-500">Actions</p>
           <Button size="sm" onClick={() => setShowTopup(true)} className="mt-2 w-full">Top Up</Button>
           <Button size="sm" variant="secondary" onClick={() => navigate('/testing/sms')} className="mt-2 w-full">Send Test SMS</Button>
+          <div className="mt-3 pt-3 border-t border-gray-100">
+            <p className="text-xs text-gray-500 mb-1">Portal Access</p>
+            <button
+              onClick={async () => {
+                setTogglingPortal(true);
+                try {
+                  const res: any = await portalApi.toggle('client', client.id);
+                  if (res.success) updateClient(client.id, { portal_access: res.data.portal_access } as any);
+                } catch (e) { console.error('Portal toggle failed:', e); }
+                setTogglingPortal(false);
+              }}
+              disabled={togglingPortal}
+              className="flex items-center gap-2 text-sm"
+            >
+              {togglingPortal ? (
+                <span className="w-4 h-4 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
+              ) : (client as any).portal_access ? (
+                <ToggleRight size={20} className="text-green-600" />
+              ) : (
+                <ToggleLeft size={20} className="text-gray-400" />
+              )}
+              <span className={(client as any).portal_access ? 'text-green-700' : 'text-gray-500'}>
+                {(client as any).portal_access ? 'Enabled' : 'Disabled'}
+              </span>
+            </button>
+            <p className="text-[10px] text-gray-400 mt-1">
+              {(client as any).portal_access ? 'Client can log in with SMPP creds' : 'Click to enable portal login'}
+            </p>
+          </div>
         </div>
       </div>
 

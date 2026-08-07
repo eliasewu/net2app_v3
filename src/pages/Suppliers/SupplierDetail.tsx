@@ -1,8 +1,8 @@
 import React, { useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Edit, Trash2, Wifi, WifiOff, RefreshCw, TestTube, Phone, Globe, Server, CheckCircle, Download, Copy } from 'lucide-react';
+import { ArrowLeft, Edit, Trash2, Wifi, WifiOff, RefreshCw, TestTube, Phone, Globe, Server, CheckCircle, Download, Copy, ToggleLeft, ToggleRight } from 'lucide-react';
 import { useData } from '../../store/DataContext';
-import { suppliersApi } from '../../services/api';
+import { suppliersApi, portalApi } from '../../services/api';
 import { Card } from '../../components/UI/Card';
 import { Button } from '../../components/UI/Button';
 import { Badge } from '../../components/UI/Badge';
@@ -22,6 +22,7 @@ export const SupplierDetail: React.FC = () => {
   const [timeoutSecs, setTimeoutSecs] = useState(supplier?.dlr_timeout ?? 300);
   const [editingQueue, setEditingQueue] = useState(false);
   const [queueSize, setQueueSize] = useState(supplier?.max_queue_size ?? 1000);
+  const [togglingPortal, setTogglingPortal] = useState(false);
 
   if (!supplier) {
     return <div className="text-center py-12"><p className="text-gray-600 text-lg">Supplier not found</p><Button variant="secondary" onClick={() => navigate('/suppliers')} className="mt-4">Back to Suppliers</Button></div>;
@@ -97,7 +98,36 @@ export const SupplierDetail: React.FC = () => {
         <div className="bg-gradient-to-br from-blue-500 to-blue-600 rounded-xl p-5 text-white"><Server size={20} className="mb-2" /><p className="text-sm opacity-80">Failures</p><p className={`text-2xl font-bold mt-1 ${supplier.consecutive_failures>10?'text-red-200':supplier.consecutive_failures>0?'text-yellow-200':'text-white'}`}>{supplier.consecutive_failures}{supplier.consecutive_failures>=20&&<span className="text-sm ml-2">⚠ BLOCKED</span>}{supplier.status==='inactive'&&<span className="text-sm ml-2">🚫 INACTIVE</span>}</p></div>
         <div className="bg-gradient-to-br from-purple-500 to-purple-600 rounded-xl p-5 text-white"><Phone size={20} className="mb-2" /><p className="text-sm opacity-80">Balance</p><p className="text-2xl font-bold">€{(supplier.balance||0).toLocaleString()}</p></div>
         <div className="bg-gradient-to-br from-indigo-500 to-indigo-600 rounded-xl p-5 text-white"><Globe size={20} className="mb-2" /><p className="text-sm opacity-80">Credit Limit</p><p className="text-2xl font-bold">€{(supplier.credit_limit||0).toLocaleString()}</p></div>
-        <div className="bg-white rounded-xl p-5 border border-gray-200"><p className="text-sm text-gray-500">Actions</p><Button size="sm" onClick={()=>setShowTopup(true)} className="mt-2 w-full">Top Up</Button><Button size="sm" variant="secondary" onClick={handleTestConnection} className="mt-2 w-full" icon={<TestTube size={14}/>}>Test</Button></div>
+        <div className="bg-white rounded-xl p-5 border border-gray-200"><p className="text-sm text-gray-500">Actions</p><Button size="sm" onClick={()=>setShowTopup(true)} className="mt-2 w-full">Top Up</Button><Button size="sm" variant="secondary" onClick={handleTestConnection} className="mt-2 w-full" icon={<TestTube size={14}/>}>Test</Button>
+        <div className="mt-3 pt-3 border-t border-gray-100">
+          <p className="text-xs text-gray-500 mb-1">Portal Access</p>
+          <button
+            onClick={async () => {
+              setTogglingPortal(true);
+              try {
+                const res: any = await portalApi.toggle('supplier', supplier.id);
+                if (res.success) updateSupplier(supplier.id, { portal_access: res.data.portal_access } as any);
+              } catch (e) { console.error('Portal toggle failed:', e); }
+              setTogglingPortal(false);
+            }}
+            disabled={togglingPortal}
+            className="flex items-center gap-2 text-sm"
+          >
+            {togglingPortal ? (
+              <span className="w-4 h-4 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
+            ) : (supplier as any).portal_access ? (
+              <ToggleRight size={20} className="text-green-600" />
+            ) : (
+              <ToggleLeft size={20} className="text-gray-400" />
+            )}
+            <span className={(supplier as any).portal_access ? 'text-green-700' : 'text-gray-500'}>
+              {(supplier as any).portal_access ? 'Enabled' : 'Disabled'}
+            </span>
+          </button>
+          <p className="text-[10px] text-gray-400 mt-1">
+            {(supplier as any).portal_access ? 'Supplier can log in with SMPP creds' : 'Click to enable portal login'}
+          </p>
+        </div></div>
       </div>
 
       {testResult && <div className={`p-4 rounded-lg ${testResult.success?'bg-green-50 border border-green-200':'bg-red-50 border border-red-200'}`}><p className={`text-sm ${testResult.success?'text-green-700':'text-red-700'}`}>{testResult.msg}</p></div>}

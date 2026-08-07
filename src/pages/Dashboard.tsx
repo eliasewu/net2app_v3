@@ -6,6 +6,7 @@ import { Card } from '../components/UI/Card';
 import { StatCard } from '../components/UI/StatCard';
 import { Badge } from '../components/UI/Badge';
 import { ProfitWidget } from '../components/Dashboard/ProfitWidget';
+import { QuickWizard } from '../components/Dashboard/QuickWizard';
 import { ErrorBoundary } from '../components/UI/ErrorBoundary';
 
 export const Dashboard: React.FC = () => {
@@ -123,6 +124,8 @@ export const Dashboard: React.FC = () => {
       {/* Real-time Profit Widget */}
       <ErrorBoundary>
         <ProfitWidget />
+
+        <QuickWizard />
       </ErrorBoundary>
 
       {/* Alert Row */}

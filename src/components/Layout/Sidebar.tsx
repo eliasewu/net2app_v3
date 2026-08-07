@@ -126,11 +126,37 @@ interface SidebarProps {
 }
 
 import { useTheme } from '../../store/ThemeContext';
+import { useAuth } from '../../store/AuthContext';
+
+// Portal-only menu for client/supplier portal users
+const portalMenuItems: MenuItem[] = [
+  { label: 'Dashboard', icon: <LayoutDashboard size={20} />, path: '/' },
+  {
+    label: 'My CDR',
+    icon: <MessageSquare size={20} />,
+    children: [
+      { label: 'SMS Logs', icon: <MessageSquare size={16} />, path: '/sms-logs' },
+    ]
+  },
+  {
+    label: 'Billing',
+    icon: <CreditCard size={20} />,
+    children: [
+      { label: 'Invoices', icon: <FileText size={16} />, path: '/billing/invoices' },
+      { label: 'Payments', icon: <CreditCard size={16} />, path: '/billing/payments' },
+    ]
+  },
+];
 
 export const Sidebar: React.FC<SidebarProps> = ({ isCollapsed, isMobileOpen, onCloseMobile }) => {
   const { isDark } = useTheme();
+  const { isSuperAdmin, user } = useAuth();
+  
+  // Client/supplier portal users see a limited menu
+  const isPortalUser = user?.role === 'client' || user?.role === 'supplier';
+  const activeMenuItems = isPortalUser ? portalMenuItems : menuItems;
   const location = useLocation();
-  const [expandedItems, setExpandedItems] = useState<string[]>(['Clients', 'Suppliers', 'Routing']);
+  const [expandedItems, setExpandedItems] = useState<string[]>([]);
   const touchStartX = useRef(0);
   const SWIPE_THRESHOLD = 80; // px to swipe before closing
 
@@ -165,7 +191,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ isCollapsed, isMobileOpen, onC
 
   const toggleExpand = (label: string) => {
     setExpandedItems(prev =>
-      prev.includes(label) ? prev.filter(item => item !== label) : [...prev, label]
+      prev.includes(label) ? [] : [label]
     );
   };
 
@@ -259,7 +285,14 @@ export const Sidebar: React.FC<SidebarProps> = ({ isCollapsed, isMobileOpen, onC
 
       {/* Navigation */}
       <nav className="p-3 space-y-1 h-[calc(100vh-4rem)] overflow-y-auto scrollbar-thin">
-        {menuItems.map(item => renderMenuItem(item))}
+        {activeMenuItems.map(item => {
+          // Hide License menu from non-super-admin users
+          if (item.label === 'System' && item.children && !isSuperAdmin()) {
+            const filteredItem = { ...item, children: item.children.filter(c => c.label !== 'License') };
+            return renderMenuItem(filteredItem);
+          }
+          return renderMenuItem(item);
+        })}
       </nav>
     </aside>
   );
