@@ -925,11 +925,14 @@ let smppServer = null; // Set by SmppServer import (for Android Gateway DLR push
                         // Find admin email from platform_settings or users table
                         const adminR = await pool.query("SELECT value FROM platform_settings WHERE key = 'admin_email' LIMIT 1");
                         const adminEmail = adminR.rows[0]?.value || smtp.from_email;
+                        const alertPort = parseInt(smtp.port) || 587;
+                        const alertSecure = alertPort === 465 || smtp.encryption === 'ssl';
                         const transporter = nodemailer.createTransport({
                             host: smtp.host,
-                            port: parseInt(smtp.port) || 587,
-                            secure: smtp.encryption === 'ssl',
+                            port: alertPort,
+                            secure: alertSecure,
                             auth: { user: smtp.username, pass: smtp.password },
+                            tls: { rejectUnauthorized: false },
                         });
                         await transporter.sendMail({
                             from: `"${smtp.from_name || 'NET2APP'}" <${smtp.from_email}>`,
@@ -2146,10 +2149,13 @@ async function sendWelcomeEmail(entityType, entity) {
                 if (serverIP !== '127.0.0.1') break;
             }
         } catch {}
+        const port = parseInt(smtp.port) || 587;
+        const secure = port === 465 || smtp.encryption === 'ssl';
         const transporter = nodemailer.createTransport({
-            host: smtp.host, port: parseInt(smtp.port) || 587,
-            secure: smtp.encryption === 'ssl',
+            host: smtp.host, port,
+            secure,
             auth: { user: smtp.username, pass: smtp.password },
+            tls: { rejectUnauthorized: false },
         });
         const html = `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px">
 <h2 style="color:#1a56db">Welcome to NET2APP Hub!</h2>
@@ -2201,8 +2207,9 @@ app.post('/api/clients', auth, async (req, res) => {
         const client = result.rows[0];
         // Auto-create portal user if requested
         if (portalAccess) {
+            console.error('[WELCOME] Triggering welcome email for client:', client.client_code, 'to', client.email);
             await ensurePortalUser('client', client).catch(e => console.error('[PORTAL] Failed to create client user:', e.message));
-            sendWelcomeEmail('client', client).catch(() => {});
+            sendWelcomeEmail('client', client).catch(e => console.error('[WELCOME] Client welcome email failed:', e.message));
         }
         res.json({ success: true, data: client });
     } catch (error) {
@@ -2416,7 +2423,7 @@ app.post('/api/suppliers', auth, async (req, res) => {
         const supplier = result.rows[0];
         if (supplier.portal_access) {
             await ensurePortalUser('supplier', supplier).catch(e => console.error('[PORTAL] Failed to create supplier user:', e.message));
-            sendWelcomeEmail('supplier', supplier).catch(() => {});
+            sendWelcomeEmail('supplier', supplier).catch(e => console.error('[WELCOME] Supplier welcome email failed:', e.message));
         }
         res.json({ success: true, data: supplier });
     } catch (error) {
@@ -2655,7 +2662,7 @@ app.post('/api/portal/toggle', auth, async (req, res) => {
         if (entity.portal_access) {
             const fullR = await pool.query(`SELECT * FROM ${table} WHERE id = $1`, [entity_id]);
             await ensurePortalUser(entity_type, fullR.rows[0]).catch(() => {});
-            await sendWelcomeEmail(entity_type, fullR.rows[0]).catch(() => {});
+            await sendWelcomeEmail(entity_type, fullR.rows[0]).catch(e => console.error('[WELCOME] Portal toggle welcome email failed:', e.message));
         }
         res.json({ success: true, data: entity });
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -4672,7 +4679,10 @@ app.delete('/api/dlr-queue/:id', auth, async (req, res) => {
 // Auto-generate invoice from real SMS logs for a client/supplier in a date range
 app.post('/api/invoices/generate', auth, async (req, res) => {
     try {
-        const { entity_type, entity_id, period_start, period_end, notes, auto_send } = req.body || {};
+        let { entity_type, entity_id, period_start, period_end, notes, auto_send } = req.body || {};
+        // Portal scoping: auto-resolve entity from authenticated user
+        if (req.user.client_id) { entity_type = 'client'; entity_id = req.user.client_id; }
+        if (req.user.supplier_id) { entity_type = 'supplier'; entity_id = req.user.supplier_id; }
         if (!entity_type || !entity_id) return res.status(400).json({ error: 'entity_type and entity_id are required' });
         if (!period_start || !period_end) return res.status(400).json({ error: 'period_start and period_end are required' });
 
@@ -4777,12 +4787,16 @@ app.post('/api/invoices/generate', auth, async (req, res) => {
 app.get('/api/invoices', auth, async (req, res) => {
     try {
         const { include_deleted } = req.query;
-        let q = 'SELECT * FROM invoices';
+        let q = 'SELECT * FROM invoices WHERE 1=1';
+        const p = []; let i = 1;
+        // Portal scoping: client sees own, supplier sees own
+        if (req.user.client_id) { q += ` AND entity_type = 'client' AND entity_id = $${i++}`; p.push(req.user.client_id); }
+        if (req.user.supplier_id) { q += ` AND entity_type = 'supplier' AND entity_id = $${i++}`; p.push(req.user.supplier_id); }
         if (include_deleted !== 'true') {
-            q += ' WHERE (is_deleted IS NULL OR is_deleted = false)';
+            q += ' AND (is_deleted IS NULL OR is_deleted = false)';
         }
         q += ' ORDER BY id DESC LIMIT 500';
-        const result = await pool.query(q);
+        const result = await pool.query(q, p);
         res.json({ success: true, data: result.rows });
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -4853,16 +4867,132 @@ app.delete('/api/invoices/:id', auth, async (req, res) => {
     }
 });
 
+// ==================== INVOICE PDF DOWNLOAD ====================
+// Generates a downloadable HTML invoice rendered as PDF-like page.
+// Portal users can only download their own invoices.
+app.get('/api/invoices/:id/pdf', auth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const result = await pool.query('SELECT * FROM invoices WHERE id = $1 AND (is_deleted IS NULL OR is_deleted = false)', [id]);
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Invoice not found' });
+        const inv = result.rows[0];
+        // Portal scoping
+        if (req.user.client_id && (inv.entity_type !== 'client' || inv.entity_id !== req.user.client_id)) {
+            return res.status(403).json({ error: 'Access denied' });
+        }
+        if (req.user.supplier_id && (inv.entity_type !== 'supplier' || inv.entity_id !== req.user.supplier_id)) {
+            return res.status(403).json({ error: 'Access denied' });
+        }
+        // Get destination breakdown from sms_logs
+        const breakdown = await pool.query(
+            `SELECT destination, COUNT(*) as sms_count,
+                    AVG(${inv.entity_type === 'client' ? 'client_rate' : 'supplier_rate'}) as avg_rate,
+                    SUM(${inv.entity_type === 'client' ? 'client_rate' : 'supplier_rate'} * message_parts) as total_amount
+             FROM sms_logs
+             WHERE ${inv.entity_type}_id = $1
+               AND submit_time >= $2 AND submit_time <= ($3::date + INTERVAL '1 day')
+               AND (is_deleted IS NULL OR is_deleted = false)
+             GROUP BY destination ORDER BY total_amount DESC LIMIT 20`,
+            [inv.entity_id, inv.period_start, inv.period_end]
+        );
+        const html = `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>${inv.invoice_number}</title>
+<style>
+  body { font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto; color: #1f2937; }
+  .header { display: flex; justify-content: space-between; border-bottom: 2px solid #3b82f6; padding-bottom: 20px; margin-bottom: 30px; }
+  .header h1 { font-size: 32px; color: #3b82f6; margin: 0; }
+  .header .inv-num { font-size: 18px; color: #6b7280; }
+  .meta { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 30px; }
+  .meta .box { background: #f9fafb; padding: 16px; border-radius: 8px; }
+  .meta .box h3 { font-size: 11px; text-transform: uppercase; color: #6b7280; margin: 0 0 8px; }
+  .dates { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 30px; font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; margin-bottom: 30px; }
+  th { background: #f3f4f6; padding: 10px 12px; text-align: left; font-size: 12px; text-transform: uppercase; color: #6b7280; }
+  td { padding: 10px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; }
+  td.right { text-align: right; }
+  .totals { margin-left: auto; width: 300px; }
+  .totals div { display: flex; justify-content: space-between; padding: 6px 0; font-size: 14px; }
+  .totals hr { border: none; border-top: 1px solid #d1d5db; margin: 8px 0; }
+  .totals .grand { font-size: 20px; font-weight: bold; }
+  .footer { margin-top: 40px; padding-top: 20px; border-top: 1px solid #e5e7eb; font-size: 12px; color: #9ca3af; }
+  @media print { body { margin: 0; } .no-print { display: none; } }
+</style></head><body>
+<div class="header">
+  <div><h1>📡 NET2APP Hub</h1><p style="margin:4px 0;color:#6b7280">Enterprise SMS Platform</p></div>
+  <div style="text-align:right"><h1>INVOICE</h1><p class="inv-num">${inv.invoice_number}</p></div>
+</div>
+<div class="meta">
+  <div class="box"><h3>Invoice To</h3><p style="font-weight:600;margin:0">${inv.entity_name}</p><p style="margin:4px 0;color:#6b7280">${inv.entity_type}</p></div>
+  <div class="box"><h3>Invoice By</h3><p style="font-weight:600;margin:0">NET2APP Hub</p><p style="margin:4px 0;color:#6b7280">Platform Provider</p></div>
+</div>
+<div class="dates">
+  <div><strong>Invoice Date</strong><br>${new Date(inv.created_at).toLocaleDateString()}</div>
+  <div><strong>Period Start</strong><br>${new Date(inv.period_start).toLocaleDateString()}</div>
+  <div><strong>Period End</strong><br>${new Date(inv.period_end).toLocaleDateString()}</div>
+  <div><strong>Due Date</strong><br>${new Date(inv.due_date).toLocaleDateString()}</div>
+</div>
+<table>
+  <thead><tr><th>Destination</th><th class="right">SMS Count</th><th class="right">Avg Rate</th><th class="right">Amount</th></tr></thead>
+  <tbody>${breakdown.rows.map(r => `<tr><td>${r.destination}</td><td class="right">${parseInt(r.sms_count).toLocaleString()}</td><td class="right">€${Number(r.avg_rate).toFixed(4)}</td><td class="right">€${Number(r.total_amount).toFixed(2)}</td></tr>`).join('')}</tbody>
+</table>
+<div class="totals">
+  <div><span>Subtotal</span><span>€${Number(inv.total_amount).toLocaleString()}</span></div>
+  <div><span>Tax (${inv.tax_rate || 0}%)</span><span>€${Number(inv.tax_amount).toLocaleString()}</span></div>
+  <hr><div class="grand"><span>Total</span><span>€${Number(inv.grand_total).toLocaleString()}</span></div>
+</div>
+${inv.notes ? `<p style="margin-top:20px;font-size:13px;color:#6b7280"><strong>Notes:</strong> ${inv.notes}</p>` : ''}
+<div class="footer">NET2APP Hub • Enterprise SMS Platform • ${new Date().getFullYear()}</div>
+<p class="no-print" style="text-align:center;margin-top:20px"><button onclick="window.print()" style="padding:10px 24px;background:#3b82f6;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:14px">🖨 Print / Save PDF</button></p>
+</body></html>`;
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.setHeader('Content-Disposition', `inline; filename="${inv.invoice_number}.html"`);
+        res.send(html);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Billing invoice list (frontend-friendly with filters)
+app.post('/api/billing/invoices/list', auth, async (req, res) => {
+    try {
+        const f = req.body || {};
+        const pageLimit = Math.min(parseInt(f.limit) || 50, 500);
+        const pageOffset = parseInt(f.offset) || 0;
+        let q = 'SELECT * FROM invoices WHERE 1=1';
+        const p = []; let i = 1;
+        // Portal scoping
+        if (req.user.client_id) { q += ` AND entity_type = 'client' AND entity_id = $${i++}`; p.push(req.user.client_id); }
+        if (req.user.supplier_id) { q += ` AND entity_type = 'supplier' AND entity_id = $${i++}`; p.push(req.user.supplier_id); }
+        if (f.entity_type) { q += ` AND entity_type = $${i++}`; p.push(f.entity_type); }
+        if (f.entity_id) { q += ` AND entity_id = $${i++}`; p.push(f.entity_id); }
+        if (f.status) { q += ` AND status = $${i++}`; p.push(f.status); }
+        if (f.include_deleted !== true) q += ' AND (is_deleted IS NULL OR is_deleted = false)';
+        // Count
+        const countQ = q.replace('SELECT *', 'SELECT COUNT(*) as total');
+        const countR = await pool.query(countQ, p);
+        const total = parseInt(countR.rows[0].total);
+        // Paginate
+        q += ` ORDER BY created_at DESC LIMIT $${i++} OFFSET $${i++}`;
+        p.push(pageLimit, pageOffset);
+        const result = await pool.query(q, p);
+        res.json({ success: true, data: result.rows, total });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ==================== PAYMENTS ====================
 app.get('/api/payments', auth, async (req, res) => {
     try {
         const { include_deleted } = req.query;
-        let q = 'SELECT * FROM payments';
+        let q = 'SELECT * FROM payments WHERE 1=1';
+        const p = []; let i = 1;
+        // Portal scoping
+        if (req.user.client_id) { q += ` AND entity_type = 'client' AND entity_id = $${i++}`; p.push(req.user.client_id); }
+        if (req.user.supplier_id) { q += ` AND entity_type = 'supplier' AND entity_id = $${i++}`; p.push(req.user.supplier_id); }
         if (include_deleted !== 'true') {
-            q += ' WHERE (is_deleted IS NULL OR is_deleted = false)';
+            q += ' AND (is_deleted IS NULL OR is_deleted = false)';
         }
         q += ' ORDER BY id DESC LIMIT 500';
-        const result = await pool.query(q);
+        const result = await pool.query(q, p);
         res.json({ success: true, data: result.rows });
     } catch (error) {
         res.status(500).json({ error: error.message });

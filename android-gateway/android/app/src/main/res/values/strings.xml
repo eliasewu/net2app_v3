@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">NET2APP Gateway</string>
+    <string name="title_activity_main">NET2APP Gateway</string>
+    <string name="package_name">com.net2app.gateway</string>
+    <string name="custom_url_scheme">com.net2app.gateway</string>
+</resources>

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Plus, Search, Download, Eye, Send, CheckCircle, FileText } from 'lucide-react';
 import { useData } from '../../store/DataContext';
+import { useAuth } from '../../store/AuthContext';
 import { Card } from '../../components/UI/Card';
 import { Button } from '../../components/UI/Button';
 import { Badge } from '../../components/UI/Badge';
@@ -12,6 +13,8 @@ import { api } from '../../services/api';
 
 export const InvoicesList: React.FC = () => {
   const { invoices, clients, suppliers, updateInvoice } = useData();
+  const { user } = useAuth();
+  const isPortalUser = user?.role === 'client' || user?.role === 'supplier';
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('all');
   const [typeFilter, setTypeFilter] = useState<string>('all');
@@ -218,9 +221,16 @@ export const InvoicesList: React.FC = () => {
               <CheckCircle size={16} className="text-green-500" />
             </button>
           )}
-          <button className="p-1.5 rounded hover:bg-gray-100" title="Download PDF">
-            <Download size={16} className="text-gray-500" />
-          </button>
+          <a
+            href={`/api/invoices/${invoice.id}/pdf`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="p-1.5 rounded hover:bg-gray-100"
+            title="Download PDF"
+            onClick={(e) => { e.stopPropagation(); }}
+          >
+            <Download size={16} className="text-blue-500" />
+          </a>
         </div>
       ),
     },
@@ -241,9 +251,11 @@ export const InvoicesList: React.FC = () => {
           <h1 className="text-2xl font-bold text-gray-800">Invoices</h1>
           <p className="text-gray-500 mt-1">Generate and manage invoices for clients and suppliers</p>
         </div>
-        <Button icon={<Plus size={18} />} onClick={() => setShowModal(true)} loading={generating}>
-          Generate Invoice
-        </Button>
+        {!isPortalUser && (
+          <Button icon={<Plus size={18} />} onClick={() => setShowModal(true)} loading={generating}>
+            Generate Invoice
+          </Button>
+        )}
       </div>
 
       {/* Stats */}
@@ -488,7 +500,9 @@ export const InvoicesList: React.FC = () => {
             {viewModal.notes && <div className="text-sm text-gray-600"><strong>Notes:</strong> {viewModal.notes}</div>}
 
             <div className="flex justify-end gap-3 pt-4 border-t">
-              <Button variant="secondary" icon={<Download size={16} />} onClick={() => window.print()}>Download PDF</Button>
+              <a href={`/api/invoices/${viewModal.id}/pdf`} target="_blank" rel="noopener noreferrer">
+                <Button variant="secondary" icon={<Download size={16} />}>Download PDF</Button>
+              </a>
               {viewModal.status === 'draft' && (
                 <Button icon={<Send size={16} />} onClick={() => { updateInvoice(viewModal.id, { status: 'sent' }); setViewModal(null); }}>Send Invoice</Button>
               )}
