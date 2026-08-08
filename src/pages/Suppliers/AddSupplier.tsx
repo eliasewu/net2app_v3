@@ -102,6 +102,8 @@ export const AddSupplier: React.FC = () => {
     api_key: existingSupplier?.api_key || '',
     api_method: (existingSupplier?.api_method || 'POST') as 'GET' | 'POST',
     force_dlr: existingSupplier?.force_dlr || false,
+    force_dlr_timeout: (existingSupplier as any)?.force_dlr_timeout || (existingSupplier as any)?.dlr_timeout || 150,
+    force_dlr_timeout_mode: (existingSupplier as any)?.force_dlr_timeout_mode || 'fixed',
     balance: existingSupplier?.balance || 0,
     credit_limit: existingSupplier?.credit_limit || 0,
     currency: (existingSupplier?.currency || 'EUR') as Currency,
@@ -459,12 +461,20 @@ export const AddSupplier: React.FC = () => {
   <Input label="Credit Limit" type="number" value={formData.credit_limit} onChange={e => updateField('credit_limit', parseFloat(e.target.value))} />
   <Input label="Max Queue Size" type="number" value={formData.max_queue_size} onChange={e => updateField('max_queue_size', parseInt(e.target.value)||1000)} hint="Max pending SMS queue depth for inbound gateways (0=unlimited)" min={0} />
   <Input label="DLR Timeout (sec)" type="number" value={formData.dlr_timeout} onChange={e => updateField('dlr_timeout', parseInt(e.target.value)||300)} hint="Time before inbound messages are reported as EXPIRED" min={30} />
-  <div className="flex items-center pt-2">
+  <div className="flex items-center gap-6 pt-2">
     <label className="flex items-center gap-2 cursor-pointer">
       <input type="checkbox" checked={(formData as any).portal_access || false} onChange={e => updateField('portal_access', e.target.checked)} className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500" />
       <span className="text-sm text-gray-700">Enable Portal Access</span>
     </label>
+    <label className="flex items-center gap-2 cursor-pointer">
+      <input type="checkbox" checked={(formData as any).force_dlr || false} onChange={e => updateField('force_dlr', e.target.checked)} className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500" />
+      <span className="text-sm text-gray-700">Force DLR</span>
+    </label>
   </div>
+  {(formData as any).force_dlr && (<>
+    <Select label="Force DLR Timeout Mode" value={(formData as any).force_dlr_timeout_mode || 'fixed'} onChange={e => updateField('force_dlr_timeout_mode', e.target.value)} options={[{value:'fixed',label:'Fixed'},{value:'random_1_5',label:'Random 1-5s'},{value:'random_1_10',label:'Random 1-10s'}]} />
+    <Input label="Force DLR Timeout (sec)" type="number" value={(formData as any).force_dlr_timeout || 150} onChange={e => updateField('force_dlr_timeout', parseInt(e.target.value)||0)} hint="For fixed mode: exact seconds. Random modes use this as upper bound." min={0} />
+  </>)}
         </div></Card>
 
         {formData.connection_type === 'smpp' && (

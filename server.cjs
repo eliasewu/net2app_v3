@@ -1441,23 +1441,51 @@ let smppServer = null; // Set by SmppServer import (for Android Gateway DLR push
                         });
 
                         // Auto-DLR: if force_dlr is enabled, schedule a fake DELIVRD after timeout.
+                        // Uses resolveForceDlrTimeout() for fixed/random modes per Excel matrix.
                         const hasForceDlr = (client.force_dlr || route.supplier_force_dlr);
                         if (hasForceDlr) {
-                            const timeoutSec = Math.max(
-                                client.force_dlr ? (parseInt(client.force_dlr_timeout) || 0) : 0,
-                                route.supplier_force_dlr ? (route.supplier_force_dlr_timeout || 0) : 0
-                            );
+                            const clientTimeoutMode = (client.force_dlr_timeout_mode || 'fixed');
+                            const supplierTimeoutMode = (route.supplier_force_dlr_timeout_mode || 'fixed');
+                            const clientTimeoutSec = client.force_dlr
+                                ? resolveForceDlrTimeout(clientTimeoutMode, parseInt(client.force_dlr_timeout) || 0)
+                                : 0;
+                            const supplierTimeoutSec = route.supplier_force_dlr
+                                ? resolveForceDlrTimeout(supplierTimeoutMode, route.supplier_force_dlr_timeout || 0)
+                                : 0;
+                            const timeoutSec = Math.max(clientTimeoutSec, supplierTimeoutSec);
                             const scheduleDlr = async () => {
                                 try {
-                                    await pool.query(
-                                        `UPDATE sms_logs SET dlr_status = 'DELIVRD', status = 'delivered', delivery_time = NOW(), dlr_timestamp = NOW(), is_force_dlr = true WHERE message_id = $1 AND dlr_status = 'PENDING'`,
+                                    const updResult = await pool.query(
+                                        `UPDATE sms_logs SET dlr_status = 'DELIVRD', status = 'delivered', delivery_time = NOW(), dlr_timestamp = NOW(), is_force_dlr = true, dlr_source = 'FORCE_TIMEOUT' WHERE message_id = $1 AND dlr_status = 'PENDING'`,
                                         [log.message_id]
                                     );
-                                    await pool.query(
-                                        `UPDATE sms_outbox SET dlr_status = 'DELIVRD', status = 'delivered', dlr_confirmed_at = NOW(), completed_at = NOW() WHERE message_id = $1 AND dlr_status = 'PENDING'`,
-                                        [log.message_id]
-                                    ).catch(() => {});
-                                    console.error(`[FORCE-DLR] ⚡ ${log.message_id}: Auto-DLR set to DELIVRD after ${timeoutSec}s (SMPP relay force_dlr override)`);
+                                    // Only bill if status was still PENDING (real DLR didn't arrive yet).
+                                    // Excel Matrix Rule #6: Real failure before timeout → no charge, cancel timer.
+                                    if (updResult.rowCount > 0) {
+                                        await pool.query(
+                                            `UPDATE sms_outbox SET dlr_status = 'DELIVRD', status = 'delivered', dlr_confirmed_at = NOW(), completed_at = NOW() WHERE message_id = $1 AND dlr_status = 'PENDING'`,
+                                            [log.message_id]
+                                        ).catch(() => {});
+                                        // Excel Matrix Rule: Force DLR timeout → charge client, ZERO supplier payout
+                                        // unless supplier_force_dlr is also enabled.
+                                        const isForceDlrBilling = true;
+                                        const fsCost = parseFloat((supplierRate * parts).toFixed(6));
+                                        await applyBilling({
+                                            messageId: log.message_id,
+                                            clientId: log.client_id,
+                                            supplierId: route.supplier_id,
+                                            clientCost, supplierCost: fsCost,
+                                            clientBillingMode, supplierBillingMode,
+                                            isSubmit: false,
+                                            dlrStatus: 'DELIVRD',
+                                            clientForceDlr: client.force_dlr || false,
+                                            supplierForceDlr: route.supplier_force_dlr || false,
+                                            isForceDlrBilling
+                                        });
+                                        console.error(`[FORCE-DLR] ⚡ ${log.message_id}: Auto-DLR set to DELIVRD after ${timeoutSec}s (SMPP relay, mode=${clientTimeoutMode}/${supplierTimeoutMode}, client=${client.force_dlr}, supplier=${route.supplier_force_dlr})`);
+                                    } else {
+                                        console.error(`[FORCE-DLR] ⏭ ${log.message_id}: Force DLR skipped — real DLR already arrived (not PENDING)`);
+                                    }
                                 } catch (e) { /* best-effort */ }
                             };
                             setTimeout(scheduleDlr, timeoutSec * 1000);
@@ -2364,13 +2392,13 @@ app.post('/api/clients', auth, async (req, res) => {
             `INSERT INTO clients (client_code, company_name, contact_person, email, phone, address, country,
              smpp_username, smpp_password, smpp_ip, smpp_port, system_type, max_tps,
              billing_mode, currency, balance, credit_limit,
-             api_enabled, webhook_url, force_dlr, routing_plan_id, rate_plan_id, portal_access, status, created_at, updated_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,NOW(),NOW()) RETURNING *`,
+             api_enabled, webhook_url, force_dlr, force_dlr_timeout, force_dlr_timeout_mode, routing_plan_id, rate_plan_id, portal_access, status, created_at, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,NOW(),NOW()) RETURNING *`,
             [
                 b.client_code, b.company_name, b.contact_person || '', b.email || '', b.phone || '', b.address || '', b.country || '',
                 b.smpp_username, b.smpp_password, b.smpp_ip || '0.0.0.0', b.smpp_port || 2775, b.system_type || 'SMPP', b.max_tps || 100,
                 b.billing_mode || 'dlr', b.currency || 'EUR', b.balance || 0, b.credit_limit || 0,
-                b.api_enabled || false, b.webhook_url || '', b.force_dlr !== undefined ? b.force_dlr : true, b.routing_plan_id || null, b.rate_plan_id || null, portalAccess, b.status || 'active'
+                b.api_enabled || false, b.webhook_url || '', b.force_dlr !== undefined ? b.force_dlr : true, b.force_dlr_timeout || 0, b.force_dlr_timeout_mode || 'fixed', b.routing_plan_id || null, b.rate_plan_id || null, portalAccess, b.status || 'active'
             ]
         );
         const client = result.rows[0];
@@ -2455,13 +2483,13 @@ app.post('/api/clients/bulk', auth, async (req, res) => {
                     `INSERT INTO clients (client_code, company_name, contact_person, email, phone, address, country,
                      smpp_username, smpp_password, smpp_ip, smpp_port, system_type, max_tps,
                      billing_mode, currency, balance, credit_limit,
-                     api_enabled, webhook_url, force_dlr, routing_plan_id, rate_plan_id, status, created_at, updated_at)
-                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,NOW(),NOW()) RETURNING *`,
+                     api_enabled, webhook_url, force_dlr, force_dlr_timeout, force_dlr_timeout_mode, routing_plan_id, rate_plan_id, status, created_at, updated_at)
+                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,NOW(),NOW()) RETURNING *`,
                     [
                         client_code, company_name, row.contact_person || '', row.email || '', row.phone || '', row.address || '', row.country || '',
                         row.smpp_username || client_code, row.smpp_password || '', row.smpp_ip || '0.0.0.0', parseInt(row.smpp_port) || 2775, row.system_type || 'SMPP', parseInt(row.max_tps) || 100,
                         row.billing_mode || 'dlr', row.currency || 'EUR', parseFloat(row.balance) || 0, parseFloat(row.credit_limit) || 0,
-                        row.api_enabled === 'true' || row.api_enabled === true, row.webhook_url || '', row.force_dlr !== 'false', row.routing_plan_id || null, row.rate_plan_id || null, row.status || 'active'
+                        row.api_enabled === 'true' || row.api_enabled === true, row.webhook_url || '', row.force_dlr !== 'false', row.force_dlr_timeout || 0, row.force_dlr_timeout_mode || 'fixed', row.routing_plan_id || null, row.rate_plan_id || null, row.status || 'active'
                     ]
                 );
                 created.push(ins.rows[0]);
@@ -2605,7 +2633,7 @@ app.put('/api/suppliers/:id', auth, async (req, res) => {
         const { id } = req.params;
         const fields = req.body;
         // Build dynamic SET clause for any field passed
-        const allowed = ['supplier_code','company_name','contact_person','email','phone','connection_type','smpp_host','smpp_port','smpp_username','smpp_password','system_id','smpp_version','smpp_system_type','smpp_bind_type','smpp_addr_ton','smpp_addr_npi','smpp_addr_range','is_inbound','api_url','api_key','api_method','api_connector_id','voice_otp_config_id','voice_otp_mode','whatsapp_device_ids','telegram_device_ids','dst_sip_address','reconnect_schedule','rate_per_second','audio_codec','capacity','balance','credit_limit','currency','billing_mode','bind_status','consecutive_failures','force_dlr','status','max_queue_size','dlr_timeout'];
+        const allowed = ['supplier_code','company_name','contact_person','email','phone','connection_type','smpp_host','smpp_port','smpp_username','smpp_password','system_id','smpp_version','smpp_system_type','smpp_bind_type','smpp_addr_ton','smpp_addr_npi','smpp_addr_range','is_inbound','api_url','api_key','api_method','api_connector_id','voice_otp_config_id','voice_otp_mode','whatsapp_device_ids','telegram_device_ids','dst_sip_address','reconnect_schedule','rate_per_second','audio_codec','capacity','balance','credit_limit','currency','billing_mode','bind_status','consecutive_failures','force_dlr','status','max_queue_size','dlr_timeout','force_dlr_timeout','force_dlr_timeout_mode'];
         const setParts = [];
         const values = [];
         let idx = 1;
@@ -3564,31 +3592,66 @@ app.get('/api/rates/history', auth, async (req, res) => {
     await pool.query('ALTER TABLE sms_outbox ADD COLUMN IF NOT EXISTS supplier_billing_mode VARCHAR(20) DEFAULT \'dlr\'').catch(() => {});
     await pool.query('ALTER TABLE clients ADD COLUMN IF NOT EXISTS force_dlr_timeout INTEGER DEFAULT 0').catch(() => {});
     await pool.query('ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS force_dlr_timeout INTEGER DEFAULT 0').catch(() => {});
+    await pool.query('ALTER TABLE clients ADD COLUMN IF NOT EXISTS force_dlr_timeout_mode VARCHAR(20) DEFAULT \'fixed\'').catch(() => {});
+    await pool.query('ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS force_dlr_timeout_mode VARCHAR(20) DEFAULT \'fixed\'').catch(() => {});
+    await pool.query('ALTER TABLE sms_logs ADD COLUMN IF NOT EXISTS dlr_source VARCHAR(20) DEFAULT \'REAL\'').catch(() => {});
+    await pool.query('ALTER TABLE invoices ADD COLUMN IF NOT EXISTS force_dlr_charge DECIMAL(15,4) DEFAULT 0').catch(() => {});
+    await pool.query('ALTER TABLE invoices ADD COLUMN IF NOT EXISTS net_profit DECIMAL(15,4) DEFAULT 0').catch(() => {});
 })().catch(() => {});
 
+// ======== FORCE DLR TIMEOUT RESOLVER ========
+// Computes the actual timeout in seconds based on the timeout_mode setting.
+// Modes:
+//   'fixed'        → use force_dlr_timeout value directly (seconds)
+//   'random_1_5'   → random between 1 and 5 seconds
+//   'random_1_10'  → random between 1 and 10 seconds
+function resolveForceDlrTimeout(mode, timeoutValue) {
+    const t = parseInt(timeoutValue) || 0;
+    if (mode === 'random_1_5') {
+        return Math.floor(Math.random() * 5) + 1;
+    }
+    if (mode === 'random_1_10') {
+        return Math.floor(Math.random() * 10) + 1;
+    }
+    // 'fixed' or any other value → use the configured timeout directly
+    return t;
+}
+
 // ======== UNIVERSAL BILLING HELPER ========
-// Charges client and/or supplier based on their independent billing_mode.
-// At submit (isSubmit=true): charges parties whose billing_mode='submit'.
-// At DLR (isSubmit=false): charges remaining parties whose billing_mode='dlr' on DELIVRD.
-// forceDlr flags: if true, override billing_mode to 'submit' at submit time (charge immediately).
+// Implements the Custom Server Billing Matrix (On Submit / On DLR / Force DLR):
+//
+//   On Submit Mode:     Client charged YES, Supplier cost YES — immediately on MT submit.
+//   On DLR + DELIVRD:   Client charged YES, Supplier cost YES — on genuine DELIVRD.
+//   On DLR + UNDELIV:   Client charged NO,  Supplier cost NO  — zero charge.
+//   On DLR + Force DLR: Client charged YES (on timeout), Supplier cost NO — ZERO supplier
+//                        payout (tenant gross margin protected per Excel row 5).
+//                        EXCEPTION: if Supplier Force DLR is also active, supplier IS paid.
+//   Force DLR + Real DELIVRD before timeout: normal settlement overrides Force DLR timer.
+//   Force DLR + Real failure before timeout: cancel Force DLR, no charge.
+//
 // Uses ATOMIC CLAIM-FIRST pattern to prevent double-billing:
 //   1. Atomically claim the billing flag (is_client_billed / is_supplier_billed)
 //   2. If claim succeeds, deduct balance
 //   3. If deduction fails, rollback the claim
-async function applyBilling({ messageId, clientId, supplierId, clientCost, supplierCost, clientBillingMode, supplierBillingMode, isSubmit, dlrStatus, clientForceDlr = false, supplierForceDlr = false }) {
+//
+// isForceDlrBilling: when true (force DLR timeout fired), applies margin isolation —
+//   client is charged but supplier cost is zeroed unless supplierForceDlr is also true.
+async function applyBilling({ messageId, clientId, supplierId, clientCost, supplierCost, clientBillingMode, supplierBillingMode, isSubmit, dlrStatus, clientForceDlr = false, supplierForceDlr = false, isForceDlrBilling = false }) {
     try {
         clientBillingMode = clientBillingMode || 'dlr';
         supplierBillingMode = supplierBillingMode || 'dlr';
         
-        // ── Force DLR does NOT override billing_mode ──
-        // Force DLR only schedules a fake DELIVRD after timeout — it must not
-        // change billing behavior. Clients with billing_mode='dlr' should only
-        // be charged on real (or force-simulated) DELIVRD, never on submit.
-        // Otherwise failed messages get billed immediately with no refund path.
+        // ── Force DLR Margin Isolation (Excel Matrix Rule #2) ──
+        // When force DLR timeout fires (isForceDlrBilling=true), charge client but NOT supplier
+        // unless Supplier Force DLR is also explicitly enabled on the route.
+        // This guarantees 100% gross margin on forced completions.
+        const effectiveSupplierCost = (isForceDlrBilling && !supplierForceDlr) ? 0 : supplierCost;
         
         let clientBilledNow = false, supplierBilledNow = false;
         
         // ── Client billing (atomic claim-first) ──
+        // Force DLR billing acts like a DLR DELIVRD event — charges DLR-mode parties.
+        // Submit-mode parties were already charged at submit time.
         const shouldBillClient = isSubmit
             ? clientBillingMode === 'submit'
             : (clientBillingMode === 'dlr' && dlrStatus === 'DELIVRD');
@@ -3626,7 +3689,7 @@ async function applyBilling({ messageId, clientId, supplierId, clientCost, suppl
             ? (supplierBillingMode === 'submit' || supplierBillingMode === 'credit')
             : ((supplierBillingMode === 'dlr' || supplierBillingMode === 'credit') && dlrStatus === 'DELIVRD');
         
-        if (shouldBillSupplier && supplierCost > 0 && supplierId) {
+        if (shouldBillSupplier && effectiveSupplierCost > 0 && supplierId) {
             const claimed = await pool.query(
                 'UPDATE sms_logs SET is_supplier_billed = true WHERE message_id = $1 AND is_supplier_billed = false RETURNING id',
                 [messageId]
@@ -3638,16 +3701,17 @@ async function applyBilling({ messageId, clientId, supplierId, clientCost, suppl
                     if (isCreditMode) {
                         await pool.query(
                             'UPDATE suppliers SET balance = balance - $1, updated_at = NOW() WHERE id = $2',
-                            [supplierCost, supplierId]
+                            [effectiveSupplierCost, supplierId]
                         );
                     } else {
                         await pool.query(
                             'UPDATE suppliers SET balance = GREATEST(0, balance - $1), updated_at = NOW() WHERE id = $2',
-                            [supplierCost, supplierId]
+                            [effectiveSupplierCost, supplierId]
                         );
                     }
                     supplierBilledNow = true;
-                    console.error(`[BILLING] 💰 ${messageId}: Supplier #${supplierId} billed €${supplierCost} (${isSubmit ? 'submit' : 'DLR'}, mode=${supplierBillingMode}${isCreditMode ? ' credit→negative allowed' : ''})`);
+                    const marginNote = (isForceDlrBilling && supplierCost > 0 && effectiveSupplierCost === 0) ? ' [FORCE-DLR: supplier=€0 margin=100%]' : '';
+                    console.error(`[BILLING] 💰 ${messageId}: Supplier #${supplierId} billed €${effectiveSupplierCost} (${isSubmit ? 'submit' : 'DLR'}, mode=${supplierBillingMode}${isCreditMode ? ' credit→negative allowed' : ''}${isForceDlrBilling ? ' forceDLR' : ''})${marginNote}`);
                 } catch (deductErr) {
                     await pool.query(
                         'UPDATE sms_logs SET is_supplier_billed = false WHERE message_id = $1',
@@ -3656,6 +3720,8 @@ async function applyBilling({ messageId, clientId, supplierId, clientCost, suppl
                     console.error(`[BILLING] ❌ ${messageId}: Supplier deduction failed, claim rolled back: ${deductErr.message}`);
                 }
             }
+        } else if (isForceDlrBilling && supplierCost > 0 && effectiveSupplierCost === 0) {
+            console.error(`[BILLING] 🛡️ ${messageId}: Force DLR margin protection — client billed, supplier NOT billed (€${supplierCost.toFixed(4)} saved, 100% margin)`);
         }
         
         // ── Update composite is_billed flag (backward compat) ──
@@ -3732,7 +3798,7 @@ async function resolveRoute(client, destination) {
     const debugId = `[ROUTE:${client.client_code || client.id}→${maskedDest}]`;
     const dbg = (...args) => { if (DEBUG_ROUTE) console.error(...args); };
     if (DEBUG_ROUTE) dbg(`${debugId} Starting route resolution (raw dest: ${destination})`);
-    let supplier_id = null, supplier_code = null, supplier_rate = null, supplier_billing_mode = 'dlr', supplier_force_dlr = false, supplier_force_dlr_timeout = 0;
+    let supplier_id = null, supplier_code = null, supplier_rate = null, supplier_billing_mode = 'dlr', supplier_force_dlr = false, supplier_force_dlr_timeout = 0, supplier_force_dlr_timeout_mode = 'fixed';
     let route_name = null, trunk_name = null, mcc = '', mnc = '', operator = '', country = '';
     let voice_otp_config_id = null;  // resolved from route > trunk > supplier
 
@@ -3790,6 +3856,7 @@ async function resolveRoute(client, destination) {
                             supplier_billing_mode = supR.rows[0].billing_mode || 'dlr';
                             supplier_force_dlr = supR.rows[0].force_dlr || false;
                             supplier_force_dlr_timeout = parseInt(supR.rows[0].force_dlr_timeout) || 0;
+                            supplier_force_dlr_timeout_mode = supR.rows[0].force_dlr_timeout_mode || 'fixed';
                             dbg(`${debugId}     ✅ Supplier: ${supplier_code} (ID=${supplier_id})`);
                             // Voice OTP config priority: route > trunk > supplier
                             voice_otp_config_id = route.voice_otp_config_id
@@ -3836,6 +3903,7 @@ async function resolveRoute(client, destination) {
             supplier_billing_mode = fallbackR.rows[0].billing_mode || 'dlr';
             supplier_force_dlr = fallbackR.rows[0].force_dlr || false;
             supplier_force_dlr_timeout = parseInt(fallbackR.rows[0].force_dlr_timeout) || 0;
+            supplier_force_dlr_timeout_mode = fallbackR.rows[0].force_dlr_timeout_mode || 'fixed';
             route_name = 'fallback';
             trunk_name = 'fallback';
             dbg(`${debugId} ✅ Fallback supplier: ${supplier_code} (ID=${supplier_id})`);
@@ -3853,7 +3921,7 @@ async function resolveRoute(client, destination) {
         }
     }
 
-    const result = { supplier_id, supplier_code, supplier_rate, supplier_billing_mode, supplier_force_dlr, supplier_force_dlr_timeout, route_name, trunk_name, mcc, mnc, operator, country, voice_otp_config_id, billing_mode: client.billing_mode || 'dlr' };
+    const result = { supplier_id, supplier_code, supplier_rate, supplier_billing_mode, supplier_force_dlr, supplier_force_dlr_timeout, supplier_force_dlr_timeout_mode, route_name, trunk_name, mcc, mnc, operator, country, voice_otp_config_id, billing_mode: client.billing_mode || 'dlr' };
     dbg(`${debugId} ✅ RESOLVED: supplier=${supplier_code || 'NONE'} route=${route_name} trunk=${trunk_name} rate=€${supplier_rate || 0} mcc=${mcc} mnc=${mnc}`);
     return result;
 }
@@ -4164,7 +4232,9 @@ app.post('/api/sms/send', auth, async (req, res) => {
             clientForceDlr: c.force_dlr || false,
             supplierForceDlr: route.supplier_force_dlr || false,
             clientForceDlrTimeout: parseInt(c.force_dlr_timeout) || 0,
-            supplierForceDlrTimeout: route.supplier_force_dlr_timeout || 0
+            supplierForceDlrTimeout: route.supplier_force_dlr_timeout || 0,
+            clientForceDlrTimeoutMode: c.force_dlr_timeout_mode || 'fixed',
+            supplierForceDlrTimeoutMode: route.supplier_force_dlr_timeout_mode || 'fixed'
         };
 
         // 6. Generate message_id and enqueue for async processing
@@ -4311,24 +4381,49 @@ app.post('/api/sms/send', auth, async (req, res) => {
             });
         }
 
-        // 9. Auto-DLR: if force_dlr is enabled, schedule a fake DELIVRD after force_dlr_timeout seconds.
-        //    timeout=0 means instant (setImmediate). Charges immediately regardless of billing_mode.
+        // 9. Auto-DLR: if force_dlr is enabled, schedule a fake DELIVRD after resolved timeout.
+        //    Uses resolveForceDlrTimeout() for fixed/random modes per Excel matrix.
         if (billingContext.clientForceDlr || billingContext.supplierForceDlr) {
-            const timeoutSec = Math.max(
-                billingContext.clientForceDlr ? billingContext.clientForceDlrTimeout : 0,
-                billingContext.supplierForceDlr ? billingContext.supplierForceDlrTimeout : 0
-            );
+            const clientTimeoutSec = billingContext.clientForceDlr
+                ? resolveForceDlrTimeout(billingContext.clientForceDlrTimeoutMode, billingContext.clientForceDlrTimeout)
+                : 0;
+            const supplierTimeoutSec = billingContext.supplierForceDlr
+                ? resolveForceDlrTimeout(billingContext.supplierForceDlrTimeoutMode, billingContext.supplierForceDlrTimeout)
+                : 0;
+            const timeoutSec = Math.max(clientTimeoutSec, supplierTimeoutSec);
             const scheduleDlr = async () => {
                 try {
-                    await pool.query(
-                        `UPDATE sms_logs SET dlr_status = 'DELIVRD', status = 'delivered', delivery_time = NOW(), dlr_timestamp = NOW(), is_force_dlr = true WHERE message_id = $1 AND dlr_status = 'PENDING'`,
+                    const updResult = await pool.query(
+                        `UPDATE sms_logs SET dlr_status = 'DELIVRD', status = 'delivered', delivery_time = NOW(), dlr_timestamp = NOW(), is_force_dlr = true, dlr_source = 'FORCE_TIMEOUT' WHERE message_id = $1 AND dlr_status = 'PENDING'`,
                         [msgId]
                     );
-                    await pool.query(
-                        `UPDATE sms_outbox SET dlr_status = 'DELIVRD', status = 'delivered', dlr_confirmed_at = NOW(), completed_at = NOW() WHERE message_id = $1 AND dlr_status = 'PENDING'`,
-                        [msgId]
-                    ).catch(() => {});
-                    console.error(`[FORCE-DLR] ⚡ ${msgId}: Auto-DLR set to DELIVRD after ${timeoutSec}s (force_dlr override, client=${billingContext.clientForceDlr}, supplier=${billingContext.supplierForceDlr})`);
+                    // Only bill if status was still PENDING (real DLR didn't arrive yet).
+                    // Excel Matrix Rule #6: Real failure before timeout → no charge.
+                    if (updResult.rowCount > 0) {
+                        await pool.query(
+                            `UPDATE sms_outbox SET dlr_status = 'DELIVRD', status = 'delivered', dlr_confirmed_at = NOW(), completed_at = NOW() WHERE message_id = $1 AND dlr_status = 'PENDING'`,
+                            [msgId]
+                        ).catch(() => {});
+                        // Excel Matrix Rule: Force DLR timeout → charge client, ZERO supplier payout
+                        // unless supplier_force_dlr is also enabled.
+                        await applyBilling({
+                            messageId: msgId,
+                            clientId: billingContext.client_id,
+                            supplierId: billingContext.supplier_id,
+                            clientCost: billingContext.clientSubmitCost,
+                            supplierCost: billingContext.supplierSubmitCost,
+                            clientBillingMode: billingContext.clientBillingMode,
+                            supplierBillingMode: billingContext.supplierBillingMode,
+                            isSubmit: false,
+                            dlrStatus: 'DELIVRD',
+                            clientForceDlr: billingContext.clientForceDlr,
+                            supplierForceDlr: billingContext.supplierForceDlr,
+                            isForceDlrBilling: true
+                        });
+                        console.error(`[FORCE-DLR] ⚡ ${msgId}: Auto-DLR set to DELIVRD after ${timeoutSec}s (force_dlr override, client=${billingContext.clientForceDlr}, supplier=${billingContext.supplierForceDlr}, modes=${billingContext.clientForceDlrTimeoutMode}/${billingContext.supplierForceDlrTimeoutMode})`);
+                    } else {
+                        console.error(`[FORCE-DLR] ⏭ ${msgId}: Force DLR skipped — real DLR already arrived (not PENDING)`);
+                    }
                 } catch (e) { /* best-effort */ }
             };
             if (timeoutSec <= 0) {
@@ -4889,7 +4984,9 @@ app.post('/api/invoices/generate', auth, async (req, res) => {
                 SUM(CASE WHEN status = 'delivered' THEN 1 ELSE 0 END) as delivered_sms,
                 SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed_sms,
                 SUM(CASE WHEN is_billed = true AND billing_mode_snapshot = 'submit' THEN ${rateCol} * message_parts ELSE 0 END) as submit_charge,
-                SUM(CASE WHEN is_billed = true AND (billing_mode_snapshot IS NULL OR billing_mode_snapshot = 'dlr') THEN ${rateCol} * message_parts ELSE 0 END) as dlr_charge
+                SUM(CASE WHEN is_billed = true AND (billing_mode_snapshot IS NULL OR billing_mode_snapshot = 'dlr') THEN ${rateCol} * message_parts ELSE 0 END) as dlr_charge,
+                SUM(CASE WHEN is_billed = true AND is_force_dlr = true THEN ${rateCol} * message_parts ELSE 0 END) as force_dlr_charge,
+                SUM(CASE WHEN is_billed = true AND is_force_dlr = true THEN 1 ELSE 0 END) as force_dlr_count
              FROM sms_logs
              WHERE ${idCol} = $1
                AND submit_time >= $2
@@ -4906,9 +5003,12 @@ app.post('/api/invoices/generate', auth, async (req, res) => {
         const failedSms = parseInt(agg.failed_sms) || 0;
         const submitCharge = parseFloat(agg.submit_charge) || 0;
         const dlrCharge = parseFloat(agg.dlr_charge) || 0;
+        const forceDlrCharge = parseFloat(agg.force_dlr_charge) || 0;
+        const forceDlrCount = parseInt(agg.force_dlr_count) || 0;
         // Net profit for invoice: revenue (totalAmount) minus supplier cost on DELIVRD
+        // Force DLR messages have 100% margin (no supplier cost) — reflected in lower supplierCost
         const netProfit = parseFloat((totalAmount - supplierCost).toFixed(4));
-        const billingSummary = `Submit-mode: €${submitCharge.toFixed(4)} | DLR-mode: €${dlrCharge.toFixed(4)} | Total billed: €${totalAmount.toFixed(4)}`;
+        const billingSummary = `Submit-mode: €${submitCharge.toFixed(4)} | DLR-mode: €${dlrCharge.toFixed(4)} | Force-DLR: €${forceDlrCharge.toFixed(4)} (${forceDlrCount} msgs, 100% margin) | Total billed: €${totalAmount.toFixed(4)}`;
 
         if (totalSms === 0) {
             return res.status(400).json({ error: 'No SMS data found for this period. Invoice not generated.' });
@@ -4931,14 +5031,14 @@ app.post('/api/invoices/generate', auth, async (req, res) => {
              invoice_to_name, invoice_to_email,
              invoice_by_name, invoice_by_email,
              period_start, period_end, total_sms, delivered_sms, failed_sms,
-             total_amount, submit_charge, dlr_charge, tax_amount, tax_rate, grand_total,
+             total_amount, submit_charge, dlr_charge, force_dlr_charge, net_profit, tax_amount, tax_rate, grand_total,
              currency, status, due_date, notes, billing_mode_summary, created_at)
-             VALUES ($1,$2,$3,$4,$5,$6,'NET2APP Hub','billing@net2app.com',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,NOW()) RETURNING *`,
+             VALUES ($1,$2,$3,$4,$5,$6,'NET2APP Hub','billing@net2app.com',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,NOW()) RETURNING *`,
             [invNum, entity_type, entity_id, entityName,
              entityName, entityEmail,
              period_start, period_end,
              totalSms, deliveredSms, failedSms,
-             totalAmount, submitCharge, dlrCharge, taxAmount, taxRate, grandTotal,
+             totalAmount, submitCharge, dlrCharge, forceDlrCharge, netProfit, taxAmount, taxRate, grandTotal,
              entity.currency || 'EUR', 'draft', dueDate, notes || 'Auto-generated from SMS logs', billingSummary]
         );
 
@@ -4952,6 +5052,8 @@ app.post('/api/invoices/generate', auth, async (req, res) => {
                 total_amount: totalAmount,
                 supplier_cost: supplierCost,
                 net_profit: netProfit,
+                force_dlr_charge: forceDlrCharge,
+                force_dlr_count: forceDlrCount,
                 submit_charge: submitCharge,
                 dlr_charge: dlrCharge,
                 tax_amount: taxAmount,

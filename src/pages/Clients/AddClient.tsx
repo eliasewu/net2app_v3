@@ -17,7 +17,8 @@ export const AddClient: React.FC = () => {
     client_code: '', company_name: '', contact_person: '', email: '', phone: '', address: '', country: '',
     smpp_username: '', smpp_password: '', smpp_ip: '', smpp_port: 2775, system_type: 'SMPP', max_tps: 100,
     billing_mode: 'dlr' as BillingMode, currency: 'EUR' as Currency, balance: 0, credit_limit: 0,
-    api_enabled: false, webhook_url: '', force_dlr: true, routing_plan_id: '', rate_plan_id: '',
+    api_enabled: false, webhook_url: '', force_dlr: true, force_dlr_timeout: 150, force_dlr_timeout_mode: 'fixed',
+    routing_plan_id: '', rate_plan_id: '',
     portal_access: false,
     status: 'active' as const,
   };
@@ -32,7 +33,9 @@ export const AddClient: React.FC = () => {
     billing_mode: existingClient.billing_mode, currency: existingClient.currency,
     balance: existingClient.balance, credit_limit: existingClient.credit_limit,
     api_enabled: existingClient.api_enabled, webhook_url: existingClient.webhook_url,
-    force_dlr: existingClient.force_dlr, routing_plan_id: existingClient.routing_plan_id || '',
+    force_dlr: existingClient.force_dlr, force_dlr_timeout: (existingClient as any).force_dlr_timeout || (existingClient as any).dlr_timeout || 150,
+    force_dlr_timeout_mode: (existingClient as any).force_dlr_timeout_mode || 'fixed',
+    routing_plan_id: existingClient.routing_plan_id || '',
     rate_plan_id: existingClient.rate_plan_id || '', portal_access: (existingClient as any).portal_access || false,
     status: existingClient.status as 'active'|'inactive'|'suspended',
   } : defaultForm;
@@ -350,6 +353,32 @@ export const AddClient: React.FC = () => {
             />
           </div>
         </Card>
+
+        {/* Force DLR Settings */}
+        {formData.force_dlr && (
+          <Card title="⚡ Force DLR Timeout Settings" subtitle="Configures when a fake DELIVRD is generated if no real DLR arrives. Client is charged on timeout but supplier is NOT (100% margin protection).">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <Select
+                label="Timeout Mode"
+                value={(formData as any).force_dlr_timeout_mode || 'fixed'}
+                onChange={(e) => updateField('force_dlr_timeout_mode', e.target.value)}
+                options={[
+                  { value: 'fixed', label: 'Fixed (use value below)' },
+                  { value: 'random_1_5', label: 'Random 1-5 seconds' },
+                  { value: 'random_1_10', label: 'Random 1-10 seconds' },
+                ]}
+              />
+              <Input
+                label="Timeout (seconds)"
+                type="number"
+                value={(formData as any).force_dlr_timeout || 150}
+                onChange={(e) => updateField('force_dlr_timeout', parseInt(e.target.value) || 0)}
+                hint="For fixed mode: exact seconds. For random modes: upper bound of range."
+                min={0}
+              />
+            </div>
+          </Card>
+        )}
 
         {errors.submit && <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-600">{errors.submit}</div>}
         {/* Actions */}

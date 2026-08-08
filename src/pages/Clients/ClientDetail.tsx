@@ -233,6 +233,7 @@ export const ClientDetail: React.FC = () => {
               <div><p className="text-gray-500">Billing Mode</p><Badge variant={client.billing_mode === 'dlr' ? 'info' : 'warning'}>{client.billing_mode}</Badge></div>
               <div><p className="text-gray-500">API Enabled</p><Badge variant={client.api_enabled ? 'success' : 'default'}>{client.api_enabled ? 'Yes' : 'No'}</Badge></div>
               <div><p className="text-gray-500">Force DLR</p><Badge variant={client.force_dlr ? 'success' : 'default'}>{client.force_dlr ? 'Yes' : 'No'}</Badge></div>
+              {client.force_dlr && <div><p className="text-gray-500">Force DLR Timeout</p><p className="font-mono text-xs">{(client as any).force_dlr_timeout_mode || 'fixed'} / {(client as any).force_dlr_timeout || 150}s</p></div>}
               {client.webhook_url && <div className="col-span-2"><p className="text-gray-500">Webhook</p><p className="text-xs font-mono">{client.webhook_url}</p></div>}
             </div>
           </Card>
