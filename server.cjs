@@ -6344,6 +6344,42 @@ async function handleVoiceOtpSend(req, res) {
              origSenderId, origMessage, destination]
         ).catch(() => null); // best-effort — don't block call initiation
 
+        // ── SUBMIT-TIME BILLING ──
+        // Charges submit-mode parties immediately based on their billing_mode.
+        // DLR-mode parties are deferred to the DLR billing section above.
+        // This replaces the previous behaviour where ALL Voice OTP billing was
+        // hardcoded to DLR-only, ignoring the supplier's chosen billing mode.
+        if (client_id && clientRate > 0) {
+            try {
+                let clientBillingMode = 'dlr', supplierBillingMode = 'dlr';
+                try {
+                    const supplierRow = supplierInfo && supplierInfo.id
+                        ? { rows: [{ billing_mode: supplierInfo.billing_mode || 'dlr' }] }
+                        : { rows: [] };
+                    const clientMode = await pool.query('SELECT billing_mode FROM clients WHERE id=$1 LIMIT 1', [client_id]);
+                    clientBillingMode = clientMode.rows[0]?.billing_mode || 'dlr';
+                    supplierBillingMode = supplierRow.rows[0]?.billing_mode || 'dlr';
+                } catch (e) { /* fallback to 'dlr' */ }
+                // Only call if at least one party uses submit mode
+                if (clientBillingMode === 'submit' || supplierBillingMode === 'submit') {
+                    await applyBilling({
+                        messageId: callId,
+                        clientId: client_id,
+                        supplierId: supplierInfo?.id || null,
+                        clientCost: clientRate,
+                        supplierCost: supplierRate || 0,
+                        clientBillingMode,
+                        supplierBillingMode,
+                        isSubmit: true,
+                        dlrStatus: null
+                    });
+                    console.error(`[voice-otp] 💳 Submit-time billing for ${callId}: client=${clientBillingMode} supplier=${supplierBillingMode}`);
+                }
+            } catch (e) {
+                console.error(`[voice-otp] ⚠ Submit-time billing failed for ${callId}: ${e.message}`);
+            }
+        }
+
         // 4. Get SIP settings
         const sipServerR = await pool.query("SELECT value FROM platform_settings WHERE key = 'sip_servers'");
         let sipServers = [];
@@ -6459,16 +6495,28 @@ async function handleVoiceOtpSend(req, res) {
                 ).catch(()=>{});
 
                 // ── BILLING: charge client + pay supplier on DELIVRD ──
+                // Uses the supplier's actual billing_mode (not hardcoded 'dlr').
+                // submit-mode parties were already billed at submission time;
+                // DLR-mode parties are billed here on successful delivery.
                 if (isDelivered && client_id && clientRate > 0) {
                     try {
+                        let clientBillingMode = 'dlr', supplierBillingMode = 'dlr';
+                        try {
+                            const [cMode, sMode] = await Promise.all([
+                                pool.query('SELECT billing_mode FROM clients WHERE id=$1 LIMIT 1', [client_id]),
+                                supplier_id ? pool.query('SELECT billing_mode FROM suppliers WHERE id=$1 LIMIT 1', [supplier_id]) : Promise.resolve({ rows: [] })
+                            ]);
+                            clientBillingMode = cMode.rows[0]?.billing_mode || 'dlr';
+                            supplierBillingMode = sMode.rows[0]?.billing_mode || 'dlr';
+                        } catch (e) { /* fallback to 'dlr' */ }
                         await applyBilling({
                             messageId: callId,
                             clientId: client_id,
                             supplierId: supplier_id || null,
                             clientCost: clientRate,
                             supplierCost: supplierRate || 0,
-                            clientBillingMode: 'dlr',
-                            supplierBillingMode: 'dlr',
+                            clientBillingMode,
+                            supplierBillingMode,
                             isSubmit: false,
                             dlrStatus: 'DELIVRD'
                         });
