@@ -670,7 +670,9 @@ let smppServer = null; // Set by SmppServer import (for Android Gateway DLR push
         // WHITELIST approach: only push DLR for external sources.
         // Internal sources (test_sms, campaign, voice_otp, e2e_test) — DLR stays in sms_logs only.
         // Source is passed by callers — no extra DB query needed.
-        const EXTERNAL_DLR_SOURCES = ['smpp_client', 'external_api', 'smpp_esme', 'smpp'];
+        // Voice OTP added — its DLR results (DELIVRD/UNDELIV) are pushed to external
+        // clients via SMPP/HTTP just like regular SMS DLRs.
+        const EXTERNAL_DLR_SOURCES = ['smpp_client', 'external_api', 'smpp_esme', 'smpp', 'voice_otp'];
 
         queueManager.onDlr = async (job) => {
             try {
@@ -754,7 +756,7 @@ let smppServer = null; // Set by SmppServer import (for Android Gateway DLR push
                 await pool.query(
                     `INSERT INTO dlr_outbox (message_id, entity_type, entity_id, client_id, client_code, destination, sender_id, status, dlr_receipt, submit_time, webhook_url, webhook_sent)
                      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-                     ON CONFLICT (message_id) DO UPDATE SET entity_type = EXCLUDED.entity_type, entity_id = EXCLUDED.entity_id, webhook_sent = EXCLUDED.webhook_sent`,
+                     ON CONFLICT (message_id) DO UPDATE SET status = EXCLUDED.status, dlr_receipt = EXCLUDED.dlr_receipt, entity_type = EXCLUDED.entity_type, entity_id = EXCLUDED.entity_id, webhook_sent = EXCLUDED.webhook_sent`,
                     [job.message_id, entityType, entityId, entityType === 'client' ? entityId : null, entityCode, job.destination, job.sender_id, job.status, receipt, job.submit_time || job.queued_at, webhookUrl, webhookSent]
                 );
                 console.error(`[DLR-OUTBOX] 📝 DLR stored: ${job.message_id} → ${job.status} (${entityType}=${entityCode}, source=${messageSource}, webhook=${webhookSent ? 'sent' : 'none'})`);
@@ -1825,6 +1827,155 @@ let smppServer = null; // Set by SmppServer import (for Android Gateway DLR push
 
         console.error('[INIT] Submit timeout reporter started — checks stale inbound messages every 60s, reports EXPIRED after 5min');
 
+        // ======== PENDING DLR TIMEOUT CLEANER (60-MIN) ========
+        // After 60 minutes from submission, marks all pending DLRs as UNDELIV/FAILED.
+        // SMS: updates sms_logs (all sources), pushes to external clients (SMPP/HTTP)
+        //      for external sources only. test_sms/campaign → sms_logs only, no external push.
+        // Voice OTP: updates voice_otp_logs + sms_logs, pushes DLR to external client.
+        const PENDING_DLR_TIMEOUT_MIN = 60; // 60-minute hard timeout for pending DLRs
+        setInterval(async () => {
+            try {
+                // ── SMS DLR TIMEOUT ──
+                // Find all sms_logs with PENDING DLR older than 60 minutes.
+                // Batch-process in chunks of 100 to avoid long-running transactions.
+                const smsPending = await pool.query(
+                    `SELECT id, message_id, client_id, client_code, destination, sender_id,
+                            source, submit_time, message_parts, client_rate, supplier_rate
+                     FROM sms_logs
+                     WHERE dlr_status = 'PENDING'
+                       AND status IN ('submitted', 'pending')
+                       AND submit_time < NOW() - INTERVAL '${PENDING_DLR_TIMEOUT_MIN} minutes'
+                       AND (dlr_source IS NULL OR dlr_source = 'REAL')
+                     ORDER BY submit_time ASC
+                     LIMIT 100`
+                );
+
+                if (smsPending.rows.length > 0) {
+                    const messageIds = smsPending.rows.map(r => r.message_id);
+                    // Atomic UPDATE: set dlr_status='UNDELIV', status='failed' for all matched rows
+                    await pool.query(
+                        `UPDATE sms_logs SET dlr_status = 'UNDELIV', status = 'failed',
+                         error_code = 'DLR_TIMEOUT',
+                         error_message = 'DLR timeout after ${PENDING_DLR_TIMEOUT_MIN} minutes',
+                         delivery_time = NOW(), dlr_timestamp = NOW(),
+                         dlr_source = 'DLR_TIMEOUT'
+                         WHERE message_id = ANY($1::varchar[]) AND dlr_status = 'PENDING'`,
+                        [messageIds]
+                    );
+                    // Also update sms_outbox for consistency
+                    await pool.query(
+                        `UPDATE sms_outbox SET dlr_status = 'UNDELIV', status = 'failed',
+                         dlr_confirmed_at = NOW()
+                         WHERE message_id = ANY($1::varchar[]) AND dlr_status = 'PENDING'`,
+                        [messageIds]
+                    ).catch(() => {});
+
+                    console.error(`[DLR-TIMEOUT] ⏰ SMS: ${smsPending.rows.length} pending DLR(s) timed out after ${PENDING_DLR_TIMEOUT_MIN}min → marked UNDELIV`);
+
+                    // Push DLR to external clients for external sources only.
+                    // test_sms and campaign: DLR stays in sms_logs, no external push.
+                    const NO_PUSH_SOURCES = ['test_sms', 'campaign', 'e2e_test'];
+                    for (const row of smsPending.rows) {
+                        const source = row.source || '';
+                        if (NO_PUSH_SOURCES.includes(source)) {
+                            // Internal source — DLR updated in sms_logs only, skip external push
+                            console.error(`[DLR-TIMEOUT] 🔒 ${row.message_id}: Internal (${source}) — sms_logs updated, no external push`);
+                            continue;
+                        }
+                        // External source — push DLR to outbox for SMPP/HTTP delivery
+                        if (queueManager && queueManager.onDlr && row.client_id) {
+                            try {
+                                queueManager.onDlr({
+                                    client_id: row.client_id,
+                                    message_id: row.message_id,
+                                    destination: row.destination,
+                                    sender_id: row.sender_id || '',
+                                    status: 'UNDELIV',
+                                    client_code: row.client_code || '',
+                                    queued_at: row.submit_time,
+                                    source: source || 'unknown'
+                                });
+                                console.error(`[DLR-TIMEOUT] 📤 ${row.message_id}: UNDELIV pushed to external client (source=${source})`);
+                            } catch (e) {
+                                console.error(`[DLR-TIMEOUT] ⚠ ${row.message_id}: DLR push failed: ${e.message}`);
+                            }
+                        }
+                    }
+                }
+
+                // ── VOICE OTP DLR TIMEOUT ──
+                // Find all voice_otp_logs with PENDING DLR older than 60 minutes.
+                const voicePending = await pool.query(
+                    `SELECT * FROM voice_otp_logs
+                     WHERE dlr_status = 'PENDING'
+                       AND status IN ('sent', 'initiated')
+                       AND created_at < NOW() - INTERVAL '${PENDING_DLR_TIMEOUT_MIN} minutes'
+                     ORDER BY created_at ASC
+                     LIMIT 50`
+                );
+
+                if (voicePending.rows.length > 0) {
+                    const voiceIds = voicePending.rows.map(r => r.id);
+                    const voiceCallIds = voicePending.rows.map(r => r.call_id);
+
+                    // Mark voice OTP logs as FAILED/UNDELIV
+                    await pool.query(
+                        `UPDATE voice_otp_logs SET dlr_status = 'UNDELIV', status = 'failed',
+                         error_message = 'Voice OTP DLR timeout after ${PENDING_DLR_TIMEOUT_MIN} minutes',
+                         completed_at = NOW()
+                         WHERE id = ANY($1::int[]) AND dlr_status = 'PENDING'`,
+                        [voiceIds]
+                    );
+
+                    // Also update corresponding sms_logs entries
+                    await pool.query(
+                        `UPDATE sms_logs SET dlr_status = 'UNDELIV', status = 'failed',
+                         error_code = 'VOICE_DLR_TIMEOUT',
+                         error_message = 'Voice OTP DLR timeout after ${PENDING_DLR_TIMEOUT_MIN} minutes',
+                         delivery_time = NOW(), dlr_timestamp = NOW(),
+                         dlr_source = 'DLR_TIMEOUT'
+                         WHERE message_id = ANY($1::varchar[]) AND dlr_status = 'PENDING'`,
+                        [voiceCallIds]
+                    ).catch(() => {});
+
+                    // Also update sms_outbox for consistency (voice OTP goes through outbox too)
+                    await pool.query(
+                        `UPDATE sms_outbox SET dlr_status = 'UNDELIV', status = 'failed',
+                         dlr_confirmed_at = NOW()
+                         WHERE message_id = ANY($1::varchar[]) AND dlr_status = 'PENDING'`,
+                        [voiceCallIds]
+                    ).catch(() => {});
+
+                    console.error(`[DLR-TIMEOUT] ⏰ Voice OTP: ${voicePending.rows.length} pending DLR(s) timed out after ${PENDING_DLR_TIMEOUT_MIN}min → marked UNDELIV`);
+
+                    // Push DLR to external client for each timed-out voice OTP
+                    for (const row of voicePending.rows) {
+                        if (row.client_id && queueManager && queueManager.onDlr) {
+                            try {
+                                queueManager.onDlr({
+                                    client_id: row.client_id,
+                                    message_id: row.call_id,
+                                    destination: row.destination,
+                                    sender_id: '',
+                                    status: 'UNDELIV',
+                                    client_code: '',
+                                    queued_at: row.created_at,
+                                    source: 'voice_otp'
+                                });
+                                console.error(`[DLR-TIMEOUT] 📤 Voice OTP ${row.call_id}: UNDELIV pushed to external client`);
+                            } catch (e) {
+                                console.error(`[DLR-TIMEOUT] ⚠ Voice OTP ${row.call_id}: DLR push failed: ${e.message}`);
+                            }
+                        }
+                    }
+                }
+            } catch (e) {
+                console.error('[DLR-TIMEOUT] Error in pending DLR timeout cycle:', e.message);
+            }
+        }, 60000);
+
+        console.error(`[INIT] Pending DLR timeout cleaner started — marks SMS + Voice OTP DLRs as UNDELIV after ${PENDING_DLR_TIMEOUT_MIN}min, pushes to external clients (skips test_sms/campaign)`);
+
         // ======== HELPER: Push failed DLR to inbound supplier ========
         // Called by the SMPP relay poller when an inbound supplier's message
         // fails validation (NO_ROUTE, NO_RATE, NO_PROFIT, CLIENT_NOT_FOUND).
@@ -2633,7 +2784,7 @@ app.put('/api/suppliers/:id', auth, async (req, res) => {
         const { id } = req.params;
         const fields = req.body;
         // Build dynamic SET clause for any field passed
-        const allowed = ['supplier_code','company_name','contact_person','email','phone','connection_type','smpp_host','smpp_port','smpp_username','smpp_password','system_id','smpp_version','smpp_system_type','smpp_bind_type','smpp_addr_ton','smpp_addr_npi','smpp_addr_range','is_inbound','api_url','api_key','api_method','api_connector_id','voice_otp_config_id','voice_otp_mode','whatsapp_device_ids','telegram_device_ids','dst_sip_address','reconnect_schedule','rate_per_second','audio_codec','capacity','balance','credit_limit','currency','billing_mode','bind_status','consecutive_failures','force_dlr','status','max_queue_size','dlr_timeout','force_dlr_timeout','force_dlr_timeout_mode'];
+        const allowed = ['supplier_code','company_name','contact_person','email','phone','connection_type','smpp_host','smpp_port','smpp_username','smpp_password','system_id','smpp_version','smpp_system_type','smpp_bind_type','smpp_addr_ton','smpp_addr_npi','smpp_addr_range','is_inbound','api_url','api_key','api_method','api_connector_id','voice_otp_config_id','voice_otp_mode','whatsapp_device_ids','telegram_device_ids','dst_sip_address','reconnect_schedule','rate_per_second','audio_codec','capacity','balance','credit_limit','currency','billing_mode','bind_status','consecutive_failures','force_dlr','status','max_queue_size','dlr_timeout','force_dlr_timeout','force_dlr_timeout_mode','ott_max_tps','ott_proxy_node'];
         const setParts = [];
         const values = [];
         let idx = 1;
@@ -7182,9 +7333,28 @@ app.post('/api/ott/devices/:id/validate', auth, async (req, res) => {
         const result = await pool.query('SELECT * FROM ott_devices WHERE id = $1', [id]);
         if (result.rows.length === 0) return res.status(404).json({ error: 'OTT device not found' });
         const device = result.rows[0];
-        // Basic validation: check if number matches device type capabilities
-        const valid = device.session_status === 'connected' && number.length >= 10;
-        res.json({ success: true, data: { valid } });
+        // Real validation via device API (Baileys for WhatsApp, Telethon for Telegram)
+        try {
+            const ottMgr = await import('./src/services/ottDeviceManager.mjs');
+            const validation = await ottMgr.validateOTTNumber(
+                String(device.id),
+                device.device_type,
+                number,
+                device.proxy_node || null
+            );
+            // Cache result
+            await pool.query(
+                `INSERT INTO number_validation_results (device_id, number, channel, is_valid, result, validated_at)
+                 VALUES ($1,$2,$3,$4,$5,NOW())
+                 ON CONFLICT (device_id, number) DO UPDATE SET is_valid=$4, result=$5, validated_at=NOW()`,
+                [device.id, number, device.device_type, validation.valid, JSON.stringify(validation)]
+            ).catch(() => {});
+            res.json({ success: true, data: validation });
+        } catch (valErr) {
+            // Fallback to basic validation
+            const valid = device.session_status === 'connected' && number.length >= 10;
+            res.json({ success: true, data: { valid, error: valErr.message } });
+        }
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -7279,6 +7449,20 @@ app.put('/api/platform-settings', auth, async (req, res) => {
 });
 
 
+// ==================== CHANNELS DLR HELPER ====================
+// Pushes DLR results for OTT channel messages to the dlr_outbox for SMPP/HTTP delivery.
+function pushChannelDlr(messageId, destination, status, errorMsg, httpStatus) {
+    try {
+        const receipt = `id:${messageId} sub:001 dlvrd:${status === 'DELIVRD' ? '001' : '000'} submit date:${new Date().toISOString().slice(0,16).replace(/[-:T]/g,'')} done date:${new Date().toISOString().slice(0,16).replace(/[-:T]/g,'')} stat:${status} err:${String(httpStatus || 0).padStart(3,'0')} text:${errorMsg || ''}`;
+        pool.query(
+            `INSERT INTO dlr_outbox (message_id, entity_type, client_code, destination, sender_id, status, dlr_receipt, submit_time, webhook_url)
+             VALUES ($1,'client','','$2','','$3',$4,NOW(),'')
+             ON CONFLICT (message_id) DO UPDATE SET status = EXCLUDED.status, dlr_receipt = EXCLUDED.dlr_receipt`,
+            [messageId, destination, status, receipt]
+        ).catch(() => {});
+    } catch (e) { /* best-effort DLR push */ }
+}
+
 // ==================== CHANNELS (RCS, Flash SMS, WhatsApp, Telegram, HTTP API) ====================
 // Generic multi-channel message send endpoint
 app.post('/api/channels/send', auth, async (req, res) => {
@@ -7293,17 +7477,81 @@ app.post('/api/channels/send', auth, async (req, res) => {
             case 'rcs':
             case 'flash_sms':
             case 'whatsapp':
-            case 'telegram':
-                // Log the send to channel_messages table
+            case 'telegram': {
+                // Validate device is connected
+                if (!device_id) {
+                    const msgInsert = await pool.query(
+                        `INSERT INTO channel_messages (message_id, channel, destination, message_text, media_url, device_id, sender_id, api_connector_id, status, submitted_at, error) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'failed',NOW(),$9) RETURNING *`,
+                        [messageId, channel, destination, message, media_url || null, null, sender_id || null, api_connector_id || null, 'No device_id provided']
+                    );
+                    // Push DLR: failed — no device
+                    pushChannelDlr(messageId, destination, 'UNDELIV', 'No OTT device specified', 400);
+                    return res.status(400).json({ success: false, error: 'device_id is required for ' + channel, data: msgInsert.rows[0] });
+                }
+
+                // Validate number via device API before sending
+                let numberValid = true;
+                let validationError = null;
+                try {
+                    const ottMgr = await import('./src/services/ottDeviceManager.mjs');
+                    const devR = await pool.query('SELECT device_type, proxy_node FROM ott_devices WHERE id = $1', [device_id]);
+                    if (devR.rows.length > 0) {
+                        const validation = await ottMgr.validateOTTNumber(
+                            String(device_id),
+                            devR.rows[0].device_type,
+                            destination,
+                            devR.rows[0].proxy_node || null
+                        );
+                        numberValid = validation.valid;
+                        validationError = validation.error || '';
+                    }
+                } catch (valErr) {
+                    console.error(`[CHANNEL] Number validation skipped: ${valErr.message}`);
+                }
+
+                if (!numberValid) {
+                    // Number not valid for this channel — reject with DLR 404
+                    const msgInsert = await pool.query(
+                        `INSERT INTO channel_messages (message_id, channel, destination, message_text, media_url, device_id, sender_id, api_connector_id, status, submitted_at, error) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'failed',NOW(),$9) RETURNING *`,
+                        [messageId, channel, destination, message, media_url || null, device_id, sender_id || null, api_connector_id || null, `Number not on ${channel}: ${validationError}`]
+                    );
+                    // Push DLR: failed with 404 (invalid number)
+                    pushChannelDlr(messageId, destination, 'UNDELIV', `Number not registered on ${channel}: ${validationError}`, 404);
+                    return res.status(404).json({ success: false, error: `Number not registered on ${channel}`, code: 'NUMBER_NOT_FOUND', data: msgInsert.rows[0] });
+                }
+
+                // Send via OTT device
                 const msgInsert = await pool.query(
-                    `INSERT INTO channel_messages (message_id, channel, destination, message_text, media_url, device_id, sender_id, api_connector_id, status, submitted_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'queued',NOW()) RETURNING *`,
-                    [messageId, channel, destination, message, media_url || null, device_id || null, sender_id || null, api_connector_id || null]
+                    `INSERT INTO channel_messages (message_id, channel, destination, message_text, media_url, device_id, sender_id, api_connector_id, status, submitted_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'sending',NOW()) RETURNING *`,
+                    [messageId, channel, destination, message, media_url || null, device_id, sender_id || null, api_connector_id || null]
                 );
-                // Simulate delivery
-                setTimeout(function() {
-                    pool.query(`UPDATE channel_messages SET status = 'delivered', delivered_at = NOW() WHERE message_id = $1`, [messageId]).catch(function() {});
-                }, 2000);
-                return res.json({ success: true, data: msgInsert.rows[0], message: channel.toUpperCase() + ' message queued' });
+
+                // Actually send via the connected device
+                try {
+                    const ottMgr = await import('./src/services/ottDeviceManager.mjs');
+                    let sendResult;
+                    if (channel === 'whatsapp') {
+                        sendResult = await ottMgr.sendWhatsAppMessage(String(device_id), destination, message);
+                    } else {
+                        sendResult = await ottMgr.sendTelegramMessage(String(device_id), destination, message);
+                    }
+                    await pool.query(
+                        `UPDATE channel_messages SET status = 'delivered', delivered_at = NOW() WHERE message_id = $1`,
+                        [messageId]
+                    ).catch(() => {});
+                    // Push DLR: delivered
+                    pushChannelDlr(messageId, destination, 'DELIVRD', 'Sent via ' + channel, 200);
+                    return res.json({ success: true, data: { ...msgInsert.rows[0], status: 'delivered', message_id: sendResult?.messageId }, message: channel.toUpperCase() + ' message sent' });
+                } catch (sendErr) {
+                    await pool.query(
+                        `UPDATE channel_messages SET status = 'failed', error = $1 WHERE message_id = $2`,
+                        [sendErr.message, messageId]
+                    ).catch(() => {});
+                    // Push DLR: failed
+                    pushChannelDlr(messageId, destination, 'UNDELIV', sendErr.message, 500);
+                    return res.status(500).json({ success: false, error: sendErr.message, data: { ...msgInsert.rows[0], status: 'failed' } });
+                }
+            }
 
             case 'http':
                 if (!api_connector_id) {

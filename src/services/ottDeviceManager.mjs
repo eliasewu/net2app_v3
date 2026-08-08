@@ -13,6 +13,9 @@ import { SocksProxyAgent } from 'socks-proxy-agent';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+const execFileAsync = promisify(execFile);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SESSIONS_DIR = path.join(__dirname, '../../ott_sessions');
@@ -164,31 +167,175 @@ export async function sendWhatsAppMessage(deviceId, destination, message) {
     throw new Error(`WhatsApp device ${deviceId} not connected`);
   }
   const jid = `${destination.replace(/[^0-9]/g, '')}@s.whatsapp.net`;
-  await device.socket.sendMessage(jid, { text: message });
-  return { success: true, deviceId, destination };
+  const result = await device.socket.sendMessage(jid, { text: message });
+  return { success: true, deviceId, destination, messageId: result?.key?.id };
 }
 
-// ========== TELEGRAM (gramJS / mtcute) ==========
+/**
+ * Send a Telegram message through a connected device.
+ * Uses the saved session to send via Telethon (Python) or direct API.
+ */
+export async function sendTelegramMessage(deviceId, destination, message) {
+  const device = activeDevices.get(deviceId);
+  if (!device || device.state !== 'connected') {
+    throw new Error(`Telegram device ${deviceId} not connected`);
+  }
+
+  // Use Python Telethon with saved session
+  try {
+    const args = [
+      path.join(__dirname, '../../scripts/telegram_qr.py'),
+      String(deviceId),
+      device.phoneNumber,
+      'send',
+      destination,
+      message,
+    ];
+    const { stdout } = await execFileAsync('python3', args, { timeout: 30000 });
+    const result = JSON.parse(stdout);
+    if (!result.success) {
+      throw new Error(result.error || 'Telegram send failed');
+    }
+    return { success: true, deviceId, destination, messageId: result.message_id };
+  } catch (e) {
+    throw new Error(`Telegram send failed: ${e.message}`);
+  }
+}
+
+// ========== NUMBER VALIDATION ==========
 
 /**
- * Start Telegram pairing session.
- * For Telegram, we generate a session string that the user can use.
- * Uses gramJS-style session files or generates a pairing link.
+ * Validate if a phone number is on WhatsApp using the connected device.
+ * Uses Baileys' onWhatsApp/jid check capability.
  */
-export async function startTelegramPairing(deviceId, phoneNumber, proxyNode = null) {
+export async function validateWhatsAppNumber(deviceId, phoneNumber) {
+  const device = activeDevices.get(deviceId);
+  if (!device || device.state !== 'connected' || !device.socket) {
+    return { valid: false, error: 'Device not connected', httpStatus: 503 };
+  }
+  try {
+    const cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
+    const jid = `${cleanNumber}@s.whatsapp.net`;
+    // Check if the number exists on WhatsApp
+    const [result] = await device.socket.onWhatsApp(jid);
+    if (result && result.exists) {
+      return { valid: true, jid: result.jid, number: cleanNumber };
+    }
+    return { valid: false, error: 'Number not on WhatsApp', httpStatus: 404 };
+  } catch (e) {
+    return { valid: false, error: `Validation error: ${e.message}`, httpStatus: 500 };
+  }
+}
+
+/**
+ * Validate if a phone number is on Telegram using Python Telethon.
+ */
+export async function validateTelegramNumber(deviceId, phoneNumber, proxyNode = null) {
+  try {
+    const proxyHost = proxyNode ? proxyNode.split(':')[0] : (PROXY_NODES.length > 0 ? PROXY_NODES[0] : '');
+    const proxyPort = proxyNode && proxyNode.includes(':') ? parseInt(proxyNode.split(':')[1]) : DEFAULT_PROXY_PORT;
+    const args = [
+      path.join(__dirname, '../../scripts/telegram_qr.py'),
+      String(deviceId),
+      phoneNumber,
+      String(process.env.TELEGRAM_API_ID || '2040'),
+      process.env.TELEGRAM_API_HASH || 'b18441a1ff607e10a989891a5462e627',
+      proxyHost || '',
+      String(proxyPort),
+      'validate',
+    ].filter(a => a !== '');
+
+    const { stdout } = await execFileAsync('python3', args, { timeout: 20000 });
+    const result = JSON.parse(stdout);
+    return {
+      valid: result.valid || false,
+      username: result.username || '',
+      firstName: result.first_name || '',
+      error: result.error || '',
+      httpStatus: result.valid ? 200 : 404,
+    };
+  } catch (e) {
+    return { valid: false, error: `Validation error: ${e.message}`, httpStatus: 500 };
+  }
+}
+
+/**
+ * Validate a number against the appropriate platform (WhatsApp or Telegram)
+ * based on the channel type.
+ */
+export async function validateOTTNumber(deviceId, channel, phoneNumber, proxyNode = null) {
+  if (channel === 'whatsapp') {
+    return validateWhatsAppNumber(deviceId, phoneNumber);
+  }
+  if (channel === 'telegram') {
+    return validateTelegramNumber(deviceId, phoneNumber, proxyNode);
+  }
+  return { valid: true, message: 'No validation needed for this channel' };
+}
+
+// ========== TELEGRAM (gramJS / Telethon Python) ==========
+
+/**
+ * Start Telegram pairing session using Python Telethon script for real QR codes.
+ * Falls back to token-based pairing if Python is unavailable.
+ */
+export async function startTelegramPairing(deviceId, phoneNumber, proxyNode = null, apiId = null, apiHash = null) {
   if (activeDevices.has(deviceId)) {
     await stopDevice(deviceId);
   }
 
-  // Generate a unique pairing token stored in DB
-  const pairingToken = `tg_${deviceId}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-  
   let agent = null;
   if (proxyNode) {
     agent = new SocksProxyAgent(`socks5://${proxyNode}:${DEFAULT_PROXY_PORT}`);
   } else {
     agent = getProxyAgent(deviceId);
   }
+
+  // Extract proxy host for Python script
+  const proxyHost = proxyNode ? proxyNode.split(':')[0] : (PROXY_NODES.length > 0 ? PROXY_NODES[0] : null);
+  const proxyPort = proxyNode && proxyNode.includes(':') ? parseInt(proxyNode.split(':')[1]) : DEFAULT_PROXY_PORT;
+
+  // Try Python Telethon for real QR code
+  try {
+    const args = [
+      path.join(__dirname, '../../scripts/telegram_qr.py'),
+      String(deviceId),
+      phoneNumber,
+      String(apiId || process.env.TELEGRAM_API_ID || '2040'),
+      apiHash || process.env.TELEGRAM_API_HASH || 'b18441a1ff607e10a989891a5462e627',
+      proxyHost || '',
+      String(proxyPort),
+      'qr',
+    ].filter(a => a !== '');
+
+    const { stdout } = await execFileAsync('python3', args, { timeout: 60000 });
+    const result = JSON.parse(stdout);
+
+    if (result.success) {
+      const deviceInfo = {
+        deviceId, type: 'telegram', phoneNumber, proxy: proxyNode,
+        state: 'qr_ready', qr: result.qr, startedAt: Date.now(),
+        session: result.session, phoneCodeHash: result.phone_code_hash,
+        agent,
+      };
+      activeDevices.set(deviceId, deviceInfo);
+      console.log(`[OTT-TG] 📱 Device ${deviceId}: Real Telegram QR generated via Python Telethon`);
+      return {
+        qr: result.qr,
+        qrImage: result.qr_image,
+        deviceId,
+        type: 'telegram',
+        pairingToken: result.phone_code_hash,
+        instructions: result.instructions,
+      };
+    }
+    console.warn(`[OTT-TG] Python QR failed: ${result.error}, falling back to token`);
+  } catch (pyErr) {
+    console.warn(`[OTT-TG] Python script error: ${pyErr.message}, falling back to token-based pairing`);
+  }
+
+  // Fallback: token-based pairing
+  const pairingToken = `tg_${deviceId}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
   const deviceInfo = {
     deviceId, type: 'telegram', phoneNumber, proxy: proxyNode,
@@ -197,10 +344,8 @@ export async function startTelegramPairing(deviceId, phoneNumber, proxyNode = nu
   };
   activeDevices.set(deviceId, deviceInfo);
 
-  console.log(`[OTT-TG] 📱 Device ${deviceId}: Pairing token generated → ${pairingToken}`);
-  
-  // Return pairing info — actual session is established via the connect endpoint
-  // which calls the Telegram API through the proxy to send the auth code
+  console.log(`[OTT-TG] 📱 Device ${deviceId}: Fallback pairing token → ${pairingToken}`);
+
   return {
     deviceId,
     type: 'telegram',
