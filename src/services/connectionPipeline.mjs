@@ -132,13 +132,23 @@ class ConnectionPipeline {
         if (this.smppClient && this.smppClient.bound) {
           return await this.smppClient.submitSm(job);
         }
-        // Fallback to simulation if no real client
-        return await this.simulateSMPPSubmit(job);
+        // SMPP client not bound — fail with a clear error instead of
+        // silently returning fake success from simulateSMPPSubmit().
+        throw new Error(`SMPP client not bound for supplier ${this.supplierCode} — cannot deliver ${job.message_id}`);
       } else if (connection_type === 'http') {
         return await this.httpSubmit(job);
+      } else if (connection_type === 'voice_otp') {
+        // Voice OTP handled by QueueManager's _handleVoiceOtpJob path,
+        // but if we reach here, fail loudly rather than simulate.
+        throw new Error(`Voice OTP supplier ${this.supplierCode} reached pipeline sendMessage — should have been handled by QueueManager`);
+      } else if (connection_type === 'android_SMS') {
+        // Android SMS is handled by heartbeat polling — should never reach here.
+        throw new Error(`Android SMS supplier ${this.supplierCode} reached pipeline sendMessage — should have been skipped by QueueManager`);
       } else {
-        // Generic delivery
-        return await this.simulateSMPPSubmit(job);
+        // Unknown connection_type — fail with a clear error.
+        // Previously this silently returned fake 95% success from
+        // simulateSMPPSubmit(), which could mask misconfigured suppliers.
+        throw new Error(`Unknown connection_type '${connection_type || 'undefined'}' for supplier ${this.supplierCode} — cannot deliver ${job.message_id}. Please configure a valid connection type (smpp/http/voice_otp/android_SMS).`);
       }
     } catch (error) {
       this.consecutiveFailures++;
@@ -161,19 +171,6 @@ class ConnectionPipeline {
     } finally {
       this.busy = false;
       this.messagesProcessed++;
-    }
-  }
-
-  async simulateSMPPSubmit(job) {
-    // Simulate SMPP submit_sm latency (50-300ms)
-    await new Promise(resolve => setTimeout(resolve, 50 + Math.random() * 250));
-    
-    // 95% success rate in production simulation
-    if (Math.random() > 0.05) {
-      const smppMsgId = `SMPP_${Date.now()}_${Math.random().toString(36).substr(2, 8)}`;
-      return { success: true, smpp_message_id: smppMsgId };
-    } else {
-      throw new Error('SMPP SUBMIT_SM failed: ESME_RTHROTTLED (0x00000058)');
     }
   }
 
