@@ -100,7 +100,7 @@ function buildDlrReceipt(msgId, status, submitDate = null, errorCode = '000') {
  * @param {object} rateLimit  — RateLimiter instance (optional, for TPS check)
  */
 export default class SmppServer {
-  constructor(pgPool, queueMgr = null, rateLimit = null, resolveRouteFn = null) {
+  constructor(pgPool, queueMgr = null, rateLimit = null, resolveRouteFn = null, onDlrBilling = null) {
     if (pgPool) {
       this.pool = pgPool;
     } else {
@@ -118,6 +118,7 @@ export default class SmppServer {
     this.queueManager = queueMgr;
     this.rateLimiter = rateLimit;
     this.resolveRoute = resolveRouteFn;
+    this.onDlrBilling = onDlrBilling;
 
     /** Global session registry: "entityType_entityId" → { session, remoteAddr, systemId, bindType } */
     this.sessions = new Map();
@@ -289,15 +290,10 @@ export default class SmppServer {
                   await db.query(`UPDATE sms_outbox SET status=$1, dlr_status=$2 WHERE message_id=$3`, [finalStatus, dlrStatus, origMsgId]);
 
                   if (dlrStatus === 'DELIVRD') {
-                    // DLR billing — client + supplier deduction on DELIVRD only.
-                    // Failed/UNDELIV DLRs are NOT billed.
-                    if (orig.billing_mode_snapshot === 'dlr' && orig.client_rate) {
-                      const clientCost = parseFloat(((orig.client_rate || 0) * (orig.message_parts || 1)).toFixed(6));
-                      await db.query('UPDATE clients SET balance = GREATEST(0, balance - $1), updated_at = NOW() WHERE id = $2', [clientCost, orig.client_id]);
-                      console.log(`[SMPP-DLR] 💰 ${origMsgId}: Client billed €${clientCost} on DLR (client #${orig.client_id})`);
-                    }
-                    // Supplier-side billing — deduct supplier_rate from supplier balance
-                    // Only if supplier's billing_mode is 'dlr' (same principle as client)
+                    // DLR billing — delegate to unified applyBilling() via callback.
+                    // Uses atomic claim-first pattern with credit mode support.
+                    const clientCost = parseFloat(((orig.client_rate || 0) * (orig.message_parts || 1)).toFixed(6));
+                    let supCost = 0, supId = null, supBillingMode = 'dlr';
                     try {
                       const outboxR = await db.query(
                         `SELECT o.supplier_id, o.supplier_rate, o.message_parts, s.billing_mode AS supplier_billing_mode
@@ -306,17 +302,32 @@ export default class SmppServer {
                         [origMsgId]
                       );
                       if (outboxR.rows.length) {
-                        const supCost = parseFloat(((outboxR.rows[0].supplier_rate || 0) * (outboxR.rows[0].message_parts || 1)).toFixed(6));
-                        if (supCost > 0 && outboxR.rows[0].supplier_id && (outboxR.rows[0].supplier_billing_mode || 'dlr') === 'dlr') {
-                          await db.query('UPDATE suppliers SET balance = GREATEST(0, balance - $1), updated_at = NOW() WHERE id = $2', [supCost, outboxR.rows[0].supplier_id]);
-                          console.log(`[SMPP-DLR] 💰 ${origMsgId}: Supplier billed €${supCost} on DLR (supplier #${outboxR.rows[0].supplier_id})`);
-                        }
+                        supCost = parseFloat(((outboxR.rows[0].supplier_rate || 0) * (outboxR.rows[0].message_parts || 1)).toFixed(6));
+                        supId = outboxR.rows[0].supplier_id;
+                        supBillingMode = outboxR.rows[0].supplier_billing_mode || 'dlr';
                       }
                     } catch (e) {
                       console.error(`[SMPP-DLR] ⚠ Supplier billing lookup failed for ${origMsgId}: ${e.message}`);
                     }
-                    // Mark as billed
-                    await db.query('UPDATE sms_logs SET is_billed = true WHERE message_id = $1', [origMsgId]).catch(() => {});
+                    if (this.onDlrBilling) {
+                      try {
+                        await this.onDlrBilling({
+                          messageId: origMsgId,
+                          clientId: orig.client_id || null,
+                          supplierId: supId,
+                          clientCost,
+                          supplierCost: supCost,
+                          clientBillingMode: orig.billing_mode_snapshot || 'dlr',
+                          supplierBillingMode: supBillingMode,
+                          isSubmit: false,
+                          dlrStatus: 'DELIVRD',
+                          clientForceDlr: false,
+                          supplierForceDlr: false
+                        });
+                      } catch (e) {
+                        console.error(`[SMPP-DLR] ⚠ Billing callback failed for ${origMsgId}: ${e.message}`);
+                      }
+                    }
                     // Webhook
                     if (orig.webhook_url && this.queueManager) {
                       this.queueManager.sendWebhook(orig.webhook_url, origMsgId, orig.destination, 'delivered', 'DELIVRD', orig.client_code).catch(() => {});
