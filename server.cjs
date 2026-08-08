@@ -774,7 +774,20 @@ let smppServer = null; // Set by SmppServer import (for Android Gateway DLR push
                         console.error('[SMPP-DLR] DLR callback failed:', e.message));
                 }
             });
-            console.error('[INIT] SMPP DLR callback wired → real-time sms_logs updates + external client DLR push');
+            // Wire unified billing callback — smppClient.mjs DLR handler
+            // delegates to applyBilling() for atomic claim-first billing with
+            // credit mode support, instead of direct SQL balance updates.
+            if (typeof connectionPoolMgr.setBillingCallback === 'function') {
+                connectionPoolMgr.setBillingCallback(async (params) => {
+                    try {
+                        return await applyBilling(params);
+                    } catch (e) {
+                        console.error('[SMPP-BILLING] applyBilling callback failed for ' + (params.messageId || '?') + ': ' + e.message);
+                        return { clientBilled: false, supplierBilled: false };
+                    }
+                });
+            }
+            console.error('[INIT] SMPP DLR callback wired → real-time sms_logs updates + external client DLR push + unified billing');
         }
 
         // ======== REAL-TIME DLR PUSHER ========
@@ -8234,19 +8247,23 @@ app.post('/api/gateway/mt-dlr', async (req, res) => {
 
         if (status === 'DELIVRD' && logUpdate.rows.length > 0) {
             const log = logUpdate.rows[0];
-            if (log.billing_mode_snapshot === 'dlr' && log.client_rate) {
-                const clientCost = parseFloat(
-                    ((log.client_rate || 0) * (log.message_parts || 1)).toFixed(6)
-                );
-                await pool.query(
-                    'UPDATE clients SET balance = GREATEST(0, balance - $1), updated_at = NOW() WHERE id = $2',
-                    [clientCost, log.client_id]
-                ).catch(() => {});
-                await pool.query(
-                    'UPDATE sms_logs SET is_billed = true WHERE message_id = $1',
-                    [message_id]
-                ).catch(() => {});
-            }
+            // Use unified applyBilling for atomic claim-first billing with credit mode support.
+            // Replaces direct SQL balance updates that lacked atomic claims.
+            const clientCost = parseFloat(((log.client_rate || 0) * (log.message_parts || 1)).toFixed(6));
+            const clientBillingMode = log.billing_mode_snapshot || 'dlr';
+            await applyBilling({
+                messageId: message_id,
+                clientId: log.client_id,
+                supplierId: null,
+                clientCost,
+                supplierCost: 0,
+                clientBillingMode,
+                supplierBillingMode: 'dlr',
+                isSubmit: false,
+                dlrStatus: 'DELIVRD',
+                clientForceDlr: false,
+                supplierForceDlr: false
+            });
             if (log.webhook_url && queueManager) {
                 queueManager.sendWebhook(log.webhook_url, message_id, log.destination,
                     'delivered', 'DELIVRD', log.client_code).catch(() => {});

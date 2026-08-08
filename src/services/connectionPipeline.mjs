@@ -25,6 +25,8 @@ class ConnectionPipeline {
     this._terminated = false; // guard against redundant DB writes after max failures
     /** DLR callback set by ConnectionPoolManager — forwarded from SmppClient */
     this._onDlrCallback = null;
+    /** Billing callback set by ConnectionPoolManager — forwarded from SmppClient.onDlrBilling */
+    this._billingCallback = null;
   }
 
   async connect() {
@@ -47,6 +49,12 @@ class ConnectionPipeline {
           this.smppClient.onDlr = (dlr) => {
             if (this._onDlrCallback) {
               this._onDlrCallback(dlr);
+            }
+          };
+          // Wire billing callback to unified applyBilling() in server.cjs
+          this.smppClient.onDlrBilling = async (billingParams) => {
+            if (this._billingCallback) {
+              return await this._billingCallback(billingParams);
             }
           };
         }
@@ -280,6 +288,16 @@ class ConnectionPoolManager {
     }
   }
 
+  /** Set billing callback (for unified applyBilling) — propagated to all pipelines */
+  setBillingCallback(cb) {
+    this._globalBillingCallback = cb;
+    for (const [, pipelines] of this.supplierPipelines) {
+      for (const p of pipelines) {
+        p._billingCallback = cb;
+      }
+    }
+  }
+
   /** Set the shared pool after import (called by server.cjs) */
   init(pgPool) {
     this.pool = pgPool;
@@ -337,6 +355,7 @@ class ConnectionPoolManager {
       // Wire DLR callback if set
       if (this._globalDlrCallback) {
         pipeline._onDlrCallback = this._globalDlrCallback;
+        pipeline._billingCallback = this._globalBillingCallback;
       }
       await pipeline.connect();
       pipelines.push(pipeline);

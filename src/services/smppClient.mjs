@@ -39,6 +39,9 @@ class SmppClient {
     this._unboundSynced = false; // guard against double _syncBindStatus('unbound')
     /** DLR callback: (dlr) => void where dlr = { message_id, status, error_code, text } */
     this.onDlr = null;
+    /** Billing callback: (params) => Promise where params match applyBilling() args.
+     *  Called on DELIVRD DLR instead of direct SQL billing. */
+    this.onDlrBilling = null;
   }
 
   async connect() {
@@ -203,62 +206,31 @@ class SmppClient {
             [finalDlr, finalStatus, dlrMessageId, dlrError]
           );
 
-          // DLR BILLING: charge remaining parties whose billing_mode='dlr' on DELIVRD
+          // DLR BILLING: delegate to unified applyBilling() via callback.
+          // Uses atomic claim-first pattern with credit mode support and
+          // rollback — avoids the direct SQL billing that was here before.
           if (isDelivered && outboxR.rows.length > 0) {
             const outbox = outboxR.rows[0];
             const clientCost = parseFloat(((parseFloat(outbox.client_rate || 0)) * (parseInt(outbox.message_parts || 1))).toFixed(6));
             const supplierCost = parseFloat(((parseFloat(outbox.supplier_rate || 0)) * (parseInt(outbox.message_parts || 1))).toFixed(6));
             const clientBillingMode = outbox.billing_mode || 'dlr';
             const supplierBillingMode = outbox.supplier_billing_mode || 'dlr';
-            
-            try {
-              // Check billing flags — only charge parties that haven't been billed yet
-              const flagsR = await this.pool.query(
-                'SELECT is_client_billed, is_supplier_billed FROM sms_logs WHERE message_id = $1',
-                [dlrMessageId]
-              );
-              const isClientBilled = flagsR.rows[0]?.is_client_billed || false;
-              const isSupplierBilled = flagsR.rows[0]?.is_supplier_billed || false;
-              
-              let clientBilledNow = false, supplierBilledNow = false;
-              
-              // Client billing: only if dlr-mode and not yet billed
-              if (!isClientBilled && clientBillingMode === 'dlr' && clientCost > 0 && outbox.client_id) {
-                await this.pool.query(
-                  'UPDATE clients SET balance = GREATEST(0, balance - $1), updated_at = NOW() WHERE id = $2',
-                  [clientCost, outbox.client_id]
-                ).catch(() => {});
-                await this.pool.query(
-                  'UPDATE sms_logs SET is_client_billed = true WHERE message_id = $1 AND is_client_billed = false',
-                  [dlrMessageId]
-                ).catch(() => {});
-                clientBilledNow = true;
-                console.log(`[SMPP-CLIENT] 💰 ${supplier.supplier_code}: Client #${outbox.client_id} billed €${clientCost} on DLR (${dlrMessageId})`);
+            if (this.onDlrBilling) {
+              try {
+                await this.onDlrBilling({
+                  messageId: dlrMessageId,
+                  clientId: outbox.client_id || null,
+                  supplierId: outbox.supplier_id || null,
+                  clientCost, supplierCost,
+                  clientBillingMode, supplierBillingMode,
+                  isSubmit: false,
+                  dlrStatus: 'DELIVRD',
+                  clientForceDlr: false,
+                  supplierForceDlr: false
+                });
+              } catch (e) {
+                console.error(`[SMPP-CLIENT] ${supplier.supplier_code}: DLR billing callback failed for ${dlrMessageId}: ${e.message}`);
               }
-              
-              // Supplier billing: only if dlr-mode and not yet billed
-              if (!isSupplierBilled && supplierBillingMode === 'dlr' && supplierCost > 0 && outbox.supplier_id) {
-                await this.pool.query(
-                  'UPDATE suppliers SET balance = GREATEST(0, balance - $1), updated_at = NOW() WHERE id = $2',
-                  [supplierCost, outbox.supplier_id]
-                ).catch(() => {});
-                await this.pool.query(
-                  'UPDATE sms_logs SET is_supplier_billed = true WHERE message_id = $1 AND is_supplier_billed = false',
-                  [dlrMessageId]
-                ).catch(() => {});
-                supplierBilledNow = true;
-                console.log(`[SMPP-CLIENT] 💰 ${supplier.supplier_code}: Supplier #${outbox.supplier_id} billed €${supplierCost} on DLR (${dlrMessageId})`);
-              }
-              
-              // Update composite is_billed flag
-              if ((isClientBilled || clientBilledNow) && (isSupplierBilled || supplierBilledNow || !outbox.supplier_id)) {
-                await this.pool.query(
-                  'UPDATE sms_logs SET is_billed = true WHERE message_id = $1 AND is_billed = false',
-                  [dlrMessageId]
-                ).catch(() => {});
-              }
-            } catch (e) {
-              console.error(`[SMPP-CLIENT] ${supplier.supplier_code}: DLR billing failed for ${dlrMessageId}: ${e.message}`);
             }
           }
 
