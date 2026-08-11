@@ -225,7 +225,14 @@ _sudo -u postgres psql -d sms_platform -c "ALTER DEFAULT PRIVILEGES IN SCHEMA pu
 _sudo -u postgres psql -d sms_platform -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO sms_user;" 2>/dev/null || true
 echo "  PostgreSQL ready"
 
-echo "[3c] Importing database schema (9 migration files)..."
+echo "[3c] Checking PostgreSQL..."
+if ! _sudo systemctl is-active --quiet postgresql; then
+    _sudo systemctl start postgresql
+    sleep 2
+fi
+echo "  PostgreSQL: $(_sudo systemctl is-active postgresql)"
+
+echo "[3d] Importing database schema (11 migration files)..."
 cd "$PROJECT_DIR"
 MIGRATIONS=(
   src/database/schema.sql
@@ -249,33 +256,48 @@ mkdir -p data/uploads/audio data/asterisk 2>/dev/null || true
 _sudo chown -R ubuntu:ubuntu data/ 2>/dev/null || true
 echo "  Schema imported"
 
-echo "[3d] Setting admin password..."
+echo "[3e] Installing Node.js dependencies..."
 cd "$PROJECT_DIR"
-npm install --no-audit --no-fund 2>&1 | tail -1
+npm install --no-audit --no-fund --legacy-peer-deps 2>&1 | tail -3
+echo "  Dependencies installed"
+
+echo "[3f] Setting admin password..."
+cd "$PROJECT_DIR"
 node -e '
-const p = require("'$PROJECT_DIR'/node_modules/pg/lib/index.js");
-const b = require("'$PROJECT_DIR'/node_modules/bcryptjs/index.js");
-const pool = new p.Pool({host:"localhost",database:"sms_platform",user:"sms_user",password:"Ariya@2024Net2App"});
+const { Pool } = require("pg");
+const bcrypt = require("bcryptjs");
+const pool = new Pool({host:"localhost",database:"sms_platform",user:"sms_user",password:"Ariya@2024Net2App"});
 (async()=>{
-  const h = await b.hash("admin123",10);
-  await pool.query("UPDATE users SET password_hash=$1 WHERE username=$2",[h,"admin"]);
-  console.log("  Admin: admin / admin123");
-  await pool.end();
+  try {
+    const h = await bcrypt.hash("admin123",10);
+    await pool.query("UPDATE users SET password_hash=$1 WHERE username=$2",[h,"admin"]);
+    console.log("  ✅ Admin password set: admin / admin123");
+  } catch(e) {
+    console.error("  ⚠ Admin password reset failed:", e.message);
+  } finally {
+    await pool.end();
+  }
 })();
 '
-echo "  Admin password set"
 
-echo "[3e] Building frontend..."
+echo "[3g] Building frontend..."
 cd "$PROJECT_DIR"
-npm run build 2>&1 | tail -2
-echo "  Frontend built: $(ls dist/index.html 2>/dev/null && echo 'OK' || echo 'FAILED')"
+if npm run build 2>&1 | tail -3; then
+  echo "  ✅ Frontend built: $(ls dist/index.html 2>/dev/null && echo 'OK' || echo 'FAILED')"
+else
+  echo "  ❌ Frontend build FAILED — check npm run build output above"
+  echo "  This is non-fatal; you can rebuild manually later."
+fi
 
-echo "[3f] Building Java SMPP Gateway..."
+echo "[3h] Building Java SMPP Gateway..."
 cd "$PROJECT_DIR/java-sms-gateway"
-mvn package -DskipTests 2>&1 | tail -2
-echo "  Gateway built: $(ls target/sms-gateway*.jar 2>/dev/null && echo 'OK' || echo 'FAILED')"
+if mvn package -DskipTests 2>&1 | tail -3; then
+  echo "  ✅ Gateway built: $(ls target/sms-gateway*.jar 2>/dev/null && echo 'OK' || echo 'No JAR found')"
+else
+  echo "  ⚠ Gateway build failed — this is non-fatal if you don't need inbound SMPP"
+fi
 
-echo "[3g] Setting up systemd services..."
+echo "[3i] Setting up systemd services..."
 cd "$PROJECT_DIR"
 
 # Node.js API server
@@ -374,7 +396,7 @@ NGINXEOF
 _sudo ln -sf /etc/nginx/sites-available/net2app-hub /etc/nginx/sites-enabled/
 _sudo rm -f /etc/nginx/sites-enabled/default
 
-echo "[3h] Configuring firewall..."
+echo "[3j] Configuring firewall..."
 _sudo ufw --force reset 2>/dev/null || true
 _sudo ufw default deny incoming
 _sudo ufw default allow outgoing
@@ -388,7 +410,7 @@ _sudo ufw allow 5038/tcp
 _sudo ufw --force enable
 echo "  Firewall configured"
 
-echo "[3i] Starting all services..."
+echo "[3k] Starting all services..."
 _sudo systemctl daemon-reload
 _sudo systemctl enable net2app-hub net2app-smpg 2>/dev/null || true
 _sudo systemctl restart net2app-hub net2app-smpg 2>/dev/null || true
@@ -404,20 +426,41 @@ echo -e "${GREEN}✓ Installation complete${NC}"
 echo -e "${YELLOW}[4/5] Verifying deployment...${NC}"
 sleep 4
 
+PASS=0
+FAIL=0
+
 # Test frontend
 HTTP_CODE=$(ssh_cmd "curl -s -o /dev/null -w '%{http_code}' http://localhost:80/" 2>/dev/null)
 if [ "$HTTP_CODE" = "200" ]; then
-    echo -e "  ${GREEN}✓${NC} Frontend (port 80): HTTP ${HTTP_CODE}"
+    echo -e "  ${GREEN}✓${NC} Frontend: HTTP ${HTTP_CODE}"
+    PASS=$((PASS+1))
 else
-    echo -e "  ${RED}✗${NC} Frontend (port 80): HTTP ${HTTP_CODE}"
+    echo -e "  ${RED}✗${NC} Frontend: HTTP ${HTTP_CODE} (expected 200)"
+    FAIL=$((FAIL+1))
 fi
 
 # Test API login
 LOGIN=$(ssh_cmd "curl -s http://localhost:80/api/auth/login -H 'Content-Type: application/json' -d '{\"username\":\"admin\",\"password\":\"admin123\"}'" 2>/dev/null)
 if echo "$LOGIN" | grep -q '"success":true'; then
-    echo -e "  ${GREEN}✓${NC} API Login: OK"
+    echo -e "  ${GREEN}✓${NC} API Login: admin / admin123"
+    PASS=$((PASS+1))
 else
     echo -e "  ${RED}✗${NC} API Login: FAIL — $LOGIN"
+    FAIL=$((FAIL+1))
+fi
+
+# Test SMS endpoint (lightweight — just verifies route + auth works)
+TOKEN=$(echo "$LOGIN" | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null)
+if [ -n "$TOKEN" ]; then
+    TEST_SMS=$(ssh_cmd "curl -s http://localhost:80/api/sms/test -H 'Content-Type: application/json' -H 'Authorization: Bearer $TOKEN' -d '{\"destination\":\"1234567890\",\"message\":\"DEPLOY_TEST\",\"sender_id\":\"TEST\",\"client_id\":1}'" 2>/dev/null)
+    if echo "$TEST_SMS" | grep -q '"success":true'; then
+        echo -e "  ${GREEN}✓${NC} SMS Test endpoint: OK"
+        PASS=$((PASS+1))
+    else
+        echo -e "  ${YELLOW}⚠${NC} SMS Test: $(echo $TEST_SMS | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('error','?'))" 2>/dev/null || echo '?') (may need routes/rates configured)"
+    fi
+else
+    echo -e "  ${YELLOW}⚠${NC} SMS Test: skipped (no token from login)"
 fi
 
 # Check services
@@ -446,7 +489,11 @@ echo -e "  ${GREEN}✓${NC} DB: $(echo "$DB_COUNTS" | awk -F'\t' '{print "client
 # ============================================================
 echo ""
 echo -e "${CYAN}╔══════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║          🚀  DEPLOYMENT COMPLETE!                ║${NC}"
+if [ "$FAIL" -eq 0 ]; then
+    echo -e "${CYAN}║       ✅  READY TO DEPLOY — All Checks Passed    ║${NC}"
+else
+    echo -e "${CYAN}║       ⚠  DEPLOYED — $FAIL issue(s) to review    ║${NC}"
+fi
 echo -e "${CYAN}╚══════════════════════════════════════════════════╝${NC}"
 echo ""
 echo -e "  ${YELLOW}Frontend:${NC}  http://${SERVER_IP}"
