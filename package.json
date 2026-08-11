@@ -35,6 +35,7 @@
     "smpp": "^0.6.0-rc.4",
     "socks-proxy-agent": "^10.1.0",
     "tailwind-merge": "3.4.0",
+    "telegram": "^2.26.22",
     "uuid": "^14.0.0",
     "ws": "^8.21.1"
   },
