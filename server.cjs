@@ -12,8 +12,10 @@ const bcrypt = require('bcrypt');
 const pg = require('pg');
 const { Pool } = pg;
 const path = require('path');
+const fs = require('fs');
 const multer = require('multer');
 const cookieParser = require('cookie-parser');
+const WebSocket = require('ws');
 
 // Parse PostgreSQL NUMERIC/DECIMAL columns as JavaScript numbers (not strings).
 // OID 1700 = NUMERIC. Without this, all DECIMAL columns (rates, balances,
@@ -208,6 +210,7 @@ let queueManager = null;
 let rateLimiter = null;
 let connectionPoolMgr = null;
 let smppServer = null; // Set by SmppServer import (for Android Gateway DLR push)
+let _wsBroadcast = null; // WebSocket broadcast function (set after server starts)
 
 (async () => {
     try {
@@ -215,6 +218,7 @@ let smppServer = null; // Set by SmppServer import (for Android Gateway DLR push
         rateLimiter = (await import('./src/services/rateLimiter.mjs')).default;
         const SMSQueueManager = (await import('./src/services/smsQueueManager.mjs')).default;
         connectionPoolMgr = (await import('./src/services/connectionPipeline.mjs')).default;
+        connectionPoolMgr.init(pool); // REQUIRED — without this SmppClient has this.pool=null → DLR DB updates fail
 
         queueManager = new SMSQueueManager(pool, {
             pollIntervalMs: 50,          // Aggressive polling for 100+ TPS
@@ -710,7 +714,17 @@ let smppServer = null; // Set by SmppServer import (for Android Gateway DLR push
                     }
                 }
 
-                // WHITELIST: Only push DLR for external client sources.
+                // ⚡ Broadcast ALL DLRs to frontend WebSocket — regardless of source.
+                // Test SMS, campaign, voice OTP, and external clients all need SMS Logs auto-refresh.
+                if (_wsBroadcast) {
+                    _wsBroadcast({
+                        message_id: job.message_id,
+                        status: job.status,
+                        destination: job.destination || '',
+                    });
+                }
+
+                // WHITELIST: Only push DLR for external client sources (webhook + SMPP outbox).
                 // Supplier-originated messages ALWAYS get DLR pushed (they are external SMPP clients).
                 const messageSource = job.source || '';
                 if (entityType === 'client' && !EXTERNAL_DLR_SOURCES.includes(messageSource)) {
@@ -760,6 +774,14 @@ let smppServer = null; // Set by SmppServer import (for Android Gateway DLR push
                     [job.message_id, entityType, entityId, entityType === 'client' ? entityId : null, entityCode, job.destination, job.sender_id, job.status, receipt, job.submit_time || job.queued_at, webhookUrl, webhookSent]
                 );
                 console.error(`[DLR-OUTBOX] 📝 DLR stored: ${job.message_id} → ${job.status} (${entityType}=${entityCode}, source=${messageSource}, webhook=${webhookSent ? 'sent' : 'none'})`);
+                // ⚡ Broadcast DLR update to all connected frontend clients via WebSocket
+                if (_wsBroadcast) {
+                    _wsBroadcast({
+                        message_id: job.message_id,
+                        status: job.status,
+                        destination: job.destination || '',
+                    });
+                }
             } catch (e) {
                 console.error(`[DLR-OUTBOX] ⚠ Failed to store DLR for ${job.message_id}: ${e.message}`);
             }
@@ -790,6 +812,66 @@ let smppServer = null; // Set by SmppServer import (for Android Gateway DLR push
                 });
             }
             console.error('[INIT] SMPP DLR callback wired → real-time sms_logs updates + external client DLR push + unified billing');
+        }
+
+        // Wire OTT device connection callback — when Baileys reports connection='open',
+        // persist session_status='connected' to ott_devices so the frontend shows real status
+        // (survives server restarts since the in-memory Map is ephemeral).
+        try {
+            const ottMgr = await import('./src/services/ottDeviceManager.mjs');
+            if (typeof ottMgr.setDbUpdateCallback === 'function') {
+                ottMgr.setDbUpdateCallback(async (deviceId, status) => {
+                    await pool.query(
+                        `UPDATE ott_devices SET session_status=$1 WHERE id=$2::int`,
+                        [status, deviceId]
+                    );
+                    console.error(`[OTT-DB] 💾 Device ${deviceId}: session_status → '${status}' persisted to DB`);
+                    // When phone unlinks (logged_out), clean auth files so next Pair is fresh
+                    if (status === 'logged_out') {
+                        const authDir = path.join(__dirname, 'ott_sessions', `wa_${deviceId}`);
+                        if (fs.existsSync(authDir)) {
+                            fs.rmSync(authDir, { recursive: true, force: true });
+                            console.error(`[OTT-DB] 🗑️ Cleaned auth files for device ${deviceId} (phone unlinked)`);
+                        }
+                    }
+                });
+                console.error('[INIT] OTT device DB callback wired → Baileys connection status persisted to ott_devices');
+            }
+            
+            // Wire Telegram API credentials from DB → OTT manager
+            if (typeof ottMgr.setTelegramCredentials === 'function') {
+                try {
+                    const tgCreds = await pool.query(
+                        `SELECT key, value FROM platform_settings WHERE key IN ('telegram_api_id','telegram_api_hash')`
+                    );
+                    const creds = {};
+                    for (const row of tgCreds.rows) { creds[row.key] = row.value; }
+                    if (creds.telegram_api_id && creds.telegram_api_hash) {
+                        ottMgr.setTelegramCredentials(
+                            parseInt(creds.telegram_api_id),
+                            creds.telegram_api_hash
+                        );
+                        console.error(`[INIT] Telegram API credentials loaded (api_id=${creds.telegram_api_id})`);
+                    } else {
+                        console.error('[INIT] ⚠️  No Telegram API credentials in platform_settings — using defaults (QRs will NOT scan!)');
+                    }
+                } catch (e) {
+                    console.error('[INIT] Failed to load Telegram credentials from DB:', e.message);
+                }
+            }
+            
+            // Resume session monitors for previously-connected Telegram devices (survive restart)
+            if (typeof ottMgr.resumeConnectedTelegramDevices === 'function') {
+                ottMgr.resumeConnectedTelegramDevices(async (sql, params) => {
+                    return pool.query(sql, params);
+                }).then(() => {
+                    console.error('[INIT] OTT Telegram session monitors resumed');
+                }).catch(e => {
+                    console.error('[INIT] OTT Telegram session resume failed:', e.message);
+                });
+            }
+        } catch (e) {
+            console.error('[INIT] OTT DB callback setup failed:', e.message);
         }
 
         // ======== REAL-TIME DLR PUSHER ========
@@ -1056,8 +1138,23 @@ let smppServer = null; // Set by SmppServer import (for Android Gateway DLR push
                             healthy = true;
 
                         } else if (['rcs', 'ott', 'whatsapp', 'telegram'].includes(connType)) {
-                            // RCS/OTT — active means bound (device sessions handle real connectivity)
-                            healthy = true;
+                            // OTT — check DB for at least one connected device.
+                            // Supplier is only healthy if >= 1 device has session_status='connected'.
+                            try {
+                                const ottDevR = await pool.query(
+                                    `SELECT COUNT(*)::int AS cnt FROM ott_devices
+                                     WHERE supplier_id = $1 AND session_status = 'connected'
+                                       AND (is_deleted IS NULL OR is_deleted = false)`,
+                                    [s.id]
+                                );
+                                healthy = (ottDevR.rows[0]?.cnt || 0) > 0;
+                                if (!healthy) {
+                                    console.error(`[HEALTH] ⚠️ ${s.supplier_code}: No connected OTT devices`);
+                                }
+                            } catch (e) {
+                                // DB error during device check — keep healthy=false, retry next cycle
+                                console.error(`[HEALTH] ⚠️ ${s.supplier_code}: OTT device check failed: ${e.message}`);
+                            }
 
                         } else if (['flash_sms', 'whatsapp_business', 'telegram_business', 'android_SMS'].includes(connType)) {
                             // Flash SMS / WhatsApp Business / Telegram Business / Android SMS — active means bound
@@ -1789,8 +1886,10 @@ let smppServer = null; // Set by SmppServer import (for Android Gateway DLR push
                 for (const log of stale.rows) {
                     try {
                         const timeoutSecs = parseInt(log.timeout_secs) || DEFAULT_TIMEOUT_SECS;
-                        const timeoutLabel = timeoutSecs >= 60
-                            ? `${Math.round(timeoutSecs / 60)}min`
+                        // Exact label: 150s → "150s", 300s → "5min", 120s → "2min".
+                        // (Math.round(150/60)=3 previously mislabeled 150s as "3min".)
+                        const timeoutLabel = timeoutSecs >= 60 && timeoutSecs % 60 === 0
+                            ? `${timeoutSecs / 60}min`
                             : `${timeoutSecs}s`;
                         const doneDate = new Date();
                         const sdf = (d) => d.toISOString().slice(2,16).replace(/[-:T]/g,'');
@@ -1825,7 +1924,7 @@ let smppServer = null; // Set by SmppServer import (for Android Gateway DLR push
             }
         }, 60000);
 
-        console.error('[INIT] Submit timeout reporter started — checks stale inbound messages every 60s, reports EXPIRED after 5min');
+        console.error('[INIT] Submit timeout reporter started — checks stale inbound messages every 60s, reports EXPIRED after each supplier\'s dlr_timeout');
 
         // ======== PENDING DLR TIMEOUT CLEANER (60-MIN) ========
         // After 60 minutes from submission, marks all pending DLRs as UNDELIV/FAILED.
@@ -2711,6 +2810,7 @@ app.post('/api/suppliers', auth, async (req, res) => {
                 dst_sip_address, reconnect_schedule, rate_per_second, audio_codec, capacity,
                 balance, credit_limit, currency, billing_mode,
                 bind_status, consecutive_failures, force_dlr, status, portal_access,
+                dlr_timeout, max_queue_size, force_dlr_timeout, force_dlr_timeout_mode,
                 created_at, updated_at
             ) VALUES (
                 $1,$2,$3,$4,$5,
@@ -2723,6 +2823,7 @@ app.post('/api/suppliers', auth, async (req, res) => {
                 $27,$28,$29,$30,$31,
                 $32,$33,$34,
                 $35,$36,$37,$38,$39,$40,
+                $41,$42,$43,$44,
                 NOW(), NOW()
             ) RETURNING *`,
             [
@@ -2765,7 +2866,11 @@ app.post('/api/suppliers', auth, async (req, res) => {
                 b.consecutive_failures || 0,
                 b.force_dlr !== undefined ? b.force_dlr : false,
                 b.status || 'active',
-                b.portal_access !== undefined ? b.portal_access : false
+                b.portal_access !== undefined ? b.portal_access : false,
+                b.dlr_timeout ?? 150,
+                b.max_queue_size ?? 1000,
+                b.force_dlr_timeout ?? 0,
+                b.force_dlr_timeout_mode || 'fixed'
             ]
         );
         const supplier = result.rows[0];
@@ -4016,8 +4121,8 @@ async function resolveRoute(client, destination) {
                                 || null;
                             if (voice_otp_config_id) dbg(`${debugId}     Voice OTP config ID=${voice_otp_config_id}`);
                             const supRateR = await pool.query(
-                                "SELECT rate FROM rates WHERE entity_type='supplier' AND entity_id=$1 AND (mcc = $2 OR mcc = '*') AND is_active=true ORDER BY CASE WHEN mnc = '*' THEN 0 ELSE 1 END, rate ASC LIMIT 1",
-                                [supplier_id, mcc || null]
+                                "SELECT rate FROM rates WHERE entity_type='supplier' AND entity_id=$1 AND (mcc = $2 OR mcc = '*') AND is_active=true ORDER BY CASE WHEN mnc = $3 THEN 0 WHEN mnc = '*' THEN 1 ELSE 2 END, rate ASC LIMIT 1",
+                                [supplier_id, mcc || null, mnc || null]
                             );
                             if (supRateR.rows.length) {
                                 supplier_rate = parseFloat(supRateR.rows[0].rate);
@@ -4060,8 +4165,8 @@ async function resolveRoute(client, destination) {
             dbg(`${debugId} ✅ Fallback supplier: ${supplier_code} (ID=${supplier_id})`);
             // Query supplier rate for fallback path too
             const supRateR = await pool.query(
-                "SELECT rate FROM rates WHERE entity_type='supplier' AND entity_id=$1 AND (mcc = $2 OR mcc = '*') AND is_active=true ORDER BY rate ASC LIMIT 1",
-                [supplier_id, mcc || null]
+                "SELECT rate FROM rates WHERE entity_type='supplier' AND entity_id=$1 AND (mcc = $2 OR mcc = '*') AND is_active=true ORDER BY CASE WHEN mnc = $3 THEN 0 WHEN mnc = '*' THEN 1 ELSE 2 END, rate ASC LIMIT 1",
+                [supplier_id, mcc || null, mnc || null]
             );
             if (supRateR.rows.length) {
                 supplier_rate = parseFloat(supRateR.rows[0].rate);
@@ -4707,32 +4812,112 @@ app.get('/api/sms/logs/:id', auth, async (req, res) => {
 
 // Send a test SMS
 app.post('/api/sms/test', auth, async (req, res) => {
-    // Forward to the full /api/sms/send pipeline so test messages actually:
-    // 1) pass all 7 validation gates (auth, route, rate, profit, balance),
-    // 2) get enqueued to sms_outbox with connector_transaction_id,
-    // 3) get submitted to the supplier via HTTP/SMPP connector, and
-    // 4) get polled for DLR every 5s (up to 3 min timeout).
+    // UNIVERSAL TEST SMS ENDPOINT — always logs to sms_logs with real status.
+    // Supports: test SMS, curl/HTTP, client SMS, campaign SMS.
     //
-    // Previously this endpoint only INSERT-ed into sms_logs with status='sent'
-    // and never actually called the supplier — zero DLR, zero delivery.
+    // Flow:
+    //  1) If a valid client_id is provided → forward to full /api/sms/send pipeline
+    //     (7-gate: auth, route, rate, profit, balance, enqueue, submit).
+    //     Each gate logs failures to sms_logs with specific error_code.
+    //  2) If no client or client is invalid → log directly to sms_logs with
+    //     a clear failure reason (CLIENT_NOT_FOUND, NO_CLIENTS_CONFIGURED, etc.)
+    //     so it appears in the SMS Logs page.
+    //  3) If client exists but route fails → log with NO_ROUTE / NO_SUPPLIER.
+    //
+    // All results are visible at http://51.178.20.165/sms-logs
     try {
-        const authHeader = req.headers.authorization || '';
-        const response = await fetch(`http://127.0.0.1:${PORT}/api/sms/send`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': authHeader,
-            },
-            body: JSON.stringify({
-                ...req.body,
-                source: 'test_sms',  // tag so sms_logs.source shows test_sms
-                idempotency_key: `TEST_${Date.now()}_${Math.random().toString(36).substr(2, 8)}`,
-            }),
-            signal: AbortSignal.timeout(30000),
+        const { client_id, destination, sender_id, message } = req.body;
+        const dest = destination || '';
+        const sid = sender_id || 'TEST';
+        const msg = message || 'Test message';
+        const msgId = genNumericMsgId('1'); // '1' = internal test prefix
+
+        // If client_id is provided, try the full pipeline
+        if (client_id) {
+            const clientCheck = await pool.query(
+                'SELECT id, client_code, status FROM clients WHERE id = $1 AND (is_deleted IS NULL OR is_deleted = false)',
+                [client_id]
+            );
+            if (clientCheck.rows.length > 0 && clientCheck.rows[0].status === 'active') {
+                // Valid active client — forward to full pipeline
+                // Generate a fresh internal JWT for the forward — avoids "No token provided"
+                // when the user's browser token is near expiry or not sent correctly.
+                const internalToken = jwt.sign({ id: 1, username: 'system', role: 'super_admin' }, JWT_SECRET, { expiresIn: '30s' });
+                const response = await fetch(`http://127.0.0.1:${PORT}/api/sms/send`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${internalToken}`,
+                    },
+                    body: JSON.stringify({
+                        ...req.body,
+                        source: 'test_sms',
+                        idempotency_key: `TEST_${Date.now()}_${Math.random().toString(36).substr(2, 8)}`,
+                    }),
+                    signal: AbortSignal.timeout(30000),
+                });
+                const data = await response.json();
+                return res.status(response.status).json(data);
+            }
+            // Client provided but invalid — log to sms_logs with reason
+            const reason = clientCheck.rows.length === 0
+                ? 'Client not found'
+                : `Client "${clientCheck.rows[0].client_code}" is ${clientCheck.rows[0].status} (not active)`;
+            await pool.query(
+                `INSERT INTO sms_logs (message_id, destination, sender_id, message, status, error_code, error_message, source, submit_time)
+                 VALUES ($1,$2,$3,$4,'failed','CLIENT_NOT_FOUND',$5,'test_sms',NOW())`,
+                [msgId, dest, sid, msg, reason]
+            ).catch(e => console.error('[TEST-SMS] Log insert failed:', e.message));
+            return res.status(400).json({
+                success: false,
+                error: reason,
+                code: 'CLIENT_NOT_FOUND',
+                message_id: msgId,
+                logged: true,
+                hint: 'SMS logged to SMS Logs. Configure an active client + route + rate to send.'
+            });
+        }
+
+        // No client_id provided — check if any active clients exist
+        const activeClients = await pool.query(
+            "SELECT COUNT(*)::int as cnt FROM clients WHERE status='active' AND (is_deleted IS NULL OR is_deleted = false)"
+        );
+        const clientCount = activeClients.rows[0]?.cnt || 0;
+
+        if (clientCount === 0) {
+            // No clients configured at all
+            await pool.query(
+                `INSERT INTO sms_logs (message_id, destination, sender_id, message, status, error_code, error_message, source, submit_time)
+                 VALUES ($1,$2,$3,$4,'failed','NO_CLIENTS_CONFIGURED',$5,'test_sms',NOW())`,
+                [msgId, dest, sid, msg, 'No active clients configured. Add a client in Clients page first.']
+            ).catch(e => console.error('[TEST-SMS] Log insert failed:', e.message));
+            return res.status(400).json({
+                success: false,
+                error: 'No active clients configured',
+                code: 'NO_CLIENTS_CONFIGURED',
+                message_id: msgId,
+                logged: true,
+                hint: 'Add a client in the Clients page, then configure a route + rate. All failures are visible in SMS Logs.'
+            });
+        }
+
+        // Active clients exist but no client_id specified — log with hint
+        await pool.query(
+            `INSERT INTO sms_logs (message_id, destination, sender_id, message, status, error_code, error_message, source, submit_time)
+             VALUES ($1,$2,$3,$4,'failed','NO_CLIENT_SELECTED',$5,'test_sms',NOW())`,
+            [msgId, dest, sid, msg, `${clientCount} active client(s) exist but none selected. Select a client from the Test SMS form.`]
+        ).catch(e => console.error('[TEST-SMS] Log insert failed:', e.message));
+        return res.status(400).json({
+            success: false,
+            error: 'No client selected',
+            code: 'NO_CLIENT_SELECTED',
+            message_id: msgId,
+            logged: true,
+            clients_available: clientCount,
+            hint: `${clientCount} active client(s) available. Select one from the dropdown to test the full SMPP pipeline.`
         });
-        const data = await response.json();
-        res.status(response.status).json(data);
     } catch (e) {
+        console.error('[TEST-SMS] Error:', e.message);
         res.status(500).json({ success: false, error: e.message });
     }
 });
@@ -7097,7 +7282,7 @@ app.put('/api/ott-devices/:id', auth, async (req, res) => {
     try {
         const { id } = req.params;
         const fields = req.body;
-        const allowed = ['device_name','device_type','phone_number','session_status','qr_code','last_active','supplier_id','proxy_config','session_data','pairing_token','proxy_node'];
+        const allowed = ['device_name','device_type','phone_number','session_status','qr_code','last_active','supplier_id','proxy_config','session_data','pairing_token','proxy_node','burst_limit','monthly_limit','monthly_sent','monthly_reset','total_sent','api_id','api_hash'];
         const setParts = []; const values = []; let idx = 1;
         for (const key of allowed) {
             if (fields[key] !== undefined) { setParts.push(`${key} = $${idx++}`); values.push(fields[key]); }
@@ -7146,7 +7331,7 @@ app.put('/api/ott/devices/:id', auth, async (req, res) => {
     try {
         const { id } = req.params;
         const fields = req.body;
-        const allowed = ['device_name','device_type','phone_number','session_status','qr_code','last_active','supplier_id','proxy_config','session_data','pairing_token','proxy_node'];
+        const allowed = ['device_name','device_type','phone_number','session_status','qr_code','last_active','supplier_id','proxy_config','session_data','pairing_token','proxy_node','burst_limit','monthly_limit','monthly_sent','monthly_reset','total_sent','api_id','api_hash'];
         const setParts = []; const values = []; let idx = 1;
         for (const key of allowed) {
             if (fields[key] !== undefined) { setParts.push(`${key} = $${idx++}`); values.push(fields[key]); }
@@ -7208,19 +7393,26 @@ app.get('/api/ott/devices/:id/qr', auth, async (req, res) => {
             }
         }
 
-        // For Telegram, generate pairing token
+        // For Telegram, generate real QR via Python Telethon
         if (device.device_type === 'telegram' && (!pairingToken || device.session_status === 'qr_pending')) {
             try {
                 const ottMgr = await import('./src/services/ottDeviceManager.mjs');
                 const result = await ottMgr.startTelegramPairing(
                     String(device.id),
                     device.phone_number,
-                    device.proxy_node || null
+                    device.proxy_node || null,
+                    device.api_id || null,
+                    device.api_hash || null
                 );
                 pairingToken = result.pairingToken;
+                // Use real QR from Telethon (e.g. tg://login?token=...)
+                if (result.qr && result.qr.startsWith('tg://')) {
+                    qrCode = result.qr;
+                    console.log(`[OTT-QR] ✅ Telegram real QR for device ${id}: ${result.qr.substring(0, 40)}...`);
+                }
                 await pool.query(
-                    `UPDATE ott_devices SET pairing_token=$1, session_status='qr_pending' WHERE id=$2`,
-                    [pairingToken, id]
+                    `UPDATE ott_devices SET pairing_token=$1, qr_code=$2, session_status='qr_pending' WHERE id=$3`,
+                    [pairingToken, qrCode || result.qr, id]
                 );
             } catch (tgErr) {
                 console.error(`[OTT-QR] Telegram pairing failed for device ${id}: ${tgErr.message}`);
@@ -7237,11 +7429,13 @@ app.get('/api/ott/devices/:id/qr', auth, async (req, res) => {
             success: true,
             data: {
                 qr: qrCode,
+                qr_image: device.device_type === 'telegram' ? `/qr/tg_${device.id}.png` : null,
                 pairing_token: pairingToken,
                 device_type: device.device_type,
+                proxy_node: device.proxy_node,
                 instructions: device.device_type === 'whatsapp'
                     ? 'Open WhatsApp on your phone → Settings → Linked Devices → Scan QR code'
-                    : 'Use the pairing token with your Telegram client to authenticate',
+                    : 'Open Telegram on your phone → Settings → Devices → Link Desktop Device → Scan QR code',
             }
         });
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -7260,15 +7454,33 @@ app.post('/api/ott/devices/:id/connect', auth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Disconnect device
+// Disconnect device — stops socket, cleans auth files, updates DB both ends
 app.post('/api/ott/devices/:id/disconnect', auth, async (req, res) => {
     try {
         const { id } = req.params;
+        const ottMgr = await import('./src/services/ottDeviceManager.mjs');
+        
+        // 1. Stop in-memory socket (logs out from WhatsApp/Telegram)
+        await ottMgr.stopDevice(id);
+        
+        // 2. Clean auth session files from disk (forces fresh QR on next Pair)
+        const authDir = path.join(__dirname, 'ott_sessions', `wa_${id}`);
+        if (fs.existsSync(authDir)) {
+            fs.rmSync(authDir, { recursive: true, force: true });
+            console.log(`[OTT] 🗑️ Cleaned auth files for device ${id}: ${authDir}`);
+        }
+        // Also clean Telegram sessions
+        const tgSessionFile = path.join(__dirname, 'ott_sessions', `tg_${id}.session`);
+        if (fs.existsSync(tgSessionFile)) fs.unlinkSync(tgSessionFile);
+        
+        // 3. Update DB to reflect disconnect
         const result = await pool.query(
-            `UPDATE ott_devices SET session_status = 'disconnected' WHERE id = $1 RETURNING *`,
+            `UPDATE ott_devices SET session_status='disconnected', qr_code=NULL, pairing_token=NULL, last_active=NOW() WHERE id=$1 RETURNING *`,
             [id]
         );
         if (result.rows.length === 0) return res.status(404).json({ error: 'OTT device not found' });
+        
+        console.log(`[OTT] 🔌 Device ${id}: Disconnected from GUI — socket stopped, auth cleaned, DB updated`);
         res.json({ success: true, data: result.rows[0], message: 'Device disconnected' });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -7305,13 +7517,45 @@ app.post('/api/ott/proxy/add', auth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Get device connection status (from in-memory registry)
+// Download Tailscale+3proxy setup script
+app.get('/api/ott/proxy/setup-script', auth, (req, res) => {
+    const scriptPath = path.join(__dirname, 'scripts', 'setup-tailscale-3proxy.sh');
+    if (fs.existsSync(scriptPath)) {
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Content-Disposition', 'attachment; filename="setup-tailscale-3proxy.sh"');
+        fs.createReadStream(scriptPath).pipe(res);
+    } else {
+        res.status(404).json({ error: 'Setup script not found' });
+    }
+});
+
+// Remove proxy node
+app.delete('/api/ott/proxy/remove', auth, async (req, res) => {
+    try {
+        const { host } = req.body || {};
+        if (!host) return res.status(400).json({ error: 'host is required' });
+        const ottMgr = await import('./src/services/ottDeviceManager.mjs');
+        const pool = ottMgr.removeProxyNode(host);
+        res.json({ success: true, data: { pool, count: pool.length } });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get device connection status (in-memory + DB fallback)
 app.get('/api/ott/devices/:id/status', auth, async (req, res) => {
     try {
         const { id } = req.params;
         const ottMgr = await import('./src/services/ottDeviceManager.mjs');
-        const status = ottMgr.getDeviceStatus(id);
-        res.json({ success: true, data: status });
+        const liveStatus = ottMgr.getDeviceStatus(id);
+        // Merge with DB state — survive server restarts
+        if (liveStatus.state === 'disconnected' && liveStatus.type === null) {
+            const dbR = await pool.query('SELECT device_type, session_status, phone_number FROM ott_devices WHERE id=$1', [id]);
+            if (dbR.rows.length) {
+                liveStatus.type = dbR.rows[0].device_type;
+                liveStatus.state = dbR.rows[0].session_status;
+                liveStatus.phoneNumber = dbR.rows[0].phone_number;
+            }
+        }
+        res.json({ success: true, data: liveStatus });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -7434,7 +7678,8 @@ app.put('/api/platform-settings', auth, async (req, res) => {
         const allowed = ['platform_name','support_email','company_name','company_address','company_phone',
             'company_email','company_vat','currency','invoice_prefix','payment_prefix',
             'default_tax_rate','force_dlr_default','dlr_timeout_default','auto_block_failures',
-            'max_retry_attempts','voice_otp_retry_interval','voice_otp_max_retries'];
+            'max_retry_attempts','voice_otp_retry_interval','voice_otp_max_retries',
+            'telegram_api_id','telegram_api_hash'];
         for (const key of allowed) {
             if (b[key] !== undefined) {
                 await pool.query(
@@ -7489,6 +7734,47 @@ app.post('/api/channels/send', auth, async (req, res) => {
                     return res.status(400).json({ success: false, error: 'device_id is required for ' + channel, data: msgInsert.rows[0] });
                 }
 
+                // ── OTT DEVICE RATE LIMITING ──
+                // Check BEFORE validation so we don't waste API calls on over-quota devices.
+                // Burst: max {burst_limit} per hour. Monthly: max {monthly_limit} per calendar month.
+                const devLimitR = await pool.query(
+                    `SELECT burst_limit, monthly_limit, monthly_sent, monthly_reset FROM ott_devices WHERE id = $1`,
+                    [device_id]
+                );
+                if (devLimitR.rows.length > 0) {
+                    const lim = devLimitR.rows[0];
+                    const burstLimit = parseInt(lim.burst_limit) || 250;
+                    const monthlyLimit = parseInt(lim.monthly_limit) || 1000;
+                    let monthlySent = parseInt(lim.monthly_sent) || 0;
+                    const now = new Date();
+                    const resetDate = lim.monthly_reset ? new Date(lim.monthly_reset) : null;
+                    if (!resetDate || resetDate.getMonth() !== now.getMonth() || resetDate.getFullYear() !== now.getFullYear()) {
+                        monthlySent = 0;
+                        await pool.query(`UPDATE ott_devices SET monthly_sent=0, monthly_reset=DATE_TRUNC('month',NOW())::DATE WHERE id=$1`, [device_id]);
+                    }
+                    if (monthlySent >= monthlyLimit) {
+                        const m = await pool.query(
+                            `INSERT INTO channel_messages (message_id,channel,destination,message_text,device_id,status,submitted_at,error) VALUES ($1,$2,$3,$4,$5,'failed',NOW(),$6) RETURNING *`,
+                            [messageId, channel, destination, message, device_id, `Monthly limit (${monthlySent}/${monthlyLimit})`]
+                        );
+                        pushChannelDlr(messageId, destination, 'UNDELIV', `Monthly limit: ${monthlySent}/${monthlyLimit}`, 429);
+                        return res.status(429).json({ success: false, error: `Monthly limit reached: ${monthlySent}/${monthlyLimit}`, data: m.rows[0] });
+                    }
+                    const burstR = await pool.query(
+                        `SELECT COUNT(*)::int AS cnt FROM channel_messages WHERE device_id=$1 AND status='delivered' AND submitted_at > NOW()-INTERVAL '1 hour'`,
+                        [device_id]
+                    );
+                    const burstCount = burstR.rows[0]?.cnt || 0;
+                    if (burstCount >= burstLimit) {
+                        const m = await pool.query(
+                            `INSERT INTO channel_messages (message_id,channel,destination,message_text,device_id,status,submitted_at,error) VALUES ($1,$2,$3,$4,$5,'failed',NOW(),$6) RETURNING *`,
+                            [messageId, channel, destination, message, device_id, `Burst limit (${burstCount}/${burstLimit}/hr)`]
+                        );
+                        pushChannelDlr(messageId, destination, 'UNDELIV', `Burst limit: ${burstCount}/${burstLimit}/hr`, 429);
+                        return res.status(429).json({ success: false, error: `Burst limit reached: ${burstCount}/${burstLimit}/hr`, data: m.rows[0] });
+                    }
+                }
+
                 // Validate number via device API before sending
                 let numberValid = true;
                 let validationError = null;
@@ -7535,6 +7821,12 @@ app.post('/api/channels/send', auth, async (req, res) => {
                     } else {
                         sendResult = await ottMgr.sendTelegramMessage(String(device_id), destination, message);
                     }
+                    // Increment device counters
+                    await pool.query(
+                        `UPDATE ott_devices SET monthly_sent = monthly_sent + 1, total_sent = total_sent + 1 WHERE id = $1`,
+                        [device_id]
+                    ).catch(() => {});
+
                     await pool.query(
                         `UPDATE channel_messages SET status = 'delivered', delivered_at = NOW() WHERE message_id = $1`,
                         [messageId]
@@ -8374,6 +8666,7 @@ app.get('/install', (req, res) => {
 });
 
 app.use('/download', express.static('public')); // other downloads
+app.use('/qr', express.static('public/qr'));      // QR code images for OTT device pairing
 app.use((req, res, next) => {
     if (!req.path.startsWith('/api')) {
         res.sendFile(path.join(__dirname, 'dist', 'index.html'));
@@ -8685,6 +8978,170 @@ app.post('/api/gateway/mt-dlr', async (req, res) => {
 });
 
 /**
+ * POST /api/supplier/dlr
+ * Supplier-facing DLR callback — any supplier can POST delivery status.
+ * Auth via x-api-key header (matches supplier.api_key).
+ * Matches DLR against dlr_match_ids in sms_outbox for ANY known ID.
+ *
+ * Body: { message_id: "SMSC_ID", status: "DELIVRD"|"UNDELIV"|... }
+ */
+app.post('/api/supplier/dlr', async (req, res) => {
+    try {
+        const { message_id, status } = req.body;
+        if (!message_id || !status) {
+            return res.status(400).json({ success: false, error: 'message_id and status are required' });
+        }
+
+        // Authenticate via supplier API key
+        const apiKey = req.headers['x-api-key'] || req.query.api_key || '';
+        let supplierId = null, supplierCode = '';
+        if (apiKey) {
+            const supR = await pool.query(
+                'SELECT id, supplier_code FROM suppliers WHERE api_key = $1 AND status = $2 LIMIT 1',
+                [apiKey, 'active']
+            );
+            if (supR.rows.length > 0) {
+                supplierId = supR.rows[0].id;
+                supplierCode = supR.rows[0].supplier_code;
+            }
+        }
+        // If no api_key provided, also try matching by supplier_id in body
+        if (!supplierId && req.body.supplier_id) {
+            const supR = await pool.query(
+                'SELECT id, supplier_code FROM suppliers WHERE id = $1 AND status = $2 LIMIT 1',
+                [parseInt(req.body.supplier_id), 'active']
+            );
+            if (supR.rows.length > 0) {
+                supplierId = supR.rows[0].id;
+                supplierCode = supR.rows[0].supplier_code;
+            }
+        }
+
+        if (!supplierId) {
+            console.error(`[Supplier-DLR] ❌ Unauthenticated DLR attempt for ${message_id} (api_key provided: ${!!apiKey})`);
+            return res.status(401).json({ success: false, error: 'Invalid or missing API key. Provide x-api-key header or valid supplier_id.' });
+        }
+
+        const isDelivered = status === 'DELIVRD';
+        const finalStatus = isDelivered ? 'delivered' : 'failed';
+        const finalDlr = status === 'DELIVRD' ? 'DELIVRD'
+            : (status === 'UNDELIV' ? 'UNDELIV' : (status === 'REJECTD' ? 'REJECTD' : status));
+
+        console.error(`[Supplier-DLR] ← ${supplierCode}: DLR for ${message_id} → ${finalDlr}`);
+
+        // Match against dlr_match_ids — covers our message_id, SMSC's ID, forwarded IDs
+        const outboxR = await pool.query(
+            `UPDATE sms_outbox SET
+               dlr_status = $1,
+               dlr_received_at = NOW(),
+               dlr_confirmed_at = NOW(),
+               status = $2,
+               completed_at = NOW()
+             WHERE $3 = ANY(dlr_match_ids)
+               AND status IN ('submitted', 'dead_letter')
+             RETURNING id, message_id, client_id, client_code, supplier_id, destination,
+                       sender_id, source, queued_at,
+                       client_rate, supplier_rate, message_parts, billing_mode, supplier_billing_mode`,
+            [finalDlr, finalStatus, String(message_id)]
+        );
+
+        // Fallback: match by connector_transaction_id
+        if (outboxR.rows.length === 0) {
+            const fallbackR = await pool.query(
+                `UPDATE sms_outbox SET
+                   dlr_status = $1,
+                   dlr_received_at = NOW(),
+                   dlr_confirmed_at = NOW(),
+                   status = $2,
+                   completed_at = NOW()
+                 WHERE connector_transaction_id = $3
+                   AND status IN ('submitted', 'dead_letter')
+                 RETURNING id, message_id, client_id, client_code, supplier_id, destination,
+                           sender_id, source, queued_at,
+                           client_rate, supplier_rate, message_parts, billing_mode, supplier_billing_mode`,
+                [finalDlr, finalStatus, String(message_id)]
+            );
+            if (fallbackR.rows.length > 0) {
+                outboxR.rows = fallbackR.rows;
+                // Also append to dlr_match_ids for future matching
+                await pool.query(
+                    `UPDATE sms_outbox SET dlr_match_ids = array_append(COALESCE(dlr_match_ids, ARRAY[]::TEXT[]), $1)
+                     WHERE id = $2 AND NOT ($1 = ANY(dlr_match_ids))`,
+                    [String(message_id), fallbackR.rows[0].id]
+                ).catch(() => {});
+            }
+        }
+
+        if (outboxR.rows.length === 0) {
+            console.error(`[Supplier-DLR] ⚠ ${supplierCode}: No outbox match for ${message_id} (not in dlr_match_ids or connector_transaction_id)`);
+            return res.status(404).json({ success: false, error: 'Message not found in outbox', message_id });
+        }
+
+        const outbox = outboxR.rows[0];
+        const ourMsgId = outbox.message_id;
+
+        // Update sms_logs
+        await pool.query(
+            `UPDATE sms_logs SET
+               dlr_status = $1,
+               status = $2,
+               delivery_time = NOW(),
+               dlr_timestamp = NOW()
+             WHERE message_id = $3`,
+            [finalDlr, finalStatus, ourMsgId]
+        );
+
+        // DLR Billing for DELIVRD
+        if (isDelivered) {
+            const clientCost = parseFloat(((parseFloat(outbox.client_rate || 0)) * (parseInt(outbox.message_parts || 1))).toFixed(6));
+            const supplierCost = parseFloat(((parseFloat(outbox.supplier_rate || 0)) * (parseInt(outbox.message_parts || 1))).toFixed(6));
+            const clientBillingMode = outbox.billing_mode || 'dlr';
+            const supplierBillingMode = outbox.supplier_billing_mode || 'dlr';
+            try {
+                await applyBilling({
+                    messageId: ourMsgId,
+                    clientId: outbox.client_id || null,
+                    supplierId: outbox.supplier_id || null,
+                    clientCost, supplierCost,
+                    clientBillingMode, supplierBillingMode,
+                    isSubmit: false,
+                    dlrStatus: 'DELIVRD',
+                    clientForceDlr: false,
+                    supplierForceDlr: false
+                });
+            } catch (e) {
+                console.error(`[Supplier-DLR] Billing failed for ${ourMsgId}: ${e.message}`);
+            }
+        }
+
+        // Push DLR to external SMPP clients
+        if (queueManager && queueManager.onDlr) {
+            queueManager.onDlr({
+                message_id: ourMsgId,
+                client_id: outbox.client_id,
+                client_code: outbox.client_code,
+                destination: outbox.destination,
+                sender_id: outbox.sender_id,
+                status: finalDlr,
+                source: outbox.source || 'smpp',
+                queued_at: outbox.queued_at,
+            }).catch(e => console.error(`[Supplier-DLR] DLR push failed for ${ourMsgId}: ${e.message}`));
+        }
+
+        // WebSocket broadcast to frontend
+        if (_wsBroadcast) {
+            _wsBroadcast({ message_id: ourMsgId, status: finalDlr, destination: outbox.destination || '' });
+        }
+
+        console.error(`[Supplier-DLR] ✅ ${supplierCode}: DLR applied — ${message_id} → ${ourMsgId} = ${finalDlr}`);
+        res.json({ success: true, message_id: ourMsgId, status: finalDlr });
+    } catch (e) {
+        console.error(`[Supplier-DLR] ❌ Error: ${e.message}`);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+/**
  * GET /api/gateway/stats — get gateway device statistics.
  */
 app.get('/api/gateway/stats', async (req, res) => {
@@ -8723,8 +9180,27 @@ app.get('/api/gateway/stats', async (req, res) => {
 
 console.log('[Gateway] Android SMS Gateway API routes registered');
 
-app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`);
+
+    // ======== WEB SOCKET SERVER for real-time frontend updates ========
+    const wss = new WebSocket.Server({ server, path: '/ws/dlr' });
+    const wsClients = new Set();
+    wss.on('connection', (ws) => {
+        wsClients.add(ws);
+        ws.on('close', () => wsClients.delete(ws));
+        ws.on('error', () => wsClients.delete(ws));
+    });
+    // Broadcast helper — sends DLR update to all connected frontend clients
+    const broadcastDlrUpdate = (data) => {
+        const msg = JSON.stringify({ type: 'dlr_update', ...data });
+        for (const ws of wsClients) {
+            try { ws.send(msg); } catch (e) { wsClients.delete(ws); }
+        }
+    };
+    // Store broadcast on a module-level variable so the DLR callback can access it
+    _wsBroadcast = broadcastDlrUpdate;
+    console.error('[WS] WebSocket DLR push server ready on /ws/dlr');
 
     // ── STARTUP SELF-PROBE ──
     // Measures time from process start to first successful HTTP response.

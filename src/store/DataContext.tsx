@@ -176,6 +176,31 @@ export const DataProvider:React.FC<{children:ReactNode}> = ({children}) => {
     }
   }, [isAuthenticated, fetchAll]);
 
+  // OTT Device status auto-refresh — syncs disconnect from phone → GUI in real-time
+  const refreshOTTDevices = useCallback(async () => {
+    try {
+      const res: any = await api.get('/ott-devices');
+      if (res.success && res.data?.data) {
+        setOTTDevices(prev => {
+          const fresh = res.data.data;
+          // Only update if something changed — avoid unnecessary re-renders
+          const changed = fresh.length !== prev.length ||
+            fresh.some((d: OTTDevice) => {
+              const old = prev.find(p => String(p.id) === String(d.id));
+              return !old || old.session_status !== d.session_status;
+            });
+          return changed ? fresh : prev;
+        });
+      }
+    } catch (_) { /* silent — don't spam console on transient errors */ }
+  }, []);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    const interval = setInterval(refreshOTTDevices, 15000); // Every 15 seconds
+    return () => clearInterval(interval);
+  }, [isAuthenticated, refreshOTTDevices]);
+
   // Client CRUD — call API + throw on failure for form error handling
   const addClient=useCallback(async (c:Omit<Client,'id'|'created_at'|'updated_at'>) => {
     const res = await clientsApi.create(c);

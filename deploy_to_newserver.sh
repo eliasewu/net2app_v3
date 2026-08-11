@@ -233,8 +233,10 @@ MIGRATIONS=(
   src/database/migrate_voice_otp_v3.sql
   src/database/migrate_queue.sql
   src/database/migrate_add_blocking_rules.sql
+  src/database/migrate_block_ethiopia.sql
   src/database/migrate_add_voice_otp_config_id.sql
   src/database/migrate_otp_pattern.sql
+  src/database/migrate_dlr_match_ids.sql
   src/database/migrate_translations_v4.sql
   db_migration_add_missing_columns.sql
 )

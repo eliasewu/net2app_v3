@@ -603,11 +603,16 @@ class SMSQueueManager {
 
     if (result && result.success) {
       // Save connector transaction_id for DLR polling (Voice OTP / HTTP connectors)
+      // Also append to dlr_match_ids so DLR matching can find it by any known ID
       if (result.transaction_id) {
+        const txId = String(result.transaction_id);
         await this.pool.query(
-          'UPDATE sms_outbox SET connector_transaction_id = $1 WHERE id = $2',
-          [result.transaction_id, id]
-        );
+          `UPDATE sms_outbox SET 
+             connector_transaction_id = $1,
+             dlr_match_ids = array_append(COALESCE(dlr_match_ids, ARRAY[]::TEXT[]), $2)
+           WHERE id = $3`,
+          [txId, txId, id]
+        ).catch(err => console.error(`[QueueManager] Failed to save tx_id for ${message_id}:`, err.message));
       }
       // Mark as submitted (not delivered — wait for real DLR)
       await this.pool.query(
@@ -653,7 +658,10 @@ class SMSQueueManager {
           billing_mode || 'dlr', supplier_billing_mode || 'dlr',
           isClientBilled, isSupplierBilled, isBilled, smsSource
         ]
-      );
+      ).catch(err => {
+        console.error(`[QueueManager] sms_logs insert failed for ${message_id}:`, err.message);
+        // Don't throw — SMS was submitted successfully. sms_logs can be backfilled later.
+      });
 
       // DLR billing, webhook, and DLR push are deferred to real DLR confirmation
       // (HTTP DLR poll in server.cjs or SMPP DLR handler in smppServer.mjs)
@@ -680,7 +688,7 @@ class SMSQueueManager {
       }
     }
 
-    // 1) Try inbound delivery via SMPP server session first
+    // 1) Try inbound delivery via SMPP server session (auto-skips outbound suppliers)
     if (this.onDeliverToInboundSupplier && job.supplier_id) {
       try {
         const delivered = await this.onDeliverToInboundSupplier(job.supplier_id, job);

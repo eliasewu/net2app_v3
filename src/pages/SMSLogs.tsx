@@ -109,6 +109,42 @@ export const SMSLogs: React.FC = () => {
     return () => clearInterval(interval);
   }, [currentPage, loadLogs]);
 
+  // ⚡ Real-time DLR push via WebSocket — auto-refresh SMS Logs when DLRs arrive
+  useEffect(() => {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/ws/dlr`;
+    let ws;
+    let reconnectTimer;
+    const connect = () => {
+      try {
+        ws = new WebSocket(wsUrl);
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.type === 'dlr_update') {
+              // DLR arrived — refresh the current page immediately
+              loadLogs(currentPage);
+            }
+          } catch (e) { /* ignore malformed messages */ }
+        };
+        ws.onclose = () => {
+          // Reconnect after 5 seconds
+          reconnectTimer = setTimeout(connect, 5000);
+        };
+        ws.onerror = () => {
+          ws?.close();
+        };
+      } catch (e) {
+        reconnectTimer = setTimeout(connect, 5000);
+      }
+    };
+    connect();
+    return () => {
+      clearTimeout(reconnectTimer);
+      if (ws) { ws.onclose = null; ws.close(); }
+    };
+  }, [currentPage, loadLogs]);
+
   const getClientName = (code?: string) => { const c = clients.find(x=>x.client_code===code); return c?.company_name||code||'-'; };
   const getSupplierName = (code?: string) => { const s = suppliers.find(x=>x.supplier_code===code); return s?.company_name||code||'-'; };
   const totalPages = Math.max(1, Math.ceil(smsTotal / itemsPerPage));
@@ -163,6 +199,19 @@ export const SMSLogs: React.FC = () => {
       );
     }
     if (log.status === 'failed') {
+      // DEAD_LETTER with PENDING DLR = submitted successfully, DLR never arrived
+      // This is NOT a rejection — the SMS reached the supplier.
+      if (log.error_code === 'DEAD_LETTER' && log.dlr_status === 'PENDING') {
+        return (
+          <div className="flex items-center gap-1.5">
+            <CheckCircle size={14} className="text-green-500 flex-shrink-0" />
+            <div>
+              <p className="text-xs font-semibold text-green-700">Success</p>
+              <p className="text-[9px] text-amber-500">DLR timeout</p>
+            </div>
+          </div>
+        );
+      }
       // Has dlr_status = WAS submitted, DLR says failed
       if (log.dlr_status && log.dlr_status !== 'PENDING') {
         return (
@@ -175,8 +224,8 @@ export const SMSLogs: React.FC = () => {
           </div>
         );
       }
-      // Has error_code = pre-submit rejection
-      if (log.error_code) {
+      // Has error_code = pre-submit rejection (NO_RATE, NO_SUPPLIER, etc)
+      if (log.error_code && log.error_code !== 'DEAD_LETTER') {
         return (
           <div className="flex items-center gap-1.5">
             <XCircle size={14} className="text-red-500 flex-shrink-0" />
@@ -225,7 +274,7 @@ export const SMSLogs: React.FC = () => {
     // No DLR yet → check if this was a pre-submit rejection
     if (!dlr || dlr === 'PENDING') {
       // Pre-submit rejection: any failed/rejected message without delivery confirmation
-      if (log.status === 'failed' || log.status === 'rejected') {
+      if ((log.status === 'failed' || log.status === 'rejected') && log.error_code && log.error_code !== 'DEAD_LETTER') {
         return (
           <div className="flex items-center gap-1.5">
             <XCircle size={14} className="text-red-500 flex-shrink-0" />
@@ -307,6 +356,16 @@ export const SMSLogs: React.FC = () => {
     return <span className="text-xs text-gray-500">{dlr}</span>;
   };
 
+  // Non-sequential short reference for the # column.
+  // The raw DB id is a sequential counter (1, 2, 3…) which leaks volume info.
+  // Derive a stable, non-predictable token from the message_id instead.
+  const nonSeqRef = (log: ExtendedLog): string => {
+    const s = String(log.message_id || log.id || '');
+    let h = 0;
+    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+    return h.toString(36).toUpperCase().padStart(6, '0').slice(-6);
+  };
+
   const getSourceB = (source: string) => {
     const s = (source || '').toLowerCase();
     if (s.startsWith('smpp')) return <Badge variant="info" size="sm"><Radio size={12} className="mr-1"/>SMPP</Badge>;
@@ -323,7 +382,7 @@ export const SMSLogs: React.FC = () => {
   };
 
   const columns = [
-    { key:'id', header:'#', render:(log:ExtendedLog) => <span className="font-mono text-xs text-gray-400">{log.id}</span> },
+    { key:'id', header:'#', render:(log:ExtendedLog) => <span className="font-mono text-xs text-gray-400">{nonSeqRef(log)}</span> },
     { key:'source', header:'Type', render:(log:ExtendedLog) => getSourceB(log.source) },
     { key:'message_id', header:'ID', hideOnMobile:true, render:(log:ExtendedLog) => <span className="font-mono text-[10px] bg-gray-100 px-1.5 py-0.5 rounded">{(log.message_id||'').slice(-12)}</span> },
     { key:'client', header:'Client', render:(log:ExtendedLog) => <div><p className="text-xs font-medium">{getClientName(log.client_code)}</p><p className="text-[10px] text-gray-400">{log.client_code || '-'}</p></div> },
@@ -385,7 +444,8 @@ export const SMSLogs: React.FC = () => {
         return <Badge variant="success" size="sm">Billed</Badge>;
       }
       if (log.client_rate && log.client_rate > 0 && !log.is_billed) {
-        return <Badge variant="warning" size="sm">Pending</Badge>;
+        const reason = log.error_code === 'DEAD_LETTER' ? 'DLR Timeout' : 'Pending';
+        return <Badge variant="warning" size="sm">{reason}</Badge>;
       }
       return <span className="text-xs text-gray-400">—</span>;
     } },
@@ -431,7 +491,7 @@ export const SMSLogs: React.FC = () => {
 
   const total = smsTotal;
   const delivered = smsLogEntries.filter(l => l.status==='delivered'||l.status==='completed').length;
-  const sent = smsLogEntries.filter(l => l.status==='submitted'||l.status==='pending'||l.status==='sent'||(l.status==='failed' && l.dlr_status && l.dlr_status!=='PENDING')).length;
+  const sent = smsLogEntries.filter(l => l.status==='submitted'||l.status==='pending'||l.status==='sent'||(l.status==='failed' && l.dlr_status && l.dlr_status!=='PENDING')||(l.status==='failed' && l.error_code==='DEAD_LETTER')).length;
   const rejected = smsLogEntries.filter(l => (l.status==='failed' && l.error_code && !l.dlr_status) || l.status==='rejected').length;
 
   return (<div className="space-y-6">

@@ -70,14 +70,13 @@ class ApiClient {
       const data = normalizeNumericIds(raw);
 
       if (!response.ok) {
-        // Auto-redirect to login on 401 (expired session)
+        // On 401 (expired session): clear auth token so AuthContext detects logout.
+        // Do NOT redirect to /login — that triggers a double-redirect:
+        //   /login → PublicRoute sees authenticated → / (dashboard)
+        // Instead, clear the token and return the error. The ProtectedRoute
+        // wrapper will naturally redirect to login on the next navigation.
         if (response.status === 401 && !window.location.pathname.includes('/login')) {
-          // Clear auth token from localStorage so AuthContext detects logout.
-          // Otherwise PublicRoute immediately redirects back to dashboard,
-          // making the user see dashboard instead of the login page.
           localStorage.removeItem('auth_token');
-          window.location.href = '/login';
-          throw new Error('Session expired — redirecting to login');
         }
         throw new Error(data.error || 'Request failed');
       }

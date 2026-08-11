@@ -138,21 +138,51 @@ class SmppClient {
       });
 
       // Handle incoming deliver_sm (DLR from SMSC)
-      this.session.on('deliver_sm', async (pdu, pduCallback) => {
-        pduCallback(); // ACK the PDU immediately
+      this.session.on('deliver_sm', async (pdu) => {
+        // ACK the PDU immediately — handle both smpp library API versions:
+        // - Older: pduCallback passed as 2nd arg (may be undefined)
+        // - Newer: pdu.response() method sends deliver_sm_resp
+        try {
+          if (typeof pdu.response === 'function') {
+            pdu.response();
+          }
+        } catch (_) { /* best-effort ACK */ }
         const source = pdu.source_addr ? pdu.source_addr.toString() : '';
 
-        // Parse short_message — can be Buffer, string, or object (depending on smpp library version)
+        // Parse short_message — smpp library v0.6 returns it in various shapes:
+        // - string (plain text receipt)
+        // - Buffer (binary data)
+        // - object { message: Buffer|string, ... } (nested)
+        // - Uint8Array (not caught by Buffer.isBuffer)
         let rawMessage = '';
-        if (pdu.short_message) {
-          if (Buffer.isBuffer(pdu.short_message)) {
-            rawMessage = pdu.short_message.toString('utf8');
-          } else if (typeof pdu.short_message === 'object') {
-            rawMessage = pdu.short_message.message || pdu.short_message.short_message || JSON.stringify(pdu.short_message);
+        const sm = pdu.short_message;
+        if (sm) {
+          if (Buffer.isBuffer(sm)) {
+            rawMessage = sm.toString('utf8');
+          } else if (sm instanceof Uint8Array) {
+            rawMessage = Buffer.from(sm).toString('utf8');
+          } else if (typeof sm === 'string') {
+            rawMessage = sm;
+          } else if (typeof sm === 'object') {
+            // Could be { message: Buffer|string, ... }
+            const inner = sm.message || sm.short_message || sm.text;
+            if (inner) {
+              if (Buffer.isBuffer(inner)) {
+                rawMessage = inner.toString('utf8');
+              } else if (inner instanceof Uint8Array) {
+                rawMessage = Buffer.from(inner).toString('utf8');
+              } else {
+                rawMessage = String(inner);
+              }
+            } else {
+              rawMessage = JSON.stringify(sm);
+            }
           } else {
-            rawMessage = String(pdu.short_message);
+            rawMessage = String(sm);
           }
         }
+        // Final safety: ensure rawMessage is always a string
+        if (typeof rawMessage !== 'string') rawMessage = String(rawMessage);
 
         console.log(`[SMPP-CLIENT] ${supplier.supplier_code}: DLR from ${source}: ${rawMessage.substring(0, 200)}`);
 
@@ -180,75 +210,142 @@ class SmppClient {
         console.log(`[SMPP-CLIENT] ${supplier.supplier_code}: DLR parsed — ${dlrMessageId} → stat=${finalDlr} err=${dlrError} delivered=${isDelivered}`);
 
         try {
-          // Update sms_outbox
-          const outboxR = await this.pool.query(
+          // Update sms_outbox — use dlr_match_ids to match against ANY known ID.
+          // This array stores: our message_id, SMSC's connector_transaction_id,
+          // and any gateway-forwarded IDs (e.g. GWT...). A single query covers all.
+          let outboxR = await this.pool.query(
             `UPDATE sms_outbox SET
                dlr_status = $1,
                dlr_received_at = NOW(),
                dlr_confirmed_at = NOW(),
                status = $2,
                completed_at = NOW()
-             WHERE message_id = $3
-             RETURNING id, client_id, client_code, supplier_id, destination, sender_id, source, queued_at,
+             WHERE $3 = ANY(dlr_match_ids)
+             RETURNING id, message_id, client_id, client_code, supplier_id, destination, sender_id, source, queued_at,
                        client_rate, supplier_rate, message_parts, billing_mode, supplier_billing_mode`,
             [finalDlr, finalStatus, dlrMessageId]
           );
 
-          // Update sms_logs
-          await this.pool.query(
-            `UPDATE sms_logs SET
-               dlr_status = $1,
-               status = $2,
-               delivery_time = NOW(),
-               dlr_timestamp = NOW(),
-               error_code = CASE WHEN $4 != '000' THEN $4 ELSE error_code END
-             WHERE message_id = $3`,
-            [finalDlr, finalStatus, dlrMessageId, dlrError]
-          );
-
-          // DLR BILLING: delegate to unified applyBilling() via callback.
-          // Uses atomic claim-first pattern with credit mode support and
-          // rollback — avoids the direct SQL billing that was here before.
-          if (isDelivered && outboxR.rows.length > 0) {
-            const outbox = outboxR.rows[0];
-            const clientCost = parseFloat(((parseFloat(outbox.client_rate || 0)) * (parseInt(outbox.message_parts || 1))).toFixed(6));
-            const supplierCost = parseFloat(((parseFloat(outbox.supplier_rate || 0)) * (parseInt(outbox.message_parts || 1))).toFixed(6));
-            const clientBillingMode = outbox.billing_mode || 'dlr';
-            const supplierBillingMode = outbox.supplier_billing_mode || 'dlr';
-            if (this.onDlrBilling) {
-              try {
-                await this.onDlrBilling({
-                  messageId: dlrMessageId,
-                  clientId: outbox.client_id || null,
-                  supplierId: outbox.supplier_id || null,
-                  clientCost, supplierCost,
-                  clientBillingMode, supplierBillingMode,
-                  isSubmit: false,
-                  dlrStatus: 'DELIVRD',
-                  clientForceDlr: false,
-                  supplierForceDlr: false
-                });
-              } catch (e) {
-                console.error(`[SMPP-CLIENT] ${supplier.supplier_code}: DLR billing callback failed for ${dlrMessageId}: ${e.message}`);
+          // Fallback: chain-forwarded gateways assign NEW IDs not in dlr_match_ids.
+          // Try extracting all IDs from the receipt text and match against dlr_match_ids.
+          if (outboxR.rows.length === 0) {
+            const allIds = [...rawMessage.matchAll(/\b([A-Za-z0-9_-]{10,40})\b/g)].map(m => m[1]);
+            const uniqueIds = [...new Set(allIds)].filter(id => id !== dlrMessageId);
+            if (uniqueIds.length > 0) {
+              console.log(`[SMPP-CLIENT] ${supplier.supplier_code}: DLR forwarded-ID detection — found ${uniqueIds.length} extra IDs, trying ANY(dlr_match_ids)...`);
+              for (const altId of uniqueIds) {
+                outboxR = await this.pool.query(
+                  `UPDATE sms_outbox SET
+                     dlr_status = $1,
+                     dlr_received_at = NOW(),
+                     dlr_confirmed_at = NOW(),
+                     status = $2,
+                     completed_at = NOW()
+                   WHERE $3 = ANY(dlr_match_ids)
+                   RETURNING id, message_id, client_id, client_code, supplier_id, destination, sender_id, source, queued_at,
+                             client_rate, supplier_rate, message_parts, billing_mode, supplier_billing_mode`,
+                  [finalDlr, finalStatus, altId]
+                );
+                if (outboxR.rows.length > 0) {
+                  console.log(`[SMPP-CLIENT] ${supplier.supplier_code}: ✅ DLR matched via forwarded-ID "${altId}" in dlr_match_ids`);
+                  // Append the DLR's primary ID to dlr_match_ids so future DLRs match directly
+                  await this.pool.query(
+                    `UPDATE sms_outbox SET dlr_match_ids = array_append(dlr_match_ids, $1)
+                     WHERE id = $2 AND NOT ($1 = ANY(dlr_match_ids))`,
+                    [dlrMessageId, outboxR.rows[0].id]
+                  ).catch(() => {});
+                  break;
+                }
+              }
+            }
+            // Last resort: match by supplier + destination within 10 minute window
+            if (outboxR.rows.length === 0) {
+              console.log(`[SMPP-CLIENT] ${supplier.supplier_code}: DLR no ID match in dlr_match_ids — trying destination+time window for supplier #${supplier.id}...`);
+              outboxR = await this.pool.query(
+                `UPDATE sms_outbox SET
+                   dlr_status = $1,
+                   dlr_received_at = NOW(),
+                   dlr_confirmed_at = NOW(),
+                   status = $2,
+                   completed_at = NOW()
+                 WHERE supplier_id = $3
+                   AND status = 'submitted'
+                   AND queued_at > NOW() - INTERVAL '10 minutes'
+                   AND id = (SELECT id FROM sms_outbox WHERE supplier_id = $3 AND status = 'submitted' AND queued_at > NOW() - INTERVAL '10 minutes' ORDER BY queued_at DESC LIMIT 1)
+                 RETURNING id, message_id, client_id, client_code, supplier_id, destination, sender_id, source, queued_at,
+                           client_rate, supplier_rate, message_parts, billing_mode, supplier_billing_mode`,
+                [finalDlr, finalStatus, supplier.id]
+              );
+              if (outboxR.rows.length > 0) {
+                console.log(`[SMPP-CLIENT] ${supplier.supplier_code}: ⚠ DLR matched via time window (no ID match) → dest=${outboxR.rows[0].destination}`);
+                // Append the new DLR ID so future DLRs match directly
+                await this.pool.query(
+                  `UPDATE sms_outbox SET dlr_match_ids = array_append(dlr_match_ids, $1)
+                   WHERE id = $2 AND NOT ($1 = ANY(dlr_match_ids))`,
+                  [dlrMessageId, outboxR.rows[0].id]
+                ).catch(() => {});
               }
             }
           }
 
-          // Notify DLR callback (forward to QueueManager for external client push)
-          if (this.onDlr && outboxR.rows.length > 0) {
-            const job = outboxR.rows[0];
-            try {
-              this.onDlr({
-                message_id: dlrMessageId,
-                client_id: job.client_id,
-                client_code: job.client_code,
-                destination: job.destination,
-                sender_id: job.sender_id,
-                status: finalDlr,
-                source: job.source || 'smpp',
-                queued_at: job.queued_at,
-              });
-            } catch (e) { /* non-critical */ }
+          // Update sms_logs + billing + callback using the matched outbox row
+          if (outboxR.rows.length > 0) {
+            const matchedMsgId = outboxR.rows[0].message_id || dlrMessageId;
+            await this.pool.query(
+              `UPDATE sms_logs SET
+                 dlr_status = $1,
+                 status = $2,
+                 delivery_time = NOW(),
+                 dlr_timestamp = NOW(),
+                 error_code = CASE WHEN $4 != '000' THEN $4 ELSE error_code END
+               WHERE message_id = $3`,
+              [finalDlr, finalStatus, matchedMsgId, dlrError]
+            );
+
+            // DLR BILLING: delegate to unified applyBilling() via callback.
+            if (isDelivered) {
+              const outbox = outboxR.rows[0];
+              const clientCost = parseFloat(((parseFloat(outbox.client_rate || 0)) * (parseInt(outbox.message_parts || 1))).toFixed(6));
+              const supplierCost = parseFloat(((parseFloat(outbox.supplier_rate || 0)) * (parseInt(outbox.message_parts || 1))).toFixed(6));
+              const clientBillingMode = outbox.billing_mode || 'dlr';
+              const supplierBillingMode = outbox.supplier_billing_mode || 'dlr';
+              if (this.onDlrBilling) {
+                try {
+                  await this.onDlrBilling({
+                    messageId: matchedMsgId,
+                    clientId: outbox.client_id || null,
+                    supplierId: outbox.supplier_id || null,
+                    clientCost, supplierCost,
+                    clientBillingMode, supplierBillingMode,
+                    isSubmit: false,
+                    dlrStatus: 'DELIVRD',
+                    clientForceDlr: false,
+                    supplierForceDlr: false
+                  });
+                } catch (e) {
+                  console.error(`[SMPP-CLIENT] ${supplier.supplier_code}: DLR billing callback failed for ${dlrMessageId}: ${e.message}`);
+                }
+              }
+            }
+
+            // Notify DLR callback (forward to QueueManager for external client push)
+            if (this.onDlr) {
+              const job = outboxR.rows[0];
+              try {
+                this.onDlr({
+                  message_id: matchedMsgId,
+                  client_id: job.client_id,
+                  client_code: job.client_code,
+                  destination: job.destination,
+                  sender_id: job.sender_id,
+                  status: finalDlr,
+                  source: job.source || 'smpp',
+                  queued_at: job.queued_at,
+                });
+              } catch (e) { /* non-critical */ }
+            }
+          } else {
+            console.warn(`[SMPP-CLIENT] ${supplier.supplier_code}: DLR id "${dlrMessageId}" not found in outbox (not in any dlr_match_ids)`);
           }
 
           console.log(`[SMPP-CLIENT] ${supplier.supplier_code}: DLR processed ✓ — ${dlrMessageId} → sms_outbox=${finalStatus}, sms_logs=${finalDlr}`);
@@ -294,8 +391,14 @@ class SmppClient {
         data_coding: getDataCoding(job.message),
       }, (pdu) => {
         if (pdu.command_status === 0) {
-          resolve({ success: true, message_id: pdu.message_id });
+          // pdu.message_id may be a Buffer — convert to string for DB storage
+          const smscId = typeof pdu.message_id === 'string' ? pdu.message_id :
+                         Buffer.isBuffer(pdu.message_id) ? pdu.message_id.toString('utf8').replace(/\0/g, '') :
+                         String(pdu.message_id || '');
+          console.log(`[SMPP-CLIENT] ${this.supplier.supplier_code}: submit_sm OK — our_id=${job.message_id || '?'} smsc_id=${smscId || '?'}`);
+          resolve({ success: true, transaction_id: smscId, message_id: smscId });
         } else {
+          console.error(`[SMPP-CLIENT] ${this.supplier.supplier_code}: submit_sm FAILED — our_id=${job.message_id || '?'} status=${pdu.command_status}`);
           reject(new Error(`submit_sm failed (status ${pdu.command_status})`));
         }
       });

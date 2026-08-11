@@ -288,6 +288,8 @@ export const TestSMS: React.FC = () => {
         } : r));
         setValidationLog(prev => [...prev, `[Send] ✅ Sent! Message ID: ${msgId} | Latency: ${latency}ms`]);
 
+        // Stay on this page — user can click "View in SMS Logs" to check results
+
         // Poll for DLR status via the sms_logs entry
         setTimeout(async () => {
           try {
