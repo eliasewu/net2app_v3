@@ -1,0 +1,6 @@
+name,target_value,is_otp_extract,otp_length_min,otp_length_max,priority,is_active,apply_to,apply_entity_id
+OTP Template 1,Your OTP code is {{OTP}}. Valid for 5 minutes.,true,4,8,1,true,both,all
+OTP Template 2,Verification code: {{OTP}}. Do not share this with anyone.,true,4,8,2,true,both,all
+OTP Template 3,{{OTP}} is your login code. Valid for 10 minutes.,true,6,6,3,true,both,all
+OTP Template 4,Use {{OTP}} to complete your transaction. Thank you.,true,4,8,4,true,client,1
+Promo Template 1,Flash Sale! 50% off today only. Shop now!,false,4,8,5,true,both,all

@@ -1,0 +1,5 @@
+name,strip_prefix_digits,add_prefix_text,priority,is_active,apply_to,apply_entity_id
+BD Strip 00880,2,,1,true,both,all
+BD Add 77,0,77,2,true,both,all
+MY Strip +60,3,,3,true,both,all
+IN Add +91,0,+91,4,true,client,1

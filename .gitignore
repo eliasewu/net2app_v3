@@ -1,0 +1,23 @@
+node_modules/
+dist/
+.env
+*.log
+.DS_Store
+*.sqlite
+*.backup
+*.tar.gz
+server.log
+
+# Runtime and generated deployment state
+java-sms-gateway/target/
+ot_sessions/
+ott_sessions/
+public/qr/
+*.session
+*.session.txt
+*.keystore
+*.apk
+*.idsig
+server.cjs.bak*
+server.cjs.backup*
+server.*.bak

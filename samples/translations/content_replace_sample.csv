@@ -1,0 +1,5 @@
+name,match_content,replace_content,is_otp_extract,otp_length_min,otp_length_max,priority,is_active,apply_to,apply_entity_id
+OTP Forward,your code is,Your OTP: {{OTP}},true,4,8,1,true,both,all
+OTP 6-digit,verification code,Code: {{OTP}},true,6,6,2,true,both,all
+Brand Replace,OriginalBrand,NewBrand,false,4,8,3,true,both,all
+URL Replace,http://old.example.com,https://new.example.com,false,4,8,4,true,client,1

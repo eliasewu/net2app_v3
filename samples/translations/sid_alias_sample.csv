@@ -1,0 +1,4 @@
+name,source_pattern,target_value,sid_match_type,priority,is_active,apply_to,apply_entity_id
+Mask TC*,TECHCORP*,TC-MSG,wildcard,1,true,both,all
+Replace SENDER*,SENDER*,NEWSENDER,wildcard,2,true,both,all
+Wildcard *,*,DEFAULT,wildcard,99,true,both,all

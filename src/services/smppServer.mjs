@@ -1,0 +1,722 @@
+import smpp from 'smpp';
+import dotenv from 'dotenv';
+import pg from 'pg';
+dotenv.config();
+
+const { Pool } = pg;
+
+// ── Pure numeric message ID generator (mirrors genNumericMsgId in server.cjs) ──
+// Prefixes: '3'=MO/GSM inbound, '4'=SMPP server direct
+// Format: PREFIX + timestamp(ms) + 5-digit random → ~19-digit pure numeric ID
+const genNumericMsgId = (prefix) => `${prefix}${Date.now()}${String(Math.floor(Math.random() * 100000)).padStart(5, '0')}`;
+
+// Detects Unicode (non-GSM7) → returns SMPP data_coding: 0=GSM7, 8=UCS2
+const getDataCoding = (message) => {
+    if (!message) return 0;
+    const GSM7 = new Set('@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞ\x1BÆæßÉ !"#¤%&\'()*+,-./0123456789:;<=>?¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà\f^{}\\[~]|€');
+    for (const ch of message) { if (!GSM7.has(ch)) return 8; }
+    return 0;
+};
+
+// ── SMS Message Parts Calculator (mirrors server.cjs) ──
+const calculateMessageParts = (message) => {
+    if (!message) return 1;
+    const GSM7_CHARS = new Set([
+        '@','£','$','¥','è','é','ù','ì','ò','Ç','\n','Ø','ø','\r','Å','å',
+        'Δ','_','Φ','Γ','Λ','Ω','Π','Ψ','Σ','Θ','Ξ','\x1B','Æ','æ','ß','É',
+        ' ','!','"','#','¤','%','&','\'','(',')','*','+',',','-','.','/',
+        '0','1','2','3','4','5','6','7','8','9',':',';','<','=','>','?',
+        '¡','A','B','C','D','E','F','G','H','I','J','K','L','M','N','O',
+        'P','Q','R','S','T','U','V','W','X','Y','Z','Ä','Ö','Ñ','Ü','§',
+        '¿','a','b','c','d','e','f','g','h','i','j','k','l','m','n','o',
+        'p','q','r','s','t','u','v','w','x','y','z','ä','ö','ñ','ü','à',
+        '\f','^','{','}','\\','[','~',']','|','€',
+    ]);
+    let isGSM7 = true;
+    for (let i = 0; i < message.length; i++) {
+        if (!GSM7_CHARS.has(message[i])) { isGSM7 = false; break; }
+    }
+    if (isGSM7) {
+        if (message.length <= 160) return 1;
+        return Math.ceil(message.length / 153);
+    }
+    if (message.length <= 70) return 1;
+    return Math.ceil(message.length / 67);
+};
+
+// Server-supported SMPP versions (highest to lowest)
+const SUPPORTED_VERSIONS = [0x50, 0x34, 0x33]; // 5.0, 3.4, 3.3
+
+/**
+ * Negotiate SMPP interface version: pick the highest version the server
+ * supports that is ≤ the client's requested version.
+ */
+function negotiateVersion(clientVersion) {
+  const req = clientVersion || 0x34;
+  for (const sv of SUPPORTED_VERSIONS) {
+    if (req >= sv) return sv;
+  }
+  return 0x33; // fallback: lowest supported
+}
+
+/**
+ * Build a DLR receipt string (SMPP short_message format).
+ * Format: "id:{msgId} sub:001 dlvrd:001 submit date:{submit} done date:{done} stat:{stat} err:{err} text:{text}"
+ */
+function buildDlrReceipt(msgId, status, submitDate = null, errorCode = '000') {
+  const now = new Date();
+  const fmt = (d) => {
+    const y = d.getFullYear();
+    const mo = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    const h = String(d.getHours()).padStart(2, '0');
+    const mi = String(d.getMinutes()).padStart(2, '0');
+    return `${y}${mo}${day}${h}${mi}`;
+  };
+  const subDate = submitDate ? fmt(new Date(submitDate)) : fmt(now);
+  const doneDate = fmt(now);
+  const stat = status === 'DELIVRD' ? 'DELIVRD' : 'UNDELIV';
+  const text = status === 'DELIVRD' ? '000' : 'Delivery failed';
+  return `id:${msgId} sub:001 dlvrd:001 submit date:${subDate} done date:${doneDate} stat:${stat} err:${errorCode} text:${text}`;
+}
+
+/**
+ * SMPP Server — accepts ESME connections from external clients on port 2775.
+ *
+ * FEATURES:
+ * - Auto-negotiates SMPP versions v3.3 (0x33), v3.4 (0x34), v5.0 (0x50)
+ * - Accepts bind_transmitter, bind_receiver, bind_transceiver
+ * - Global session registry for DLR delivery (deliver_sm back to clients)
+ * - submit_sm routes through the production queue (smsQueueManager)
+ * - Rate limiting via token bucket (rateLimiter)
+ * - Full bind/unbind/disconnect database sync to smpp_sessions + bind_history
+ *
+ * NOTE: smpp 0.6.x server events receive only the PDU object (no callback).
+ * pdu.response() CREATES the response PDU but does NOT send it.
+ * Must call session.send(pdu.response({...})) to transmit the response.
+ *
+ * @param {object} pgPool     — External pg Pool
+ * @param {object} queueMgr   — SMSQueueManager instance (optional, for pipeline)
+ * @param {object} rateLimit  — RateLimiter instance (optional, for TPS check)
+ */
+export default class SmppServer {
+  constructor(pgPool, queueMgr = null, rateLimit = null, resolveRouteFn = null, onDlrBilling = null) {
+    if (pgPool) {
+      this.pool = pgPool;
+    } else {
+      this.pool = new Pool({
+        host: process.env.DB_HOST || 'localhost',
+        port: process.env.DB_PORT || 5432,
+        database: process.env.DB_NAME || 'sms_platform',
+        user: process.env.DB_USER || 'sms_user',
+        password: process.env.DB_PASS || '',
+        max: 5,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 5000,
+      });
+    }
+    this.queueManager = queueMgr;
+    this.rateLimiter = rateLimit;
+    this.resolveRoute = resolveRouteFn;
+    this.onDlrBilling = onDlrBilling;
+
+    /** Global session registry: "entityType_entityId" → { session, remoteAddr, systemId, bindType } */
+    this.sessions = new Map();
+  }
+
+  _sessionKey(entityType, entityId) {
+    return `${entityType}_${entityId}`;
+  }
+
+  start() {
+    const db = this.pool;
+    const server = smpp.createServer({ port: 2775, host: '0.0.0.0', auto_enquire_link_period: 30000 });
+
+    server.on('session', (session) => {
+      const remoteAddr = session.socket.remoteAddress;
+      let boundEntity = null;   // { entityType, entityId, entityCode, systemId, bindType }
+      let disconnected = false;
+
+      console.log(`[SMPP] New connection from: ${remoteAddr}`);
+
+      // Manual enquire_link keepalive — auto_enquire_link_period on createServer
+      // does NOT propagate to sessions (smpp 0.6.x only passes socket/tls/debug).
+      // We start our own 15s interval to keep NAT/firewall bindings alive.
+      const enquireTimer = setInterval(() => {
+        try { session.enquire_link(() => {}); } catch (e) { /* ignore */ }
+      }, 15000);
+
+      // ====== BIND HANDLER (shared across bind_transceiver/transmitter/receiver) ======
+      // NOTE: smpp 0.6.x passes only (pdu), responses via pdu.response()
+      const handleBind = async (pdu, bindType) => {
+        const systemId = pdu.system_id;
+        const password = pdu.password || '';
+        const negotiated = negotiateVersion(pdu.interface_version);
+        console.log(`[SMPP] ${bindType} request: ${systemId} (req=v${(pdu.interface_version || 0x34).toString(16)}, neg=v${negotiated.toString(16)})`);
+
+        // 1) Try inbound suppliers FIRST — GSM gateways without public IPs
+        //    register with server IP:port and authenticate as SUPPLIERS (SMSC mode).
+        //    This ensures bind_status updates correctly and the gateway appears
+        //    in the SMSC section of the BindStatus page.
+        const supplierR = await db.query(
+          `SELECT id, supplier_code, smpp_password, status
+           FROM suppliers
+           WHERE smpp_username = $1 AND is_inbound = true AND status = 'active'
+             AND (is_deleted IS NULL OR is_deleted = false)`,
+          [systemId]
+        );
+
+        if (supplierR.rows.length && supplierR.rows[0].smpp_password === password) {
+          const s = supplierR.rows[0];
+          try {
+            await this._markBound(db, 'supplier', s.id, systemId, remoteAddr, negotiated, bindType);
+          } catch (e) {
+            console.error(`[SMPP] ❌ Supplier ${systemId}: DB sync failed: ${e.message}`);
+            session.send(pdu.response({ command_status: 0x0000000B })); return;
+          }
+          boundEntity = { entityType: 'supplier', entityId: s.id, entityCode: s.supplier_code, systemId, bindType };
+          this.sessions.set(this._sessionKey('supplier', s.id), { session, remoteAddr, systemId, bindType });
+          session.send(pdu.response({ command_status: 0, system_id: systemId, sc_interface_version: negotiated }));
+          console.log(`[SMPP] ✅ Inbound supplier (GSM gateway) ${systemId} (${s.supplier_code}) bound [${bindType}] v${negotiated.toString(16)} from ${remoteAddr}`);
+          return;
+        }
+
+        // 2) Fallback: clients table (regular ESME clients)
+        const clientR = await db.query(
+          `SELECT id, client_code, smpp_password, status, smpp_ip
+           FROM clients
+           WHERE smpp_username = $1 AND status = 'active'
+             AND (is_deleted IS NULL OR is_deleted = false)`,
+          [systemId]
+        );
+
+        if (clientR.rows.length && clientR.rows[0].smpp_password === password) {
+          const c = clientR.rows[0];
+          if (c.smpp_ip && c.smpp_ip !== '0.0.0.0' && remoteAddr !== c.smpp_ip) {
+            console.log(`[SMPP] ❌ Client ${systemId}: IP mismatch (allowed ${c.smpp_ip}, got ${remoteAddr})`);
+            session.send(pdu.response({ command_status: 0x0000000D })); return;
+          }
+          try {
+            await this._markBound(db, 'client', c.id, systemId, remoteAddr, negotiated, bindType);
+          } catch (e) {
+            console.error(`[SMPP] ❌ Client ${systemId}: DB sync failed: ${e.message}`);
+            session.send(pdu.response({ command_status: 0x0000000B })); return; // system error
+          }
+          boundEntity = { entityType: 'client', entityId: c.id, entityCode: c.client_code, systemId, bindType };
+          this.sessions.set(this._sessionKey('client', c.id), { session, remoteAddr, systemId, bindType });
+          session.send(pdu.response({ command_status: 0, system_id: systemId, sc_interface_version: negotiated }));
+          console.log(`[SMPP] ✅ Client ${systemId} (${c.client_code}) bound [${bindType}] v${negotiated.toString(16)} from ${remoteAddr}`);
+          return;
+        }
+
+        console.log(`[SMPP] ❌ Auth failed for ${systemId}`);
+        session.send(pdu.response({ command_status: 0x0000000D }));
+      };
+
+      // Attach handler to all 3 bind types (smpp 0.6.x: only pdu, no callback)
+      session.on('bind_transceiver', (pdu) => handleBind(pdu, 'trx'));
+      session.on('bind_transmitter', (pdu) => handleBind(pdu, 'tx'));
+      session.on('bind_receiver', (pdu) => handleBind(pdu, 'rx'));
+
+      // ====== ENQUIRE_LINK (keepalive) ======
+      session.on('enquire_link', (pdu) => {
+        if (boundEntity) {
+          db.query(
+            `UPDATE smpp_sessions SET last_activity = NOW() WHERE entity_type=$1 AND entity_id=$2`,
+            [boundEntity.entityType, boundEntity.entityId]
+          ).catch(() => {});
+        }
+        session.send(pdu.response());
+      });
+
+      // ====== SUBMIT_SM (receive SMS from clients/suppliers) ======
+      session.on('submit_sm', async (pdu) => {
+        // Extract PDU fields FIRST — used by both client and supplier paths
+        const sourceAddr = pdu.source_addr ? pdu.source_addr.toString() : '';
+        const destAddr = pdu.destination_addr ? pdu.destination_addr.toString() : '';
+        // short_message can be Buffer (normal), string, or object (TLV message_payload)
+        const message = (() => {
+            const sm = pdu.short_message;
+            if (Buffer.isBuffer(sm)) return sm.toString('utf8');
+            if (typeof sm === 'string') return sm;
+            const mp = pdu.message_payload || pdu.tlv?.message_payload;
+            if (Buffer.isBuffer(mp)) return mp.toString('utf8');
+            if (typeof mp === 'string') return mp;
+            return '';
+        })();
+
+        // bind_receiver clients cannot send SMS
+        if (boundEntity && boundEntity.bindType === 'rx') {
+          session.send(pdu.response({ command_status: 0x00000045 }));
+          return;
+        }
+
+        // Inbound supplier (GSM gateway): detect DLR vs MO SMS
+        if (boundEntity && boundEntity.entityType === 'supplier') {
+          const esmClass = pdu.esm_class || 0;
+          // DLR detection: esm_class bit 2 (delivery receipt), receipted_message_id field,
+          // or fallback regex on message content matching standard DLR format "id:12345 sub:..."
+          const isDlr = (esmClass & 0x04) ||
+                        (pdu.receipted_message_id) ||
+                        (message && /^id:\d+ sub:/i.test(message));
+
+          if (isDlr) {
+            // === DLR from GSM gateway ===
+            let origMsgId = pdu.receipted_message_id;
+            let dlrStatus = 'DELIVRD';
+            if (!origMsgId && message) {
+              const m = message.match(/id:([^ ]+)/i);
+              if (m) origMsgId = m[1];
+              const s = message.match(/stat:([^ ]+)/i);
+              if (s) {
+                const st = String(s[1] || '').trim().toUpperCase();
+                dlrStatus = ['DELIVRD', 'DELIVERED', 'SUCCESS'].includes(st) ? 'DELIVRD' : 'UNDELIV';
+              }
+            }
+
+            if (origMsgId) {
+              try {
+                const origRes = await db.query(
+                  `UPDATE sms_logs SET dlr_status=$1, delivery_time=NOW()
+                   WHERE message_id=$2 AND status IN ('submitted','queued','pending')
+                   RETURNING client_id, client_code, sender_id, destination, submit_time, client_rate, message_parts, webhook_url, billing_mode_snapshot`,
+                  [dlrStatus, origMsgId]
+                );
+                if (origRes.rows.length > 0) {
+                  const orig = origRes.rows[0];
+                  const finalStatus = dlrStatus === 'DELIVRD' ? 'delivered' : 'failed';
+                  console.log(`[SMPP-DLR] 📥 DLR from gateway ${boundEntity.entityCode}: ${origMsgId} → ${dlrStatus}`);
+
+                  // Update sms_logs status to match DLR outcome
+                  await db.query(`UPDATE sms_logs SET status=$1 WHERE message_id=$2`, [finalStatus, origMsgId]);
+                  // Update outbox
+                  await db.query(`UPDATE sms_outbox SET status=$1, dlr_status=$2 WHERE message_id=$3`, [finalStatus, dlrStatus, origMsgId]);
+
+                  if (dlrStatus === 'DELIVRD') {
+                    // DLR billing — delegate to unified applyBilling() via callback.
+                    // Uses atomic claim-first pattern with credit mode support.
+                    const clientCost = parseFloat(((orig.client_rate || 0) * (orig.message_parts || 1)).toFixed(6));
+                    let supCost = 0, supId = null, supBillingMode = 'dlr';
+                    try {
+                      const outboxR = await db.query(
+                        `SELECT o.supplier_id, o.supplier_rate, o.message_parts, s.billing_mode AS supplier_billing_mode
+                         FROM sms_outbox o JOIN suppliers s ON s.id = o.supplier_id
+                         WHERE o.message_id = $1 LIMIT 1`,
+                        [origMsgId]
+                      );
+                      if (outboxR.rows.length) {
+                        supCost = parseFloat(((outboxR.rows[0].supplier_rate || 0) * (outboxR.rows[0].message_parts || 1)).toFixed(6));
+                        supId = outboxR.rows[0].supplier_id;
+                        supBillingMode = outboxR.rows[0].supplier_billing_mode || 'dlr';
+                      }
+                    } catch (e) {
+                      console.error(`[SMPP-DLR] ⚠ Supplier billing lookup failed for ${origMsgId}: ${e.message}`);
+                    }
+                    if (this.onDlrBilling) {
+                      try {
+                        await this.onDlrBilling({
+                          messageId: origMsgId,
+                          clientId: orig.client_id || null,
+                          supplierId: supId,
+                          clientCost,
+                          supplierCost: supCost,
+                          clientBillingMode: orig.billing_mode_snapshot || 'dlr',
+                          supplierBillingMode: supBillingMode,
+                          isSubmit: false,
+                          dlrStatus: 'DELIVRD',
+                          clientForceDlr: false,
+                          supplierForceDlr: false
+                        });
+                      } catch (e) {
+                        console.error(`[SMPP-DLR] ⚠ Billing callback failed for ${origMsgId}: ${e.message}`);
+                      }
+                    }
+                    // Webhook
+                    if (orig.webhook_url && this.queueManager) {
+                      this.queueManager.sendWebhook(orig.webhook_url, origMsgId, orig.destination, 'delivered', 'DELIVRD', orig.client_code).catch(() => {});
+                    }
+                  }
+
+                  // Push DLR to the originating bound client
+                  this.sendDlr({
+                    client_id: orig.client_id,
+                    message_id: origMsgId,
+                    destination: orig.destination,
+                    sender_id: orig.sender_id,
+                    status: dlrStatus,
+                    client_code: orig.client_code,
+                    submit_time: orig.submit_time
+                  });
+                }
+              } catch (e) {
+                console.error(`[SMPP-DLR] ❌ DLR update failed: ${e.message}`);
+              }
+              session.send(pdu.response({ command_status: 0, message_id: origMsgId }));
+            } else {
+              session.send(pdu.response({ command_status: 0 }));
+            }
+            return;
+          }
+
+          // === MO SMS from GSM gateway (real incoming mobile message) ===
+          const msgId = genNumericMsgId('3'); // INBOUND MO: prefix=3
+          try {
+            await db.query(
+              `INSERT INTO sms_logs (message_id, supplier_id, supplier_code, sender_id, destination, message, status, source, submit_time, created_at)
+               VALUES ($1,$2,$3,$4,$5,$6,'received','smpp_mo',NOW(),NOW())`,
+              [msgId, boundEntity.entityId, boundEntity.entityCode, sourceAddr, destAddr, message]
+            );
+            session.send(pdu.response({ command_status: 0, message_id: msgId }));
+            console.log(`[SMPP] 📥 MO SMS from gateway ${boundEntity.entityCode}: ${sourceAddr} → ${destAddr}`);
+
+            // Forward MO to the client who last sent MT to this number
+            try {
+              const lastClient = await db.query(
+                `SELECT client_id FROM sms_logs WHERE destination=$1 AND client_id IS NOT NULL ORDER BY submit_time DESC LIMIT 1`,
+                [sourceAddr]
+              );
+              if (lastClient.rows.length > 0) {
+                this.sendIncomingSms(lastClient.rows[0].client_id, sourceAddr, message);
+              }
+            } catch (err) { /* best effort */ }
+          } catch (e) {
+            console.error(`[SMPP] ❌ MO SMS insert failed: ${e.message}`);
+            session.send(pdu.response({ command_status: 0x0000000B }));
+          }
+          return;
+        }
+
+        // Client submit_sm path below — rate limit + queue manager
+
+        // Rate limit check: instead of REJECTING with 0x00000058 (which drops the SMS),
+        // we use peekClient() to check WITHOUT consuming a token, then enqueue with
+        // a delayed next_attempt_at. The queue manager's processJob() will consume
+        // the token when it actually processes the message.
+        // This ensures ZERO message loss due to rate limiting.
+        let rateLimitDelayMs = 0;
+        if (this.rateLimiter && boundEntity) {
+          const check = this.rateLimiter.peekClient(boundEntity.entityId);
+          if (!check.allowed) {
+            rateLimitDelayMs = check.waitMs || 1000;
+            console.log(`[SMPP] ⏱ Rate limited client ${boundEntity.entityCode} — enqueuing with ${rateLimitDelayMs}ms delay (NOT dropping)`);
+            // Continue to enqueue with delay — don't reject!
+          }
+        }
+
+        // Use the production queue if available; otherwise fallback to direct INSERT
+        if (this.queueManager && boundEntity) {
+          try {
+            const msgId = genNumericMsgId('4'); // SMPP SERVER: prefix=4
+
+            // Resolve route data: MCC/MNC, operator, supplier, rates, country
+            let routeData = { supplier_id: null, supplier_code: null, supplier_rate: 0,
+              client_rate: 0, mcc: '', mnc: '', operator: '', country: '',
+              route_name: 'SMPP', trunk_name: 'SMPP', billing_mode: 'dlr' };
+
+            if (this.resolveRoute) {
+              try {
+                const clientLookup = await db.query(
+                  'SELECT * FROM clients WHERE id = $1', [boundEntity.entityId]
+                );
+                if (clientLookup.rows.length) {
+                  const cl = clientLookup.rows[0];
+                  // Tenant expiry check — block if tenant licence expired
+                  if (cl.tenant_id) {
+                    const tR = await db.query('SELECT expiry_date, code FROM tenants WHERE id = $1 AND expiry_date IS NOT NULL AND expiry_date < NOW()', [cl.tenant_id]);
+                    if (tR.rows.length > 0) {
+                      console.log('[SMPP] Blocked ' + msgId + ': tenant ' + tR.rows[0].code + ' expired');
+                      return;
+                    }
+                  }
+                  const resolved = await this.resolveRoute(cl, destAddr);
+                  // resolved now returns snake_case keys with operator + country included
+                  Object.assign(routeData, resolved);
+                }
+              } catch (e) {
+                console.error(`[SMPP] Route resolution failed for ${boundEntity.entityCode}: ${e.message}`);
+              }
+            }
+
+            const job = {
+              message_id: msgId,
+              client_id: boundEntity.entityId,
+              client_code: boundEntity.entityCode,
+              supplier_id: routeData.supplier_id,
+              supplier_code: routeData.supplier_code,
+              sender_id: sourceAddr,
+              destination: destAddr,
+              message,
+              message_parts: calculateMessageParts(message),
+              client_rate: routeData.client_rate || 0,
+              supplier_rate: routeData.supplier_rate || 0,
+              profit: parseFloat((parseFloat(routeData.client_rate || 0) - parseFloat(routeData.supplier_rate || 0)).toFixed(6)),
+              currency: 'EUR',
+              mcc: routeData.mcc || '',
+              mnc: routeData.mnc || '',
+              operator: routeData.operator || '',
+              country: routeData.country || '',
+              route_name: routeData.route_name || 'SMPP',
+              trunk_name: routeData.trunk_name || 'SMPP',
+              billing_mode: routeData.billing_mode || 'dlr',
+              webhook_url: '',
+              source: 'smpp_client',
+            };
+
+            // If rate-limited, add delay to the job
+            if (rateLimitDelayMs > 0) {
+              job._delayMs = rateLimitDelayMs;
+            }
+
+            // Use buffered enqueue for high-throughput (batch flush every 50ms/200 jobs).
+            // Falls back to direct enqueue if buffer is full.
+            const enqResult = this.queueManager.enqueueBuffered
+              ? this.queueManager.enqueueBuffered(job)
+              : await this.queueManager.enqueue(job);
+
+            session.send(pdu.response({ command_status: 0, message_id: msgId }));
+            console.log(`[SMPP] ✅ SMS enqueued: ${msgId} (client=${boundEntity.entityCode}, dest=${destAddr}${rateLimitDelayMs > 0 ? ', rate-limited delay='+rateLimitDelayMs+'ms' : ''})`);
+            return;
+          } catch (e) {
+            console.error(`[SMPP] Queue enqueue failed: ${e.message}`);
+            session.send(pdu.response({ command_status: 0x0000000B })); // system error
+            return;
+          }
+        }
+
+        // --- Fallback: direct db insert (no queue manager available) ---
+        const msgId = genNumericMsgId('4'); // SMPP FALLBACK: prefix=4
+        await db.query(
+          `INSERT INTO sms_logs (message_id, client_id, client_code, sender_id, destination, message, status, submit_time)
+           VALUES ($1,$2,$3,$4,$5,$6,'submitted',NOW())`,
+          [msgId, boundEntity?.entityId || null, boundEntity?.entityCode || null, sourceAddr, destAddr, message]
+        );
+        session.send(pdu.response({ command_status: 0, message_id: msgId }));
+        console.log(`[SMPP] ✅ SMS queued (fallback): ${msgId}`);
+      });
+
+      // ====== UNBIND PDU ======
+      session.on('unbind', (pdu) => {
+        console.log(`[SMPP] Unbind PDU received — closing session`);
+        session.send(pdu.response());
+        session.close();
+      });
+
+      // ====== DISCONNECT (close / error) — sync DB ======
+      const handleDisconnect = async () => {
+        clearInterval(enquireTimer);
+        if (disconnected || !boundEntity) return;
+        disconnected = true;
+
+        const { entityType, entityId, systemId } = boundEntity;
+        console.log(`[SMPP] 🔌 ${entityType} ${systemId} (ID ${entityId}) disconnected`);
+
+        // Remove from global registry
+        this.sessions.delete(this._sessionKey(entityType, entityId));
+
+        // Mark session as unbound in DB
+        try {
+          await db.query(
+            `UPDATE smpp_sessions SET status = 'unbound', disconnected_at = NOW()
+             WHERE entity_type = $1 AND entity_id = $2 AND status = 'bound'`,
+            [entityType, entityId]
+          );
+        } catch (e) { console.error(`[SMPP] smpp_sessions update failed: ${e.message}`); }
+
+        // Unbind audit trail
+        try {
+          await db.query(
+            `INSERT INTO bind_history (entity_type, entity_id, system_id, ip_address, port, bind_mode, status, created_at)
+             VALUES ($1,$2,$3,$4,2775,'BIND_TRX','unbound',NOW())`,
+            [entityType, entityId, systemId, remoteAddr]
+          );
+        } catch (e) { console.error(`[SMPP] bind_history insert failed: ${e.message}`); }
+
+        // Suppliers are unbound on disconnect so routing skips them.
+        // consecutive_failures increments atomically — auto-blocked at 20
+        // by the universal health monitor.
+        if (entityType === 'supplier') {
+          try {
+            await db.query(
+              `UPDATE suppliers SET bind_status='unbound',
+               consecutive_failures = consecutive_failures + 1, updated_at = NOW()
+               WHERE id=$1`,
+              [entityId]
+            );
+          } catch (e) { console.error(`[SMPP] supplier unbind update failed: ${e.message}`); }
+        }
+
+        boundEntity = null;
+      };
+
+      session.on('close', () => {
+        clearInterval(enquireTimer);
+        handleDisconnect();
+      });
+      session.on('error', (err) => {
+        console.error(`[SMPP] Session error (${boundEntity?.systemId || remoteAddr}): ${err.message}`);
+        clearInterval(enquireTimer);
+        handleDisconnect();
+      });
+    });
+
+    // smpp.createServer() returns a Server instance but does NOT auto-listen.
+    // We must call server.listen() explicitly.
+    // The deploy script cleans up port 2775 before restart to prevent EADDRINUSE.
+    server.listen(2775, '0.0.0.0', () => {
+      console.log(`[SMPP] ✅ Server listening on 0.0.0.0:2775 (ESME binds — v3.3/v3.4/v5.0)`);
+    });
+
+    server.on('error', (err) => {
+      console.error(`[SMPP] ❌ Server error: ${err.message}`);
+    });
+  }
+
+  /**
+   * Send deliver_sm (MT SMS) to a bound INBOUND supplier for delivery.
+   * Used by the queue manager to deliver SMS to GSM gateways and other
+   * inbound suppliers that connected TO this server.
+   *
+   * @param {number} supplierId
+   * @param {object} job — { message_id, sender_id, destination, message }
+   * @returns {boolean} true if the supplier was connected and the PDU was sent
+   */
+  deliverToSupplier(supplierId, job) {
+    const key = this._sessionKey('supplier', supplierId);
+    const entry = this.sessions.get(key);
+    if (!entry) {
+      console.log(`[SMPP] ⚠ Cannot deliver to supplier #${supplierId}: not connected`);
+      return false;
+    }
+
+    const { session } = entry;
+    try {
+      session.deliver_sm({
+        source_addr: job.sender_id || '',
+        destination_addr: job.destination || '',
+        short_message: job.message || '',
+        esm_class: 0x00,       // Default SMSC Mode
+        registered_delivery: 1, // Request DLR
+        data_coding: getDataCoding(job.message || ''),
+      }, (respPdu) => {
+        if (respPdu && respPdu.command_status !== 0) {
+          console.error(`[SMPP] ❌ deliver_sm (MT) to supplier #${supplierId} failed: status=${respPdu.command_status}`);
+        }
+      });
+      console.log(`[SMPP] 📤 MT SMS to supplier #${supplierId}: ${job.message_id} → ${job.destination}`);
+      return true;
+    } catch (e) {
+      console.error(`[SMPP] ❌ deliver_sm (MT) error for supplier #${supplierId}: ${e.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * DLR Delivery: send a deliver_sm (delivery receipt) back to the
+   * bound SMPP client that originated the SMS.
+   *
+   * Called by the queue manager after a job is delivered or fails.
+   *
+   * @param {object} job — { client_id, message_id, destination, sender_id,
+   *   status ('DELIVRD'|'UNDELIV'), client_code, submit_time }
+   */
+  sendDlr(job) {
+    const key = this._sessionKey('client', job.client_id);
+    const entry = this.sessions.get(key);
+    if (!entry) {
+      console.log(`[SMPP-DLR] ⚠ Client ${job.client_code || job.client_id} not connected — DLR not pushed`);
+      return false;
+    }
+
+    const { session } = entry;
+    const receipt = buildDlrReceipt(job.message_id, job.status, job.submit_time);
+
+    try {
+      session.deliver_sm({
+        source_addr: job.destination || '',
+        destination_addr: job.sender_id || '',
+        short_message: receipt,
+        esm_class: 0x04,                // SMSC Delivery Receipt
+        registered_delivery: 0,
+        receipted_message_id: job.message_id,
+        message_state: job.status === 'DELIVRD' ? 2 : 5, // 2=DELIVERED, 5=UNDELIVERABLE
+      }, (respPdu) => {
+        // node-smpp callback receives the response PDU (not err, result pair)
+        // PDU is always an object — check command_status to detect actual failures
+        if (respPdu && respPdu.command_status !== 0) {
+          console.error(`[SMPP-DLR] ❌ deliver_sm failed for ${job.message_id}: status=${respPdu.command_status}`);
+        } else {
+          console.log(`[SMPP-DLR] ✅ DLR pushed to client ${job.client_code}: ${job.message_id} → ${job.status}`);
+        }
+      });
+      return true;
+    } catch (e) {
+      console.error(`[SMPP-DLR] ❌ deliver_sm error for ${job.message_id}: ${e.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Send deliver_sm (incoming MO SMS) to a bound client session.
+   * Used for receiving SMS from suppliers and forwarding to the client.
+   */
+  sendIncomingSms(clientId, fromNumber, message) {
+    const key = this._sessionKey('client', clientId);
+    const entry = this.sessions.get(key);
+    if (!entry) return false;
+
+    const { session } = entry;
+    try {
+      session.deliver_sm({
+        source_addr: fromNumber,
+        destination_addr: entry.systemId,
+        short_message: message,
+        esm_class: 0x00,
+        registered_delivery: 0,
+        data_coding: getDataCoding(message),
+      }, (respPdu) => {
+        if (respPdu && respPdu.command_status !== 0) {
+          console.error(`[SMPP] deliver_sm (MO) failed: status=${respPdu.command_status}`);
+        }
+      });
+      return true;
+    } catch (e) {
+      console.error(`[SMPP] deliver_sm (MO) error: ${e.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Upserts smpp_sessions (bound) + inserts bind_history audit trail.
+   * For suppliers, also updates suppliers.bind_status.
+   * THROWS on any DB failure so handleBind can reject the bind with an error.
+   */
+  async _markBound(db, entityType, entityId, systemId, ipAddr, version, bindType) {
+    const ver = version.toString(16);
+    const bindMode = bindType === 'tx' ? 'BIND_TX' : (bindType === 'rx' ? 'BIND_RX' : 'BIND_TRX');
+
+    await db.query(
+      `INSERT INTO smpp_sessions (entity_type, entity_id, system_id, ip_address, remote_ip, port, bind_mode, status,
+        negotiated_version, connected_at, last_activity, bound_count)
+       VALUES ($1,$2,$3,$4,$5,2775,$6,'bound',$7,NOW(),NOW(),1)
+       ON CONFLICT (entity_type, entity_id)
+       DO UPDATE SET system_id=$3, ip_address=$4, remote_ip=$5, bind_mode=$6,
+                     status='bound', negotiated_version=$7, connected_at=NOW(),
+                     last_activity=NOW(), bound_count=smpp_sessions.bound_count+1,
+                     last_error=NULL, last_error_at=NULL, disconnected_at=NULL`,
+      [entityType, entityId, systemId, ipAddr, ipAddr, bindMode, ver]
+    );
+
+    await db.query(
+      `INSERT INTO bind_history (entity_type, entity_id, system_id, ip_address, port, bind_mode, status, negotiated_version, created_at)
+       VALUES ($1,$2,$3,$4,2775,$5,'bound',$6,NOW())`,
+      [entityType, entityId, systemId, ipAddr, bindMode, ver]
+    );
+
+    if (entityType === 'supplier') {
+      await db.query(
+        `UPDATE suppliers SET bind_status='bound', consecutive_failures=0, updated_at=NOW() WHERE id=$1`,
+        [entityId]
+      );
+    }
+  }
+}

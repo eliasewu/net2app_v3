@@ -1,0 +1,71 @@
+package com.net2app.gateway;
+
+import com.net2app.gateway.smpp.SmppServer;
+import com.net2app.gateway.smpp.DlrPusher;
+import com.net2app.gateway.rest.RestBridge;
+import com.net2app.gateway.db.Database;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * NET2APP SMS Gateway — Java 21 SMPP Engine
+ *
+ * Modes:
+ *   - SERVER: Listens for SMPP client connections (ESMEs from the platform).
+ *     GSM modems/devices without public IP pair with this server using
+ *     server IP, port, username, and password.
+ *   - CLIENT: Connects to external SMSCs (suppliers) to deliver SMS.
+ *
+ * Architecture:
+ *   Java 21 SMPP ↔ PostgreSQL (shared with Node.js server.cjs)
+ *   Node.js handles REST API, web UI, HTTP clients
+ *   Java handles all SMPP protocol (ESME + SMSC sides)
+ */
+public class SmpGatewayMain {
+    private static final Logger log = LoggerFactory.getLogger(SmpGatewayMain.class);
+
+    public static void main(String[] args) {
+        log.info("=== NET2APP SMS Gateway v1.0.0 (Java 21) ===");
+
+        // 1. Initialize database connection pool
+        Database.init();
+
+        // 2. Start SMPP Server (accepts client/ESME connections on port 2775)
+        SmppServer smppServer = new SmppServer(2775);
+        smppServer.start();
+        log.info("SMPP Server started on port 2775 (server mode)");
+
+        // 3. Outbound supplier connections are owned by the Node.js server
+        //    (src/services/connectionPipeline.mjs + smppClient.mjs). The Java
+        //    gateway's SmppClientManager used to ALSO connect out to the same
+        //    suppliers, creating a DUPLICATE SMPP bind with the same system_id.
+        //    SMSCs only allow one session per system_id, so the two binds kept
+        //    kicking each other (~"SMPP session to supplier ... closed
+        //    unexpectedly" every 3 minutes) — bind flapping + message loss.
+        //    Disabled here; the Java gateway now only serves INBOUND binds +
+        //    DLR push.
+        log.info("Outbound supplier connections disabled — owned by Node.js (connectionPipeline)");
+
+        // 4. Start REST Bridge (exposes Java SMPP status/mgmt to Node.js)
+        RestBridge restBridge = new RestBridge(9091, smppServer);
+        restBridge.start();
+        log.info("REST Bridge started on port 9091");
+
+        // 5. Start DLR Pusher (polls dlr_outbox every 5s → deliver_sm to ESMEs)
+        DlrPusher dlrPusher = new DlrPusher(smppServer);
+        dlrPusher.start();
+        log.info("DLR Pusher started — real-time deliver_sm to connected SMPP clients");
+
+        // 6. Register shutdown hook
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            log.info("Shutting down...");
+            dlrPusher.stop();
+            smppServer.stop();
+            restBridge.stop();
+            Database.shutdown();
+            log.info("Shutdown complete");
+        }));
+
+        log.info("All services started. Ready to process SMPP traffic.");
+    }
+}

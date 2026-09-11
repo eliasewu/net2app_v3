@@ -1,0 +1,4 @@
+name,target_value,priority,is_active,apply_to,apply_entity_id
+Random SID Pool,SID001|SID002|SID003|SID004|SID005,1,true,both,all
+BD SID Pool,BDMSG|BDOTP|BDINFO,2,true,both,all
+MY SID Pool,MYMSG|MYINFO,3,true,supplier,1
