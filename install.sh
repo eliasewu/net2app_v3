@@ -509,9 +509,15 @@ server {
         proxy_set_header Host \$host;
     }
 
-    # API serves /health and /download (APK) from public/; without these the
-    # SPA fallback below would answer with index.html instead.
+    # API serves /health, /install (one-tap APK page) and /download (APK) from
+    # public/; without these the SPA fallback below would answer with
+    # index.html instead.
     location = /health {
+        proxy_pass http://127.0.0.1:$APP_PORT;
+        proxy_set_header Host \$host;
+    }
+
+    location = /install {
         proxy_pass http://127.0.0.1:$APP_PORT;
         proxy_set_header Host \$host;
     }
