@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Search, Inbox, RefreshCw, Eye, Phone, Clock, MessageSquare, Download } from 'lucide-react';
+import { Search, Inbox, RefreshCw, Eye, Phone, Clock, MessageSquare, Download, UserPlus, XCircle } from 'lucide-react';
 import { Card } from '../components/UI/Card';
 import { Button } from '../components/UI/Button';
 import { Badge } from '../components/UI/Badge';
@@ -8,6 +8,7 @@ import { Modal } from '../components/UI/Modal';
 import { InboundTrafficWidget } from '../components/Dashboard/InboundTrafficWidget';
 import { ErrorBoundary } from '../components/UI/ErrorBoundary';
 import { smsApi } from '../services/api';
+import { useData } from '../store/DataContext';
 
 interface MOSMS {
   id: string;
@@ -22,6 +23,9 @@ interface MOSMS {
   processed: boolean;
   reply_sent: boolean;
   notes?: string;
+  client_code?: string | null;
+  client_id?: number | null;
+  source?: string;
 }
 
 // MO SMS inbox — real data from sms_logs. Includes both classic SMPP MO
@@ -35,6 +39,10 @@ export const SMSInbox: React.FC = () => {
   const [replyText, setReplyText] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [assignModal, setAssignModal] = useState<MOSMS | null>(null);
+  const [assignClientId, setAssignClientId] = useState<string>('');
+  const [assignSaving, setAssignSaving] = useState(false);
+  const { clients } = useData();
 
   const fetchMoMessages = useCallback(async () => {
     setError(null);
@@ -51,8 +59,12 @@ export const SMSInbox: React.FC = () => {
           mcc: r.mcc || '',
           mnc: r.mnc || '',
           country: r.country || '',
+          // 'received' = not yet processed; anything else (assigned/replied/forwarded) counts as processed
           processed: r.status !== 'received',
           reply_sent: false,
+          client_code: r.client_code || null,
+          client_id: r.client_id || null,
+          source: r.source || '',
         }));
         setMoSMS(mapped);
       }
@@ -82,6 +94,31 @@ export const SMSInbox: React.FC = () => {
     alert(`Reply sent to ${sms.from}: "${replyText}"`);
   };
 
+  // Optional manual assignment — link an MO message to a client (null to unassign)
+  const openAssign = (sms: MOSMS) => {
+    setAssignClientId(sms.client_id ? String(sms.client_id) : '');
+    setAssignModal(sms);
+  };
+
+  const handleAssign = async () => {
+    if (!assignModal) return;
+    setAssignSaving(true);
+    try {
+      const clientId = assignClientId ? parseInt(assignClientId, 10) : null;
+      const res: any = await smsApi.assignMo(assignModal.id, clientId);
+      if (!res.success) throw new Error(res.error || 'Assign failed');
+      const updated = res.data?.data || res.data;
+      setMoSMS(prev => prev.map(m => m.id === assignModal.id
+        ? { ...m, client_id: updated?.client_id ?? clientId, client_code: updated?.client_code ?? (clients.find(c => String(c.id) === assignClientId)?.client_code ?? null) }
+        : m));
+      setAssignModal(null);
+    } catch (e: any) {
+      alert('Failed to assign: ' + (e?.message || e));
+    } finally {
+      setAssignSaving(false);
+    }
+  };
+
   const columns = [
     { key:'from', header:'From', render:(m:MOSMS)=><div className="flex items-center gap-2"><Phone size={14} className="text-gray-400"/><span className="font-mono text-sm">{m.from}</span></div> },
     { key:'to', header:'To', render:(m:MOSMS)=><Badge variant="info">{m.to}</Badge> },
@@ -89,6 +126,9 @@ export const SMSInbox: React.FC = () => {
     { key:'country', header:'Country', render:(m:MOSMS)=><span className="text-xs">{m.country} ({m.mcc}{m.mnc})</span> },
     { key:'time', header:'Received', render:(m:MOSMS)=><span className="text-xs text-gray-500">{new Date(m.received_at).toLocaleString()}</span> },
     { key:'keyword', header:'Keyword', render:(m:MOSMS)=>m.keyword ? <Badge variant="purple" size="sm">{m.keyword}</Badge> : <span className="text-xs text-gray-400">-</span> },
+    { key:'client', header:'Client', render:(m:MOSMS)=>m.client_code
+      ? <Badge variant="success" size="sm">{m.client_code}</Badge>
+      : <button onClick={()=>openAssign(m)} className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 rounded-md" title="Assign to client (optional)"><UserPlus size={12}/> Assign</button> },
     { key:'status', header:'Status', render:(m:MOSMS)=><div className="flex gap-1">{!m.processed&&<Badge variant="warning" size="sm">New</Badge>}{m.reply_sent&&<Badge variant="success" size="sm">Replied</Badge>}</div> },
     { key:'actions', header:'', render:(m:MOSMS)=><button onClick={()=>setViewModal(m)} className="p-1.5 rounded hover:bg-gray-100"><Eye size={14} className="text-gray-500"/></button> },
   ];
@@ -128,8 +168,49 @@ export const SMSInbox: React.FC = () => {
         {viewModal && <div className="space-y-4">
           <div className="grid grid-cols-2 gap-4 text-sm"><div><p className="text-gray-500">From</p><p className="font-mono font-medium">{viewModal.from}</p></div><div><p className="text-gray-500">To (Short Code)</p><p className="font-medium">{viewModal.to}</p></div><div><p className="text-gray-500">Country</p><p>{viewModal.country} ({viewModal.mcc}{viewModal.mnc})</p></div><div><p className="text-gray-500">Received</p><p>{new Date(viewModal.received_at).toLocaleString()}</p></div></div>
           <div className="bg-gray-50 p-4 rounded-lg"><p className="text-xs text-gray-500 mb-1">Message</p><p className="text-gray-800">{viewModal.message}</p></div>
-          <div className="flex gap-2">{viewModal.keyword && <Badge variant="purple">Keyword: {viewModal.keyword}</Badge>}<Badge variant={viewModal.processed?'success':'warning'}>{viewModal.processed?'Processed':'Pending'}</Badge><Badge variant={viewModal.reply_sent?'success':'default'}>{viewModal.reply_sent?'Reply Sent':'No Reply'}</Badge></div>
+          <div className="flex flex-wrap items-center gap-2">{viewModal.keyword && <Badge variant="purple">Keyword: {viewModal.keyword}</Badge>}<Badge variant={viewModal.processed?'success':'warning'}>{viewModal.processed?'Processed':'Pending'}</Badge><Badge variant={viewModal.reply_sent?'success':'default'}>{viewModal.reply_sent?'Reply Sent':'No Reply'}</Badge>
+            {viewModal.client_code
+              ? <span className="inline-flex items-center gap-1"><Badge variant="success">Client: {viewModal.client_code}</Badge><button onClick={()=>openAssign(viewModal)} className="text-xs text-gray-400 hover:text-gray-600" title="Change">✎</button></span>
+              : <button onClick={()=>openAssign(viewModal)} className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 rounded-md"><UserPlus size={12}/> Assign to client</button>}
+          </div>
         </div>}
+      </Modal>
+
+      {/* Assign-to-client modal (optional manual linking) */}
+      <Modal
+        isOpen={!!assignModal}
+        onClose={()=>setAssignModal(null)}
+        title="Assign MO Message to Client"
+        footer={
+          <div className="flex justify-end gap-3 w-full">
+            <Button variant="secondary" onClick={()=>setAssignModal(null)}>Cancel</Button>
+            {assignModal?.client_id && (
+              <Button variant="danger" icon={<XCircle size={14}/>} onClick={async () => { setAssignSaving(true); try { await smsApi.assignMo(assignModal.id, null); setMoSMS(prev => prev.map(m => m.id === assignModal.id ? { ...m, client_id: null, client_code: null } : m)); setAssignModal(null); } catch (e: any) { alert('Failed to unassign: ' + (e?.message || e)); } finally { setAssignSaving(false); } }}>Unassign</Button>
+            )}
+            <Button loading={assignSaving} onClick={handleAssign}>Assign</Button>
+          </div>
+        }
+      >
+        {assignModal && (
+          <div className="space-y-4">
+            <div className="text-sm text-gray-600">
+              <p><span className="text-gray-400">From:</span> <span className="font-mono">{assignModal.from}</span></p>
+              <p className="mt-1"><span className="text-gray-400">Message:</span> <span className="line-clamp-2">{assignModal.message}</span></p>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Client (optional)</label>
+              <select
+                value={assignClientId}
+                onChange={e=>setAssignClientId(e.target.value)}
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
+              >
+                <option value="">— Unassigned —</option>
+                {clients.map(c => <option key={c.id} value={c.id}>{c.client_code} — {c.company_name || c.contact_person || c.id}</option>)}
+              </select>
+              <p className="text-xs text-gray-400 mt-2">Assigning links this incoming SMS to the client for reporting and replies. You can leave it unassigned.</p>
+            </div>
+          </div>
+        )}
       </Modal>
     </div>
   );

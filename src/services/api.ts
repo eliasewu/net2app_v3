@@ -359,6 +359,7 @@ export const billingApi = {
 export const smsApi = {
   getLogs: (filters: any & { offset?: number; limit?: number }) => api.post<any>('/sms/logs', filters),
   getLog: (id: string) => api.get<any>(`/sms/logs/${id}`),
+  assignMo: (id: string | number, clientId: number | null) => api.post<any>(`/sms/inbox/${id}/assign`, { client_id: clientId }),
   sendTest: (data: any) => api.post<any>('/sms/test', data),
   getStats: (period: string) => api.get<any>(`/sms/stats?period=${period}`),
   getInboundStats: () => api.get<any>('/sms/stats/inbound'),

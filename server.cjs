@@ -5564,6 +5564,37 @@ app.get('/api/sms/logs/:id', auth, async (req, res) => {
     }
 });
 
+// ── Assign an inbound MO message to a client (optional, manual) ──
+// MO receipts (smpp_mo / android_gateway_mo) arrive unassigned; the operator
+// may link one to a client so replies/billing/reporting attribute to them.
+// Send client_id: null to unassign.
+app.post('/api/sms/inbox/:id/assign', auth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const clientId = req.body?.client_id;
+        const logR = await pool.query('SELECT id, source, client_id FROM sms_logs WHERE id = $1', [id]);
+        if (logR.rows.length === 0) return res.status(404).json({ error: 'Message not found' });
+        const log = logR.rows[0];
+        if (!['smpp_mo', 'android_gateway_mo'].includes(log.source)) {
+            return res.status(400).json({ error: 'Only inbound MO messages can be assigned' });
+        }
+        if (clientId === null || clientId === undefined || clientId === '') {
+            await pool.query('UPDATE sms_logs SET client_id = NULL, client_code = NULL WHERE id = $1', [id]);
+            return res.json({ success: true, data: { id: parseInt(id, 10), client_id: null, client_code: null } });
+        }
+        const cR = await pool.query(
+            'SELECT id, client_code FROM clients WHERE id = $1 AND (is_deleted IS NULL OR is_deleted = false)',
+            [clientId]
+        );
+        if (cR.rows.length === 0) return res.status(404).json({ error: 'Client not found' });
+        await pool.query('UPDATE sms_logs SET client_id = $2, client_code = $3 WHERE id = $1',
+            [id, cR.rows[0].id, cR.rows[0].client_code]);
+        res.json({ success: true, data: { id: parseInt(id, 10), client_id: cR.rows[0].id, client_code: cR.rows[0].client_code } });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // Send a test SMS
 app.post('/api/sms/test', auth, async (req, res) => {
     // UNIVERSAL TEST SMS ENDPOINT — always logs to sms_logs with real status.
