@@ -4,7 +4,7 @@ import { useGateway } from '../services/GatewayContext';
 import { ApiClient } from '../services/ApiClient';
 
 export default function DashboardPage() {
-  const { config, connectionStatus, stats, sendSms, refreshMessages } = useGateway();
+  const { config, connectionStatus, stats, sendSms, refreshMessages, checkSmsPermissions, openPermissionSettings } = useGateway();
   const navigate = useNavigate();
 
   const [quickSms, setQuickSms] = useState({ to: '', text: '' });
@@ -150,6 +150,20 @@ export default function DashboardPage() {
             <span className={connectionStatus.smsPermission ? 'ok' : 'error'}>
               {connectionStatus.smsPermission ? '✅ Granted' : '❌ Denied'}
             </span>
+            {!connectionStatus.smsPermission && (
+              <button
+                className="btn btn-secondary"
+                style={{ marginLeft: 'auto', padding: '4px 10px', fontSize: 12 }}
+                onClick={async () => {
+                  // Re-check first — if still denied, jump to system settings
+                  // (the dialog is suppressed once "Don't ask again" was chosen)
+                  const ok = await checkSmsPermissions();
+                  if (!ok) await openPermissionSettings();
+                }}
+              >
+                Fix Permissions
+              </button>
+            )}
           </div>
           <div className="status-row">
             <span>Background Service</span>

@@ -98,6 +98,69 @@ public class SmsGatewayPlugin extends Plugin {
 
         // Log startup
         Log.i(TAG, "SmsGatewayPlugin loaded");
+
+        // Auto-start: restore saved config and bring the gateway up again after
+        // an app restart, so the background heartbeat/receivers survive without
+        // the user pressing Save & Connect every time.
+        android.content.SharedPreferences prefs = context.getSharedPreferences("sms_gateway", Context.MODE_PRIVATE);
+        String savedUrl = prefs.getString("server_url", "");
+        String savedUser = prefs.getString("username", "");
+        if (!savedUrl.isEmpty() && !savedUser.isEmpty()) {
+            serverUrl = savedUrl;
+            username = savedUser;
+            password = prefs.getString("password", "");
+            apiKey = prefs.getString("api_key", "");
+            smppEnabled = prefs.getBoolean("smpp_enabled", false);
+            executor.execute(() -> {
+                boolean registered = registerWithServer();
+                if (registered) {
+                    isRegistered = true;
+                    startHeartbeat();
+                    startQueueFlusher();
+                    startDlrReaper();
+                    registerSmsReceiver();
+                    registerDlrReceiver();
+                    Log.i(TAG, "Gateway auto-started from saved config: " + username);
+                }
+            });
+        }
+    }
+
+    /** True when all SMS runtime permissions are granted. */
+    private boolean hasSmsPermissions() {
+        return ContextCompat.checkSelfPermission(context, Manifest.permission.SEND_SMS) == PackageManager.PERMISSION_GRANTED
+            && ContextCompat.checkSelfPermission(context, Manifest.permission.RECEIVE_SMS) == PackageManager.PERMISSION_GRANTED
+            && ContextCompat.checkSelfPermission(context, Manifest.permission.READ_SMS) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    /** Current permission state — lets the UI reflect reality after the user returns from Settings. */
+    @PluginMethod
+    public void checkPermissions(PluginCall call) {
+        JSObject result = new JSObject();
+        boolean granted = hasSmsPermissions();
+        result.put("granted", granted);
+        java.util.List<String> missing = new ArrayList<>();
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED) missing.add(Manifest.permission.SEND_SMS);
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECEIVE_SMS) != PackageManager.PERMISSION_GRANTED) missing.add(Manifest.permission.RECEIVE_SMS);
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) missing.add(Manifest.permission.READ_SMS);
+        result.put("missing", new JSONArray(missing));
+        call.resolve(result);
+    }
+
+    /** Opens the system App Settings page — required when the user checked "Don't ask again". */
+    @PluginMethod
+    public void openPermissionSettings(PluginCall call) {
+        try {
+            android.content.Intent i = new android.content.Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+            i.setData(android.net.Uri.parse("package:" + context.getPackageName()));
+            i.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+            context.startActivity(i);
+            JSObject result = new JSObject();
+            result.put("opened", true);
+            call.resolve(result);
+        } catch (Exception e) {
+            call.reject("Could not open settings: " + e.getMessage());
+        }
     }
 
     /**
@@ -223,6 +286,7 @@ public class SmsGatewayPlugin extends Plugin {
         result.put("serverUrl", serverUrl);
         result.put("username", username);
         result.put("smsReceiverActive", smsReceiverRegistered);
+        result.put("smsPermissionGranted", hasSmsPermissions());
         result.put("offlineQueuePending", offlineQueue != null ? offlineQueue.getPendingCount() : 0);
         result.put("smppEnabled", smppEnabled);
         if (smppClient != null) {

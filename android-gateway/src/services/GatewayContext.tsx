@@ -57,6 +57,8 @@ interface GatewayContextType {
   refreshMessages: () => Promise<void>;
   clearMessages: () => void;
   requestSmsPermission: () => Promise<boolean>;
+  checkSmsPermissions: () => Promise<boolean>;
+  openPermissionSettings: () => Promise<void>;
   isConfigured: boolean;
 }
 
@@ -286,9 +288,14 @@ export function GatewayProvider({ children }: { children: ReactNode }) {
           setConnectionStatus(prev => ({
             ...prev,
             serverConnected: status.isRegistered,
+            // Native truth: real runtime permission state (falls back to
+            // receiver-active on older builds that don't report it).
+            smsPermission: typeof status.smsPermissionGranted === 'boolean'
+              ? status.smsPermissionGranted
+              : status.smsReceiverActive,
             smppConnected: status.smppConnected,
             offlineQueuePending: status.offlineQueuePending,
-            backgroundService: status.smsReceiverActive,
+            backgroundService: status.smsReceiverActive || status.isRegistered,
           }));
         }
       } catch {}
@@ -310,11 +317,31 @@ export function GatewayProvider({ children }: { children: ReactNode }) {
         setConnectionStatus(prev => ({
           ...prev,
           serverConnected: status.isRegistered,
-          smsPermission: status.smsReceiverActive,
+          smsPermission: typeof status.smsPermissionGranted === 'boolean'
+            ? status.smsPermissionGranted
+            : status.smsReceiverActive,
+          backgroundService: status.smsReceiverActive || status.isRegistered,
           offlineQueuePending: status.offlineQueuePending,
         }));
       }
     });
+  }, []);
+
+  // Real permission check — accurate even when the dialog was permanently denied
+  const checkSmsPermissions = useCallback(async (): Promise<boolean> => {
+    try {
+      const result = await callPlugin('checkPermissions');
+      const granted = !!result?.granted;
+      setConnectionStatus(prev => ({ ...prev, smsPermission: granted }));
+      return granted;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  // Deep-link to the system App Settings page (needed after "Don't ask again")
+  const openPermissionSettings = useCallback(async (): Promise<void> => {
+    await callPlugin('openPermissionSettings');
   }, []);
 
   const value: GatewayContextType = {
@@ -328,6 +355,8 @@ export function GatewayProvider({ children }: { children: ReactNode }) {
     refreshMessages,
     clearMessages,
     requestSmsPermission,
+    checkSmsPermissions,
+    openPermissionSettings,
     isConfigured,
   };
 
