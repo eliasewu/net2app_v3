@@ -413,6 +413,15 @@ chown "$APP_USER:$APP_USER" "$ENV_FILE"
 
 log "Installing Node dependencies"
 run_as_app bash -c "cd '$APP_DIR' && PUPPETEER_SKIP_DOWNLOAD=true npm install --no-audit --no-fund --legacy-peer-deps"
+
+# Full MCC/MNC operator reference dataset (2,938 networks / 227 countries).
+# Idempotent: wipes and re-inserts in one transaction. Used by route
+# resolution (destination number -> MCC/MNC -> client rates).
+if [[ -f "$APP_DIR/src/database/import_mccmnc.cjs" && -f "$APP_DIR/src/database/mccmnc_full.json" ]]; then
+  log "Loading MCC/MNC operator database"
+  run_as_app bash -c "cd '$APP_DIR' && set -a && . ./.env && set +a && node src/database/import_mccmnc.cjs" || warn "MCC/MNC import failed (non-fatal) — rerun: node src/database/import_mccmnc.cjs"
+fi
+
 log "Building frontend"
 run_as_app bash -c "cd '$APP_DIR' && npm run build"
 # Nginx serves only the compiled frontend as www-data. Keep the application
@@ -507,6 +516,7 @@ chmod 640 "$PM2_CONFIG"
 # 5. Nginx, firewall and PM2 boot registration
 # ---------------------------------------------------------------------------
 log "Configuring Nginx reverse proxy"
+install -d -m 0755 /var/www/certbot
 NGINX_SITE=/etc/nginx/sites-available/net2app
 cat > "$NGINX_SITE" <<EOF
 server {
@@ -514,6 +524,13 @@ server {
     listen [::]:80 default_server;
     server_name _;
     root $APP_DIR/dist;
+
+    # Let's Encrypt HTTP-01 challenge responses (also used for IP certificates
+    # when ENABLE_HTTPS=true)
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+        default_type "text/plain";
+    }
     index index.html;
     client_max_body_size 50M;
 
@@ -624,7 +641,127 @@ run_as_app pm2 save
 systemctl restart "$PM2_SERVICE"
 
 # ---------------------------------------------------------------------------
-# 6. Central MySQL cluster registration and diagnostics
+# 6b. Optional HTTPS with a Let's Encrypt IP certificate (ENABLE_HTTPS=true)
+# ---------------------------------------------------------------------------
+# Let's Encrypt issues trusted certificates for bare IP addresses using the
+# shortlived profile (6-day validity, auto-renewed by certbot). Requires
+# certbot >= 5.4 (installed via snap below when missing). When enabled, the
+# web UI redirects HTTP->HTTPS while /api, /health, /install and /download
+# stay reachable over plain HTTP for Android gateways.
+if [[ "${ENABLE_HTTPS:-false}" == "true" ]]; then
+  if ! command -v certbot >/dev/null 2>&1; then
+    log "Installing certbot (snap)"
+    apt-get install -y snapd
+    snap install core 2>/dev/null || true
+    snap refresh core 2>/dev/null || true
+    snap install --classic certbot
+    ln -sfn /snap/bin/certbot /usr/bin/certbot
+  fi
+  CERTBOT_MAJOR=$(certbot --version 2>/dev/null | grep -oE '[0-9]+' | head -n1)
+  [[ "${CERTBOT_MAJOR:-0}" -ge 5 ]] || die "certbot >= 5.4 is required for IP address certificates"
+
+  if [[ -f "/etc/letsencrypt/live/$PUBLIC_IP/fullchain.pem" ]]; then
+    log "IP certificate for $PUBLIC_IP already present"
+  else
+    log "Requesting Let's Encrypt IP certificate for $PUBLIC_IP (staging validation)"
+    certbot certonly --staging --non-interactive --agree-tos --register-unsafely-without-email \
+      --preferred-profile shortlived --webroot --webroot-path /var/www/certbot \
+      --ip-address "$PUBLIC_IP"
+    certbot delete --cert-name "$PUBLIC_IP" --non-interactive
+    log "Requesting production IP certificate for $PUBLIC_IP"
+    certbot certonly --non-interactive --agree-tos --register-unsafely-without-email \
+      --preferred-profile shortlived --webroot --webroot-path /var/www/certbot \
+      --ip-address "$PUBLIC_IP"
+  fi
+
+  install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
+  cat > /etc/letsencrypt/renewal-hooks/deploy/reload-net2app-nginx.sh <<'HOOK'
+#!/bin/bash
+# Reload nginx so renewed certificates are picked up immediately
+/usr/sbin/nginx -t >/dev/null 2>&1 && systemctl reload nginx
+HOOK
+  chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-net2app-nginx.sh
+
+  NGINX_TLS_BLOCK="
+# ---- port 443: full site over TLS ------------------------------------------
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name _;
+
+    ssl_certificate     /etc/letsencrypt/live/$PUBLIC_IP/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$PUBLIC_IP/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+    ssl_prefer_server_ciphers off;
+
+    root $APP_DIR/dist;
+    index index.html;
+    client_max_body_size 50M;
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:$APP_PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 300s;
+    }
+
+    location /ws/ {
+        proxy_pass http://127.0.0.1:$APP_PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \"upgrade\";
+        proxy_set_header Host \$host;
+    }
+
+    location = /health {
+        proxy_pass http://127.0.0.1:$APP_PORT;
+        proxy_set_header Host \$host;
+    }
+
+    location = /install {
+        proxy_pass http://127.0.0.1:$APP_PORT;
+        proxy_set_header Host \$host;
+    }
+
+    location /download/ {
+        proxy_pass http://127.0.0.1:$APP_PORT;
+        proxy_set_header Host \$host;
+    }
+
+    location /assets/ {
+        expires 30d;
+        add_header Cache-Control \"public, immutable\";
+        try_files \$uri =404;
+    }
+
+    location = /index.html {
+        add_header Cache-Control \"no-cache\";
+    }
+
+    location / {
+        try_files \$uri \$uri/ /index.html;
+    }
+}
+"
+  if ! grep -q "listen 443 ssl" "$NGINX_SITE"; then
+    # Flip the :80 web-UI location to a redirect BEFORE appending the TLS block
+    # (the 443 block itself keeps serving the SPA directly).
+    sed -i 's|try_files \$uri \$uri/ /index.html;|return 301 https://\$host\$request_uri;|' "$NGINX_SITE"
+    printf '%s\n' "$NGINX_TLS_BLOCK" >> "$NGINX_SITE"
+  fi
+  nginx -t
+  systemctl reload nginx
+  log "HTTPS enabled: https://$PUBLIC_IP/ (web UI redirects; API/gateway endpoints remain on HTTP)"
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Central MySQL cluster registration and diagnostics
 # ---------------------------------------------------------------------------
 mysql_config_file=$(mktemp /run/net2app-mysql.XXXXXX)
 cleanup_mysql_config() { rm -f "$mysql_config_file"; }
