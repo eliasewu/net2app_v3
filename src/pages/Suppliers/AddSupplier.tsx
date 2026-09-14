@@ -387,7 +387,7 @@ export const AddSupplier: React.FC = () => {
                   </div>
                   <div>
                     <p className="font-semibold text-gray-800">Download Net2appPro APK</p>
-                    <p className="text-xs text-gray-500">Version 3.1 — QR pairing · HTTP REST + SMPP inbound · x-api-key · 3.2 MB</p>
+                    <p className="text-xs text-gray-500">Latest build — QR pairing · HTTP REST + SMPP inbound · x-api-key · ~3.2 MB</p>
                   </div>
                 </div>
 
