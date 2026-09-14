@@ -37,6 +37,19 @@ export interface ConnectionStatus {
   uptime: number;
 }
 
+export interface DeviceInfo {
+  model: string;
+  manufacturer: string;
+  androidVersion: string;
+  sdkInt: number;
+  simReady: boolean;
+  simCarrier: string;
+  simNumber: string;
+  appVersion: string;
+  appVersionCode?: number;
+  simCount?: number;
+}
+
 export interface GatewayStats {
   totalSent: number;
   totalReceived: number;
@@ -59,6 +72,7 @@ interface GatewayContextType {
   requestSmsPermission: () => Promise<boolean>;
   checkSmsPermissions: () => Promise<boolean>;
   openPermissionSettings: () => Promise<void>;
+  deviceInfo: DeviceInfo | null;
   isConfigured: boolean;
 }
 
@@ -154,6 +168,7 @@ export function GatewayProvider({ children }: { children: ReactNode }) {
     lastActivity: null,
   });
   const [messages, setMessages] = useState<SmsMessage[]>(loadMessages);
+  const [deviceInfo, setDeviceInfo] = useState<DeviceInfo | null>(null);
   const messagesRef = useRef<SmsMessage[]>(messages);
   useEffect(() => { messagesRef.current = messages; }, [messages]);
   const [startTime] = useState(Date.now);
@@ -301,6 +316,29 @@ export function GatewayProvider({ children }: { children: ReactNode }) {
           }));
         }
       } catch {}
+      // Refresh device/SIM snapshot (cheap local call — reflects permission
+      // grants the moment the user returns from Settings).
+      try {
+        const di = await callPlugin('getDeviceInfo');
+        if (di) {
+          const next: DeviceInfo = {
+            model: di.model || '',
+            manufacturer: di.manufacturer || '',
+            androidVersion: di.androidVersion || '',
+            sdkInt: di.sdkInt || 0,
+            simReady: !!di.simReady,
+            simCarrier: di.simCarrier || '',
+            simNumber: di.simNumber || '',
+            appVersion: di.appVersion || '',
+            appVersionCode: di.appVersionCode,
+            simCount: di.simCount,
+          };
+          setDeviceInfo(prev => {
+            if (prev && JSON.stringify(prev) === JSON.stringify(next)) return prev;
+            return next;
+          });
+        }
+      } catch {}
       // Refresh stats using latest messages
       refreshMessages();
     }, 5000);
@@ -359,6 +397,7 @@ export function GatewayProvider({ children }: { children: ReactNode }) {
     requestSmsPermission,
     checkSmsPermissions,
     openPermissionSettings,
+    deviceInfo,
     isConfigured,
   };
 

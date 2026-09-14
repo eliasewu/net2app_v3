@@ -4,7 +4,7 @@ import { useGateway } from '../services/GatewayContext';
 import { ApiClient } from '../services/ApiClient';
 
 export default function DashboardPage() {
-  const { config, connectionStatus, stats, sendSms, refreshMessages, checkSmsPermissions, openPermissionSettings } = useGateway();
+  const { config, connectionStatus, stats, sendSms, refreshMessages, checkSmsPermissions, openPermissionSettings, deviceInfo } = useGateway();
   const navigate = useNavigate();
 
   const [quickSms, setQuickSms] = useState({ to: '', text: '' });
@@ -199,6 +199,62 @@ export default function DashboardPage() {
           <button className="btn btn-sm btn-outline" onClick={() => navigate('/setup')}>
             ⚙ Settings
           </button>
+        </div>
+      </div>
+
+      {/* Device & SIM */}
+      <div className="status-details-card">
+        <h3>📱 Device & SIM</h3>
+        <div className="status-rows">
+          <div className="status-row">
+            <span>Device</span>
+            <span className="info">
+              {deviceInfo ? `${deviceInfo.manufacturer} ${deviceInfo.model}`.trim() : '—'}
+            </span>
+          </div>
+          <div className="status-row">
+            <span>Android Version</span>
+            <span className="info">
+              {deviceInfo ? `${deviceInfo.androidVersion} (API ${deviceInfo.sdkInt})` : '—'}
+            </span>
+          </div>
+          <div className="status-row">
+            <span>SIM Status</span>
+            <span className={deviceInfo?.simReady ? 'ok' : 'error'}>
+              {deviceInfo
+                ? deviceInfo.simReady
+                  ? '✅ Ready'
+                  : '❌ No SIM detected'
+                : '—'}
+            </span>
+          </div>
+          <div className="status-row">
+            <span>Carrier</span>
+            <span className="info">{deviceInfo?.simCarrier || '—'}</span>
+          </div>
+          <div className="status-row">
+            <span>SIM Number</span>
+            <span className="info">
+              {deviceInfo?.simNumber || '—'}
+              {deviceInfo && deviceInfo.simReady && !deviceInfo.simNumber && (
+                <em style={{ fontSize: 11, marginLeft: 6 }}>(grant Phone permission to show)</em>
+              )}
+            </span>
+          </div>
+          {!!deviceInfo?.simCount && deviceInfo.simCount > 1 && (
+            <div className="status-row">
+              <span>Active SIMs</span>
+              <span className="info">{deviceInfo.simCount}</span>
+            </div>
+          )}
+          <div className="status-row">
+            <span>App Version</span>
+            <span className="info">
+              {deviceInfo?.appVersion
+                ? `${deviceInfo.appVersion}${deviceInfo.appVersionCode ? ` (#${deviceInfo.appVersionCode})` : ''}`
+                : '—'}
+            </span>
+          </div>
         </div>
       </div>
 

@@ -9919,9 +9919,32 @@ app.post('/api/gateway/heartbeat', async (req, res) => {
         }
         const supplier = supplierR.rows[0];
 
+        // Store device/SIM info reported by the Android app (v3.5.0+ heartbeats).
+        const b = req.body || {};
+        const clean = (v, max) => {
+            const s = String(v == null ? '' : v).trim();
+            return s ? s.substring(0, max) : null;
+        };
         await pool.query(
-            `UPDATE suppliers SET bind_status = 'bound', last_heartbeat_at = NOW(), updated_at = NOW() WHERE id = $1`,
-            [supplier.id]
+            `UPDATE suppliers SET
+                bind_status = 'bound',
+                last_heartbeat_at = NOW(),
+                device_name = COALESCE($2, device_name),
+                android_version = COALESCE($3, android_version),
+                sim_ready = COALESCE($4, sim_ready),
+                sim_carrier = COALESCE($5, sim_carrier),
+                sim_number = COALESCE($6, sim_number),
+                last_device_info_at = NOW(),
+                updated_at = NOW()
+             WHERE id = $1`,
+            [
+                supplier.id,
+                clean(b.device_name, 120),
+                clean(b.android_version, 60),
+                typeof b.sim_ready === 'boolean' ? b.sim_ready : null,
+                clean(b.sim_carrier, 120),
+                clean(b.sim_number, 40),
+            ]
         ).catch(() => {});
 
         // Pick up both 'queued' (not yet processed by worker) and 'submitted'

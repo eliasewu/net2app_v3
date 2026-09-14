@@ -141,6 +141,83 @@ public class SmsGatewayPlugin extends Plugin {
         }
     }
 
+    // ============================================================
+    // DEVICE / SIM DETECTION
+    // ============================================================
+
+    /** True when a SIM is present and ready for SMS. */
+    private boolean isSimReady() {
+        try {
+            android.telephony.TelephonyManager tm =
+                    (android.telephony.TelephonyManager) context.getSystemService(Context.TELEPHONY_SERVICE);
+            return tm != null && tm.getSimState() == android.telephony.TelephonyManager.SIM_STATE_READY;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** SIM operator name (falls back to network operator). */
+    private String getSimCarrier() {
+        try {
+            android.telephony.TelephonyManager tm =
+                    (android.telephony.TelephonyManager) context.getSystemService(Context.TELEPHONY_SERVICE);
+            if (tm == null) return "";
+            String name = tm.getSimOperatorName();
+            if (name == null || name.isEmpty()) name = tm.getNetworkOperatorName();
+            return name != null ? name : "";
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /** SIM line number — requires READ_PHONE_STATE; empty string when not granted. */
+    private String getSimNumber() {
+        try {
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE)
+                    != PackageManager.PERMISSION_GRANTED) return "";
+            android.telephony.TelephonyManager tm =
+                    (android.telephony.TelephonyManager) context.getSystemService(Context.TELEPHONY_SERVICE);
+            String n = tm != null ? tm.getLine1Number() : null;
+            return n != null ? n : "";
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /** Full device/SIM snapshot for the dashboard card. */
+    @PluginMethod
+    public void getDeviceInfo(PluginCall call) {
+        JSObject result = new JSObject();
+        result.put("model", Build.MODEL);
+        result.put("manufacturer", Build.MANUFACTURER);
+        result.put("androidVersion", Build.VERSION.RELEASE);
+        result.put("sdkInt", Build.VERSION.SDK_INT);
+        result.put("simReady", isSimReady());
+        result.put("simCarrier", getSimCarrier());
+        result.put("simNumber", getSimNumber());
+        try {
+            android.content.pm.PackageInfo pi = context.getPackageManager()
+                    .getPackageInfo(context.getPackageName(), 0);
+            result.put("appVersion", pi.versionName);
+            result.put("appVersionCode", pi.versionCode);
+        } catch (Exception e) {
+            result.put("appVersion", "");
+        }
+        try {
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE)
+                    == PackageManager.PERMISSION_GRANTED) {
+                android.telephony.SubscriptionManager sm = (android.telephony.SubscriptionManager)
+                        context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE);
+                result.put("simCount", sm != null ? sm.getActiveSubscriptionInfoCount() : 0);
+            } else {
+                result.put("simCount", isSimReady() ? 1 : 0);
+            }
+        } catch (Exception e) {
+            result.put("simCount", 0);
+        }
+        call.resolve(result);
+    }
+
     /** True when all SMS runtime permissions are granted. */
     private boolean hasSmsPermissions() {
         return ContextCompat.checkSelfPermission(context, Manifest.permission.SEND_SMS) == PackageManager.PERMISSION_GRANTED
@@ -187,9 +264,20 @@ public class SmsGatewayPlugin extends Plugin {
         PluginCall call = pendingPermissionCall;
         pendingPermissionCall = null;
 
-        boolean allGranted = grantResults.length > 0;
-        for (int r : grantResults) {
-            if (r != PackageManager.PERMISSION_GRANTED) { allGranted = false; break; }
+        // SMS permissions are REQUIRED for the gateway to work; the Phone
+        // permissions (READ_PHONE_STATE / READ_PHONE_NUMBERS) are optional and
+        // only affect reporting the SIM line number — denying them must not
+        // mark the overall result as denied.
+        boolean allGranted = true;
+        for (int i = 0; i < permissions.length; i++) {
+            String p = permissions[i];
+            boolean isSms = Manifest.permission.SEND_SMS.equals(p)
+                    || Manifest.permission.RECEIVE_SMS.equals(p)
+                    || Manifest.permission.READ_SMS.equals(p);
+            if (isSms && (i >= grantResults.length || grantResults[i] != PackageManager.PERMISSION_GRANTED)) {
+                allGranted = false;
+                break;
+            }
         }
         JSObject result = new JSObject();
         result.put("granted", allGranted);
@@ -223,6 +311,15 @@ public class SmsGatewayPlugin extends Plugin {
             if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECEIVE_BOOT_COMPLETED)
                     != PackageManager.PERMISSION_GRANTED) {
                 permissions.add(Manifest.permission.RECEIVE_BOOT_COMPLETED);
+            }
+            // Optional — enables reporting the SIM line number to the server.
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE)
+                    != PackageManager.PERMISSION_GRANTED) {
+                permissions.add(Manifest.permission.READ_PHONE_STATE);
+            }
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_NUMBERS)
+                    != PackageManager.PERMISSION_GRANTED) {
+                permissions.add(Manifest.permission.READ_PHONE_NUMBERS);
             }
 
             if (permissions.isEmpty()) {
@@ -485,6 +582,10 @@ public class SmsGatewayPlugin extends Plugin {
 
                 JSONObject payload = new JSONObject();
                 payload.put("device_name", Build.MODEL);
+                payload.put("android_version", "Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")");
+                payload.put("sim_ready", isSimReady());
+                payload.put("sim_carrier", getSimCarrier());
+                payload.put("sim_number", getSimNumber());
                 payload.put("pending_mt_count", offlineQueue != null ? offlineQueue.getPendingCount() : 0);
 
                 java.io.OutputStream os = conn.getOutputStream();

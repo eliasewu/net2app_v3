@@ -166,6 +166,12 @@ export interface Supplier {
   force_dlr_timeout_mode?: string;
   /** Android gateway: timestamp of the last heartbeat (null = never seen) */
   last_heartbeat_at?: string | null;
+  /** Android gateway device/SIM info reported with each heartbeat */
+  device_name?: string | null;
+  android_version?: string | null;
+  sim_ready?: boolean | null;
+  sim_carrier?: string | null;
+  sim_number?: string | null;
 
   created_at: string;
   updated_at: string;

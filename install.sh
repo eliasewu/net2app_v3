@@ -307,6 +307,7 @@ MIGRATIONS=(
   src/database/migrate_pcap.sql
   src/database/migrate_security.sql
   src/database/migrate_supplier_heartbeat.sql
+  src/database/migrate_supplier_device_info.sql
 )
 for migration in "${MIGRATIONS[@]}"; do
   [[ -f "$migration" ]] || continue

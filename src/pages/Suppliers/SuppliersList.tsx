@@ -221,6 +221,22 @@ export const SuppliersList: React.FC = () => {
               {lastSeenLabel}
             </span>
           )}
+          {isAndroid && supplier.android_version && (
+            <span
+              className="text-[11px] text-gray-500 truncate max-w-[220px]"
+              title={[
+                supplier.device_name,
+                supplier.android_version,
+                supplier.sim_ready === false ? 'SIM: not ready' : supplier.sim_carrier ? `SIM: ${supplier.sim_carrier}` : null,
+                supplier.sim_number ? `Line: ${supplier.sim_number}` : null,
+              ].filter(Boolean).join(' · ')}
+            >
+              {supplier.device_name ? `${supplier.device_name} · ` : ''}
+              {supplier.android_version}
+              {supplier.sim_carrier ? ` · ${supplier.sim_carrier}` : ''}
+              {supplier.sim_ready === false ? ' · ⚠ no SIM' : ''}
+            </span>
+          )}
           {supplier.status === 'inactive' && (
             <button
               onClick={() => {
