@@ -146,6 +146,19 @@ apt-get install -y --no-install-recommends \
   redis-server redis-tools postgresql postgresql-contrib \
   mysql-client openjdk-21-jdk maven
 
+# Small VPS nodes can OOM during npm/maven builds. Ensure swap exists before
+# any build step runs.
+MEM_MB=$(free -m | awk '/^Mem:/{print $2}')
+SWAP_MB=$(free -m | awk '/^Swap:/{print $2}')
+if [[ "${MEM_MB:-0}" -lt 2000 && "${SWAP_MB:-0}" -lt 1024 && ! -f /swapfile ]]; then
+  log "Low-memory node (${MEM_MB:-?} MB RAM, ${SWAP_MB:-0} MB swap) — creating 2G swapfile"
+  fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
+  chmod 600 /swapfile
+  mkswap /swapfile >/dev/null
+  swapon /swapfile
+  grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+
 if ! command -v node >/dev/null 2>&1 || [[ "$(node -p 'process.versions.node.split(".")[0]')" -lt "$NODE_MAJOR" ]]; then
   log "Installing Node.js ${NODE_MAJOR}.x LTS"
   curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -
@@ -408,13 +421,23 @@ chmod 751 "$APP_DIR"
 find "$APP_DIR/dist" -type d -exec chmod 755 {} +
 find "$APP_DIR/dist" -type f -exec chmod 644 {} +
 
-# Net2appPro Android gateway APK ships with the repository and is served via
-# /download so every deployment offers QR pairing for Android SMS suppliers.
-if [[ -f "$APP_DIR/public/net2apppro-3.0.0.apk" ]]; then
-  chmod 644 "$APP_DIR/public/net2apppro-3.0.0.apk"
-  log "Net2appPro APK included: /download/net2apppro-3.0.0.apk"
+# Net2appPro Android gateway APK: git ignores *.apk so a fresh clone has none.
+# Serve the newest APK found in public/, optionally downloading one via APK_URL.
+APK_FILE=""
+for f in "$APP_DIR"/public/net2apppro-*.apk; do
+  [[ -f "$f" ]] && APK_FILE="$f"
+done
+if [[ -z "$APK_FILE" && -n "${APK_URL:-}" ]]; then
+  log "Downloading Net2appPro APK from APK_URL"
+  curl -fsSL --retry 3 --retry-delay 2 -o "$APP_DIR/public/net2apppro-download.apk" "$APK_URL"
+  APK_FILE="$APP_DIR/public/net2apppro-download.apk"
+fi
+if [[ -n "$APK_FILE" ]]; then
+  chmod 644 "$APK_FILE"
+  chown "$APP_USER:$APP_USER" "$APK_FILE"
+  log "Net2appPro APK ready: /download/$(basename "$APK_FILE") (alias /download/net2app-gateway.apk)"
 else
-  warn "Net2appPro APK missing from public/ — Android pairing download link will 404"
+  warn "No Net2appPro APK in public/ and APK_URL not set — copy an APK to $APP_DIR/public/ or set APK_URL, otherwise the Android pairing download 404s"
 fi
 
 if [[ -f "$APP_DIR/java-sms-gateway/pom.xml" ]]; then
@@ -462,7 +485,7 @@ module.exports = {
       name: 'net2app-smpg',
       cwd: path.join(appDir, 'java-sms-gateway'),
       script: '/usr/bin/java',
-      args: ['-jar', 'target/sms-gateway-1.0.0.jar'],
+      args: ['-jar', '__JAVA_JAR__'],
       interpreter: 'none',
       autorestart: true,
       watch: false,
@@ -475,6 +498,8 @@ module.exports = {
   ],
 };
 EOF
+# Use the actually-built JAR file name instead of assuming a fixed version.
+sed -i "s|__JAVA_JAR__|$JAVA_JAR|g" "$PM2_CONFIG"
 chown "$APP_USER:$APP_USER" "$PM2_CONFIG"
 chmod 640 "$PM2_CONFIG"
 
@@ -685,6 +710,7 @@ curl -fsS --max-time 10 "http://127.0.0.1:${JAVA_BRIDGE_PORT}/health" >/tmp/net2
 
 systemctl is-enabled "pm2-${APP_USER}" >/dev/null || die "PM2 boot registration is not enabled"
 run_as_app pm2 status
+log "Installation completed successfully"
 
 printf '\n%b============================================================%b\n' "$GREEN" "$NC"
 printf '%b  Net2App installation completed successfully%b\n' "$GREEN" "$NC"
