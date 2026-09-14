@@ -71,7 +71,10 @@ export default function SetupPage() {
   const handleSave = async () => {
     setSaving(true);
     try {
-      await requestSmsPermission();
+      const granted = await requestSmsPermission();
+      if (!granted) {
+        setPairBanner('⚠ SMS permissions were not granted. Open Android Settings → Apps → Net2appPro → Permissions, allow SMS, then reopen the app.');
+      }
       await saveConfig(form);
 
       if (form.serverUrl) {

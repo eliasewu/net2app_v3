@@ -41,6 +41,7 @@ public class SmsGatewayPlugin extends Plugin {
     private Activity activity;
     private Context context;
     private ExecutorService executor;
+    private PluginCall pendingPermissionCall;
 
     // HTTP heartbeat config
     private String serverUrl = "";
@@ -99,6 +100,28 @@ public class SmsGatewayPlugin extends Plugin {
         Log.i(TAG, "SmsGatewayPlugin loaded");
     }
 
+    /**
+     * Resolves the pending JS permission call when the user answers the system
+     * dialog. BridgeActivity forwards the result here from MainActivity.
+     */
+    public void handleRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        if (requestCode != SMS_PERMISSION_CODE || pendingPermissionCall == null) return;
+        PluginCall call = pendingPermissionCall;
+        pendingPermissionCall = null;
+
+        boolean allGranted = grantResults.length > 0;
+        for (int r : grantResults) {
+            if (r != PackageManager.PERMISSION_GRANTED) { allGranted = false; break; }
+        }
+        JSObject result = new JSObject();
+        result.put("granted", allGranted);
+        if (!allGranted) {
+            result.put("message", "SMS permissions were not fully granted — the gateway cannot send or receive SMS. Grant them in Settings → Apps → Net2appPro → Permissions.");
+        }
+        call.resolve(result);
+        Log.i(TAG, "Permission result: granted=" + allGranted);
+    }
+
     // ============================================================
     // CAPACITOR PLUGIN METHODS
     // ============================================================
@@ -130,8 +153,9 @@ public class SmsGatewayPlugin extends Plugin {
                 result.put("permissions", new JSONArray());
                 call.resolve(result);
             } else {
-                // Save call for permission result
-                bridge.saveCall(call);
+                // Keep the call until the user answers the system dialog; it is
+                // resolved in handleRequestPermissionsResult below.
+                pendingPermissionCall = call;
                 ActivityCompat.requestPermissions(activity,
                         permissions.toArray(new String[0]), SMS_PERMISSION_CODE);
             }
