@@ -115,6 +115,7 @@ public class SmsGatewayPlugin extends Plugin {
                 boolean registered = registerWithServer();
                 if (registered) {
                     isRegistered = true;
+                    startGatewayService();
                     startHeartbeat();
                     startQueueFlusher();
                     startDlrReaper();
@@ -123,6 +124,20 @@ public class SmsGatewayPlugin extends Plugin {
                     Log.i(TAG, "Gateway auto-started from saved config: " + username);
                 }
             });
+        }
+    }
+
+    /** Bring up the foreground service that keeps the process alive. */
+    private void startGatewayService() {
+        try {
+            android.content.Intent svc = new android.content.Intent(context, GatewayService.class);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(svc);
+            } else {
+                context.startService(svc);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to start GatewayService: " + e.getMessage());
         }
     }
 
@@ -256,20 +271,19 @@ public class SmsGatewayPlugin extends Plugin {
         if (serverUrl.isEmpty() || username.isEmpty()) {
             call.reject("Server URL and username are required");
             return;
-        }
-
-        executor.execute(() -> {
-            // Register with server
-            boolean registered = registerWithServer();
-            if (registered) {
-                isRegistered = true;
-                startHeartbeat();
-                startQueueFlusher();
-                startDlrReaper();
-                registerSmsReceiver();
-                registerDlrReceiver();
-                Log.i(TAG, "Gateway configured and registered: " + username);
-            }
+        }            executor.execute(() -> {
+                // Register with server
+                boolean registered = registerWithServer();
+                if (registered) {
+                    isRegistered = true;
+                    startGatewayService();
+                    startHeartbeat();
+                    startQueueFlusher();
+                    startDlrReaper();
+                    registerSmsReceiver();
+                    registerDlrReceiver();
+                    Log.i(TAG, "Gateway configured and registered: " + username);
+                }
 
             JSObject result = new JSObject();
             result.put("success", registered);
@@ -289,6 +303,7 @@ public class SmsGatewayPlugin extends Plugin {
         result.put("smsPermissionGranted", hasSmsPermissions());
         result.put("offlineQueuePending", offlineQueue != null ? offlineQueue.getPendingCount() : 0);
         result.put("smppEnabled", smppEnabled);
+        result.put("foregroundServiceRunning", GatewayService.running);
         if (smppClient != null) {
             result.put("smppConnected", smppClient.isConnected());
         } else {

@@ -295,7 +295,9 @@ export function GatewayProvider({ children }: { children: ReactNode }) {
               : status.smsReceiverActive,
             smppConnected: status.smppConnected,
             offlineQueuePending: status.offlineQueuePending,
-            backgroundService: status.smsReceiverActive || status.isRegistered,
+            // Background = foreground service alive (or at minimum the SMS
+            // receiver is registered on builds predating the service).
+            backgroundService: status.foregroundServiceRunning === true || status.smsReceiverActive || status.isRegistered,
           }));
         }
       } catch {}
@@ -320,7 +322,7 @@ export function GatewayProvider({ children }: { children: ReactNode }) {
           smsPermission: typeof status.smsPermissionGranted === 'boolean'
             ? status.smsPermissionGranted
             : status.smsReceiverActive,
-          backgroundService: status.smsReceiverActive || status.isRegistered,
+          backgroundService: status.foregroundServiceRunning === true || status.smsReceiverActive || status.isRegistered,
           offlineQueuePending: status.offlineQueuePending,
         }));
       }
