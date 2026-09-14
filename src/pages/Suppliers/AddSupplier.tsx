@@ -387,31 +387,41 @@ export const AddSupplier: React.FC = () => {
                   </div>
                   <div>
                     <p className="font-semibold text-gray-800">Download Net2appPro APK</p>
-                    <p className="text-xs text-gray-500">Version 3.0 — QR pairing · HTTP REST + SMPP inbound · 3.2 MB</p>
+                    <p className="text-xs text-gray-500">Version 3.1 — QR pairing · HTTP REST + SMPP inbound · x-api-key · 3.2 MB</p>
                   </div>
                 </div>
 
-                {/* Direct download button */}
-                <a
-                  href="/download/net2apppro-3.0.0.apk"
-                  download
-                  className="inline-flex items-center gap-2 px-5 py-3 bg-green-600 text-white rounded-lg font-medium hover:bg-green-700 transition-colors shadow-sm"
-                >
-                  <Download size={18} />
-                  Download APK
-                </a>
+                {/* Direct download button + Download QR (one-tap install page) */}
+                <div className="flex flex-col sm:flex-row items-start sm:items-center gap-5">
+                  <div>
+                    <a
+                      href="/download/net2app-gateway.apk"
+                      download
+                      className="inline-flex items-center gap-2 px-5 py-3 bg-green-600 text-white rounded-lg font-medium hover:bg-green-700 transition-colors shadow-sm"
+                    >
+                      <Download size={18} />
+                      Download APK
+                    </a>
+                    <p className="text-xs text-gray-500 mt-2">Always serves the newest Net2appPro build in public/ — the link never goes stale.</p>
+                  </div>
+                  <QrBox
+                    payload={`${window.location.origin}/install`}
+                    hint="📱 QR 1 — scan to download &amp; install on Android"
+                    size={160}
+                  />
+                </div>
 
                 {/* External URL copy */}
                 <div className="mt-4 p-3 bg-white rounded-lg border border-gray-200">
-                  <p className="text-xs font-medium text-gray-500 mb-2">External Download URL (for sharing)</p>
+                  <p className="text-xs font-medium text-gray-500 mb-2">External Install URL (for sharing)</p>
                   <div className="flex items-center gap-2">
                     <code className="flex-1 text-xs bg-gray-50 px-3 py-2 rounded font-mono text-gray-700 break-all select-all">
-                      {window.location.origin}/download/net2apppro-3.0.0.apk
+                      {window.location.origin}/install
                     </code>
                     <button
                       type="button"
                       onClick={() => {
-                        navigator.clipboard.writeText(`${window.location.origin}/download/net2apppro-3.0.0.apk`);
+                        navigator.clipboard.writeText(`${window.location.origin}/install`);
                       }}
                       className="p-2 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors"
                       title="Copy URL"
@@ -431,10 +441,10 @@ export const AddSupplier: React.FC = () => {
                   <div className="flex flex-col sm:flex-row items-center gap-5">
                     <img src={pairingQr} alt="Net2appPro pairing QR" className="rounded-xl border border-blue-200 bg-white p-2" width={230} height={230} />
                     <div className="text-sm text-gray-600 space-y-2">
-                      <p><strong>1.</strong> Install &amp; open <b>Net2appPro</b> on the phone</p>
-                      <p><strong>2.</strong> Tap <b>📷 Scan Pairing QR</b></p>
+                      <p><strong>1.</strong> Install <b>Net2appPro</b> — scan the green <b>Download QR</b> above</p>
+                      <p><strong>2.</strong> Open the app → tap <b>📷 Scan Pairing QR</b></p>
                       <p><strong>3.</strong> Point at this code — server <code className="bg-blue-100 px-1 rounded text-xs">{window.location.origin}</code>, username <code className="bg-blue-100 px-1 rounded text-xs">{formData.smpp_username || '…'}</code> and mode fill in automatically</p>
-                      <p><strong>4.</strong> Press <b>Save &amp; Connect</b> in the app — the device registers as an inbound SMS supplier</p>
+                      <p><strong>4.</strong> Press <b>Save &amp; Connect</b> — the device heartbeats and shows <b>bound</b> in the supplier list</p>
                     </div>
                   </div>
                 ) : (

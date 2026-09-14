@@ -7,9 +7,30 @@ import { Button } from '../../components/UI/Button';
 import { Badge } from '../../components/UI/Badge';
 import { Table, Pagination } from '../../components/UI/Table';
 import { Modal } from '../../components/UI/Modal';
+import { QrBox } from '../../components/UI/QrBox';
 import { api } from '../../services/api';
 import { Supplier } from '../../types';
 import { connectorIsBound } from '../../utils/bindStatus';
+
+/** QR 1 — points at the one-tap /install page so any phone can grab the newest APK. */
+const DownloadQrBox: React.FC<{ size?: number }> = ({ size = 170 }) => (
+  <QrBox
+    payload={`${window.location.origin}/install`}
+    hint="Scan to download & install Net2appPro"
+    size={size}
+  />
+);
+
+// Android devices poll every 5s → 15s grace = 3 missed beats.
+const HEARTBEAT_TIMEOUT_MS = 15000;
+/** Online = a heartbeating Android gateway, or a bound SMPP / active HTTP / VoiceOTP endpoint. */
+const isSupplierOnline = (s: Supplier): boolean => {
+  if (s.connection_type === 'android_SMS') {
+    const last = s.last_heartbeat_at ? new Date(s.last_heartbeat_at).getTime() : null;
+    return last !== null && Date.now() - last < HEARTBEAT_TIMEOUT_MS;
+  }
+  return connectorIsBound(s.connection_type, s.bind_status, s.status === 'active');
+};
 
 export const SuppliersList: React.FC = () => {
   const navigate = useNavigate();
@@ -167,16 +188,11 @@ export const SuppliersList: React.FC = () => {
         const isAndroid = ct === 'android_SMS';
         // Only SMPP has a real bound/unbound state. HTTP/VoiceOTP/OTT are always
         // available, so they show as bound whenever the supplier is active.
-        const onlineLabel = isSMPP ? 'bound' : (ct === 'http' || ct === 'voice_otp') ? 'bound' : 'connected';
+        const onlineLabel = isSMPP || isAndroid || ct === 'http' || ct === 'voice_otp' ? 'bound' : 'connected';
         const offlineLabel = isSMPP ? 'unbound' : 'offline';
-        // Android devices are only online if they heartbeated recently
-        // (poll interval 5s → 15s grace = 3 missed beats).
-        const HEARTBEAT_TIMEOUT_MS = 15000;
         const lastBeat = supplier.last_heartbeat_at ? new Date(supplier.last_heartbeat_at).getTime() : null;
         const beatAge = lastBeat ? Date.now() - lastBeat : null;
-        const isOnline = isAndroid
-          ? (beatAge !== null && beatAge < HEARTBEAT_TIMEOUT_MS)
-          : connectorIsBound(ct, supplier.bind_status, supplier.status === 'active');
+        const isOnline = isSupplierOnline(supplier);
         const lastSeenLabel = lastBeat
           ? (beatAge! < 60000 ? `${Math.max(1, Math.floor(beatAge! / 1000))}s ago`
             : beatAge! < 3600000 ? `${Math.floor(beatAge! / 60000)}m ago`
@@ -408,7 +424,7 @@ export const SuppliersList: React.FC = () => {
         <div className="bg-white rounded-xl p-4 border border-gray-200">
           <p className="text-sm text-gray-500">Online</p>
           <p className="text-2xl font-bold text-blue-600 mt-1">
-            {suppliers.filter(s => connectorIsBound(s.connection_type, s.bind_status, s.status === 'active')).length}
+            {suppliers.filter(s => !s.is_deleted && isSupplierOnline(s)).length}
           </p>
         </div>
         <div className="bg-white rounded-xl p-4 border border-gray-200">
@@ -504,8 +520,15 @@ export const SuppliersList: React.FC = () => {
       >
         <div className="text-center space-y-4">
           <p className="text-sm text-gray-600">
-            Open <b>Net2appPro</b> on the phone → <b>Scan Pairing QR</b>. The app fills in the server, credentials and mode automatically — no manual IP entry.
+            <b>Step 1 — install the app:</b> scan the Download QR with the phone (or open <code className="bg-gray-100 px-1 rounded">{window.location.origin}/install</code>). <b>Step 2 — connect:</b> open Net2appPro → <b>Scan Pairing QR</b> below. The device registers itself and shows <b>bound</b> in the list once it heartbeats.
           </p>
+          <div className="flex flex-col sm:flex-row items-center justify-center gap-6">
+            <DownloadQrBox />
+            <div className="text-left text-xs text-gray-500 max-w-[220px]">
+              <p className="font-semibold text-gray-700 mb-1">📱 QR 1 — Download</p>
+              <p>Points at <code className="bg-gray-100 px-1 rounded">/install</code> — Android phones auto-download the newest APK.</p>
+            </div>
+          </div>
           <div className="flex items-center justify-center gap-2">
             <label className="text-sm text-gray-600">Mode:</label>
             <select
@@ -524,17 +547,20 @@ export const SuppliersList: React.FC = () => {
           {pairingLoading || !pairingModal?.qr ? (
             <div className="py-10 text-gray-400 text-sm">Generating QR…</div>
           ) : (
-            <img src={pairingModal.qr} alt="Pairing QR" className="mx-auto rounded-xl border border-gray-200" width={300} height={300} />
+            <div className="space-y-2">
+              <p className="text-sm font-semibold text-gray-700">📷 QR 2 — Scan &amp; Connect</p>
+              <img src={pairingModal.qr} alt="Pairing QR" className="mx-auto rounded-xl border border-gray-200" width={300} height={300} />
+            </div>
           )}
           <p className="text-xs text-gray-400 flex items-center justify-center gap-1">
             <QrCode size={12} /> Scan once — the device registers itself as an SMS supplier
           </p>
           <a
-            href="/download/net2apppro-3.0.0.apk"
+            href="/download/net2app-gateway.apk"
             download
             className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 text-white text-sm hover:bg-blue-700"
           >
-            <Smartphone size={14} /> Download Net2appPro APK (v3.0.0)
+            <Smartphone size={14} /> Download Net2appPro APK (latest)
           </a>
           <Button variant="secondary" onClick={() => setPairingModal(null)}>Close</Button>
         </div>

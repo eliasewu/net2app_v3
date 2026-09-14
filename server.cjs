@@ -9699,13 +9699,20 @@ app.use(express.static('dist'));
 // automatically prompt the user to install. Content-Disposition: attachment
 // ensures a download dialog rather than inline display.
 app.get('/download/net2app-gateway.apk', (req, res) => {
-    const apkPath = path.join(__dirname, 'public', 'net2app-gateway.apk');
     const fs = require('fs');
-    if (!fs.existsSync(apkPath)) {
+    const pubDir = path.join(__dirname, 'public');
+    // Serve the newest Net2appPro APK present in public/ so the /install page
+    // and download QRs never point at a stale or missing filename.
+    const apks = fs.existsSync(pubDir)
+        ? fs.readdirSync(pubDir).filter(f => /^net2apppro.*\.apk$/.test(f)).sort()
+        : [];
+    const apkName = apks[apks.length - 1];
+    if (!apkName) {
         return res.status(404).json({ error: 'APK not found' });
     }
+    const apkPath = path.join(pubDir, apkName);
     res.setHeader('Content-Type', 'application/vnd.android.package-archive');
-    res.setHeader('Content-Disposition', 'attachment; filename="net2app-gateway.apk"');
+    res.setHeader('Content-Disposition', `attachment; filename="${apkName}"`);
     res.setHeader('Content-Length', fs.statSync(apkPath).size);
     fs.createReadStream(apkPath).pipe(res);
 });
