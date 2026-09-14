@@ -7,6 +7,8 @@ export interface GatewayConfig {
   serverUrl: string;
   username: string;
   password: string;
+  /** Gateway API key (x-api-key) — alternative to username/password */
+  apiKey?: string;
   connectionType: 'http_rest' | 'smpp_inbound';
   deviceName: string;
   smppHost?: string;
@@ -165,6 +167,7 @@ export function GatewayProvider({ children }: { children: ReactNode }) {
         serverUrl: c.serverUrl,
         username: c.username,
         password: c.password,
+        apiKey: c.apiKey || '',
         smppEnabled: c.connectionType === 'smpp_inbound',
       });
       if (c.connectionType === 'smpp_inbound') {
@@ -299,7 +302,7 @@ export function GatewayProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     callPlugin('loadSavedConfig').then(saved => {
       if (saved?.serverUrl) {
-        setConfigState(prev => ({ ...prev, serverUrl: saved.serverUrl, username: saved.username, password: saved.password }));
+        setConfigState(prev => ({ ...prev, serverUrl: saved.serverUrl, username: saved.username, password: saved.password, apiKey: saved.apiKey || '' }));
       }
     });
     callPlugin('getStatus').then(status => {

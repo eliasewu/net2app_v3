@@ -1,10 +1,11 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Menu, Bell, Search, User, Settings, LogOut, ChevronDown,
   Sun, Moon, Globe
 } from 'lucide-react';
 import { useAuth } from '../../store/AuthContext';
 import { useData } from '../../store/DataContext';
+import { dashboardApi } from '../../services/api';
 import { connectorIsBound } from '../../utils/bindStatus';
 
 interface HeaderProps {
@@ -21,7 +22,8 @@ function formatNumber(n: number): string {
 
 export const Header: React.FC<HeaderProps> = ({ onToggleSidebar, onToggleMobile, isSidebarCollapsed }) => {
   const { notifications, smsLogs, suppliers } = useData();
-  const { logout } = useAuth();
+  const { logout, user } = useAuth();
+  const [tenantVolume, setTenantVolume] = useState<{ total: number; used: number; remaining: number } | null>(null);
   const [showNotifications, setShowNotifications] = useState(false);
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [isDarkMode, setIsDarkMode] = useState(false);
@@ -35,7 +37,29 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar, onToggleMobile,
   const totalToday = deliveredToday + failedToday;
   const deliveryRate = totalToday > 0 ? ((deliveredToday / totalToday) * 100).toFixed(1) : '100.0';
   const boundCount = suppliers.filter(s => connectorIsBound(s.connection_type, s.bind_status, s.status === 'active')).length;
-  const totalSupplierCount = suppliers.filter(s => s.status === 'active').length;
+  useEffect(() => {
+    if (!user || user.role === 'supplier') {
+      setTenantVolume(null);
+      return;
+    }
+    let cancelled = false;
+    const loadTenantVolume = async () => {
+      const res: any = await dashboardApi.getTenantVolume();
+      if (!res.success || cancelled) return;
+      const rows = Array.isArray(res.data?.data) ? res.data.data : Array.isArray(res.data) ? res.data : [];
+      setTenantVolume({
+        total: rows.reduce((sum: number, row: any) => sum + Number(row.volume_limit || 0), 0),
+        used: rows.reduce((sum: number, row: any) => sum + Number(row.volume_used || 0), 0),
+        remaining: rows.reduce((sum: number, row: any) => sum + Number(row.volume_remaining || 0), 0),
+      });
+    };
+    loadTenantVolume();
+    const timer = window.setInterval(loadTenantVolume, 30000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [user]);
+
+  const roleLabel = user?.role === 'super_admin' ? 'Super Admin' : user?.role === 'admin' ? 'Admin' : user?.role || 'User';
+  const displayName = user?.name || user?.username || 'User';
 
   return (
     <header className={`fixed top-0 right-0 h-16 border-b border-blue-500/30 z-30 transition-all duration-300
@@ -86,12 +110,18 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar, onToggleMobile,
             </div>
             <div className="text-center">
               <p className="text-xs text-white/60">Active Binds</p>
-              <p className="text-sm font-semibold text-green-300">{boundCount}/{totalSupplierCount}</p>
+              <p className="text-sm font-semibold text-green-300">{boundCount}/{suppliers.length}</p>
             </div>
             <div className="text-center">
               <p className="text-xs text-white/60">Delivery Rate</p>
               <p className="text-sm font-semibold text-blue-200">{deliveryRate}%</p>
             </div>
+            {tenantVolume && (
+              <div className="text-center">
+                <p className="text-xs text-white/60">Volume</p>
+                <p className="text-sm font-semibold text-emerald-200">{formatNumber(tenantVolume.used)}/{formatNumber(tenantVolume.total)}</p>
+              </div>
+            )}
           </div>
 
           {/* Theme toggle — hidden on small mobile */}
@@ -170,8 +200,8 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar, onToggleMobile,
                 <User size={16} className="text-white" />
               </div>
               <div className="hidden md:block text-left">
-                <p className="text-sm font-medium text-white">Admin</p>
-                <p className="text-xs text-white/60">Super Admin</p>
+                <p className="text-sm font-medium text-white">{displayName}</p>
+                <p className="text-xs text-white/60">{roleLabel}</p>
               </div>
               <ChevronDown size={16} className="text-white/50 hidden md:block" />
             </button>
@@ -179,8 +209,8 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar, onToggleMobile,
             {showUserMenu && (
               <div className="absolute right-0 top-full mt-2 w-48 bg-white rounded-xl shadow-xl border border-gray-200 overflow-hidden">
                 <div className="p-3 border-b border-gray-200 bg-gray-50">
-                  <p className="font-medium text-gray-800">admin@net2app.com</p>
-                  <p className="text-xs text-gray-500">Super Administrator</p>
+                  <p className="font-medium text-gray-800">{user?.email || `${displayName}@net2app.com`}</p>
+                  <p className="text-xs text-gray-500">{roleLabel}</p>
                 </div>
                 <div className="py-1">
                   <button className="w-full flex items-center gap-3 px-4 py-2 text-sm text-gray-700 hover:bg-gray-50">

@@ -5,6 +5,7 @@ import { useData } from '../../store/DataContext';
 import { Card } from '../../components/UI/Card';
 import { Button } from '../../components/UI/Button';
 import { Input, Select, Textarea } from '../../components/UI/Input';
+import { QrBox } from '../../components/UI/QrBox';
 import { Client, BillingMode, Currency } from '../../types';
 
 export const AddClient: React.FC = () => {
@@ -282,23 +283,30 @@ export const AddClient: React.FC = () => {
             />
             <div className="md:col-span-2">
               <p className="text-sm font-medium text-gray-700 mb-1">API Token <span className="text-red-500">*</span></p>
-              <div className="flex gap-2">
+              <div className="flex gap-4 items-start">
                 <div className="flex-1">
-                  <Input
-                    label=""
-                    value={formData.api_key}
-                    onChange={(e) => updateField('api_key', e.target.value)}
-                    placeholder="clt001_key_..."
-                  />
+                  <div className="flex gap-2">
+                    <div className="flex-1">
+                      <Input
+                        label=""
+                        value={formData.api_key}
+                        onChange={(e) => updateField('api_key', e.target.value)}
+                        placeholder="clt001_key_..."
+                      />
+                    </div>
+                    <button type="button" onClick={generateApiKey} title="Regenerate token" className="mt-1 p-2.5 bg-gray-100 rounded-lg hover:bg-gray-200">
+                      <RefreshCw size={18} className="text-gray-600" />
+                    </button>
+                    <button type="button" onClick={copyApiKey} title="Copy token" className="mt-1 p-2.5 bg-gray-100 rounded-lg hover:bg-gray-200">
+                      <Copy size={18} className="text-gray-600" />
+                    </button>
+                  </div>
+                  <p className="text-xs text-gray-400 mt-1">Auto-generated for this client. Used as <code className="font-mono">x-api-key</code> in the HTTP API and by client Test SMS / Reporting / portal settings.</p>
                 </div>
-                <button type="button" onClick={generateApiKey} title="Regenerate token" className="mt-1 p-2.5 bg-gray-100 rounded-lg hover:bg-gray-200">
-                  <RefreshCw size={18} className="text-gray-600" />
-                </button>
-                <button type="button" onClick={copyApiKey} title="Copy token" className="mt-1 p-2.5 bg-gray-100 rounded-lg hover:bg-gray-200">
-                  <Copy size={18} className="text-gray-600" />
-                </button>
+                {formData.api_key && (
+                  <QrBox payload={formData.api_key} hint="Scan to copy the API token" size={150} />
+                )}
               </div>
-              <p className="text-xs text-gray-400 mt-1">Auto-generated for this client. Used as <code className="font-mono">x-api-key</code> in the HTTP API and by client Test SMS / Reporting / portal settings.</p>
             </div>
           </div>
         </Card>

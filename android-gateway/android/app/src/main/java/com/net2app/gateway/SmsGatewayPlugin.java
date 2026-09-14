@@ -46,6 +46,7 @@ public class SmsGatewayPlugin extends Plugin {
     private String serverUrl = "";
     private String username = "";
     private String password = "";
+    private String apiKey = "";
     private boolean isRegistered = false;
 
     // SMPP integration
@@ -68,6 +69,21 @@ public class SmsGatewayPlugin extends Plugin {
     private Handler flushHandler;
     private Runnable flushRunnable;
     private static final int FLUSH_INTERVAL_MS = 5000;
+
+    // Real DLR tracking (delivery broadcast intents)
+    private static final String ACTION_SMS_SENT = "com.net2app.gateway.SMS_SENT";
+    private static final String ACTION_SMS_DELIVERED = "com.net2app.gateway.SMS_DELIVERED";
+    private static final String EXTRA_MSG_ID = "server_msg_id";
+    private static final String EXTRA_PART = "part_index";
+    private static final String EXTRA_PARTS = "part_count";
+    private static final String EXTRA_DEST = "destination";
+    private BroadcastReceiver dlrReceiver;
+    private boolean dlrReceiverRegistered = false;
+    /** msgIds already enqueued for server DLR — prevents duplicate POSTs across parts */
+    private final java.util.Set<String> dlrReported = java.util.Collections.synchronizedSet(new java.util.HashSet<>());
+    private Handler dlrReaperHandler;
+    private static final int FLUSH_REAP_MS = 45000;   // DLR reaper pass
+    private static final long DLR_REAP_GRACE_MS = 120000; // mark UNDELIV if no broadcast within 2 min
 
     @Override
     public void load() {
@@ -132,6 +148,7 @@ public class SmsGatewayPlugin extends Plugin {
         serverUrl = call.getString("serverUrl", "");
         username = call.getString("username", "");
         password = call.getString("password", "");
+        apiKey = call.getString("apiKey", "");
         smppEnabled = call.getBoolean("smppEnabled", false);
 
         // Strip trailing slash
@@ -145,6 +162,7 @@ public class SmsGatewayPlugin extends Plugin {
                 .putString("server_url", serverUrl)
                 .putString("username", username)
                 .putString("password", password)
+                .putString("api_key", apiKey)
                 .putBoolean("smpp_enabled", smppEnabled)
                 .apply();
 
@@ -160,7 +178,9 @@ public class SmsGatewayPlugin extends Plugin {
                 isRegistered = true;
                 startHeartbeat();
                 startQueueFlusher();
+                startDlrReaper();
                 registerSmsReceiver();
+                registerDlrReceiver();
                 Log.i(TAG, "Gateway configured and registered: " + username);
             }
 
@@ -301,6 +321,7 @@ public class SmsGatewayPlugin extends Plugin {
         result.put("serverUrl", prefs.getString("server_url", ""));
         result.put("username", prefs.getString("username", ""));
         result.put("password", prefs.getString("password", ""));
+        result.put("apiKey", prefs.getString("api_key", ""));
         result.put("smppEnabled", prefs.getBoolean("smpp_enabled", false));
         call.resolve(result);
     }
@@ -354,6 +375,7 @@ public class SmsGatewayPlugin extends Plugin {
                 conn.setRequestMethod("POST");
                 conn.setRequestProperty("Content-Type", "application/json");
                 conn.setRequestProperty("Authorization", "Basic " + auth);
+                conn.setRequestProperty("X-API-Key", apiKey);
                 conn.setConnectTimeout(10000);
                 conn.setReadTimeout(10000);
                 conn.setDoOutput(true);
@@ -368,6 +390,7 @@ public class SmsGatewayPlugin extends Plugin {
 
                 int status = conn.getResponseCode();
                 if (status == 200) {
+                    isRegistered = true;
                     // Read pending MT messages
                     java.io.BufferedReader reader = new java.io.BufferedReader(
                             new java.io.InputStreamReader(conn.getInputStream()));
@@ -385,17 +408,16 @@ public class SmsGatewayPlugin extends Plugin {
                             String dest = mt.optString("destination", "");
                             String msg = mt.optString("message", "");
                             if (!dest.isEmpty()) {
-                                sendSmsViaAndroid(dest, msg);
-                                // Report DLR back to server for each MT delivered
-                                sendDlrViaHttp(msgId, "DELIVRD", "000");
+                                // DLR is reported by the delivery broadcast receiver
+                                // (real handset status), NOT optimistically here.
+                                sendSmsViaAndroid(dest, msg, msgId);
                             }
                         }
                     }
                 } else {
                     Log.w(TAG, "Heartbeat failed: HTTP " + status);
                     isRegistered = false;
-                    // Try re-register
-                    registerWithServer();
+                    // Retry registration on next beat; do not block the executor
                 }
             } catch (Exception e) {
                 Log.w(TAG, "Heartbeat error: " + e.getMessage());
@@ -409,6 +431,16 @@ public class SmsGatewayPlugin extends Plugin {
     // ============================================================
 
     private void sendSmsViaAndroid(String destination, String message) {
+        sendSmsViaAndroid(destination, message, null);
+    }
+
+    /**
+     * Send an MT SMS via the handset and register pending-intent broadcasts so
+     * the REAL delivery status is reported back (not an optimistic DELIVRD).
+     * If the delivery broadcast never arrives, a reaper marks the DLR UNDELIV
+     * so the server is never left waiting forever.
+     */
+    private void sendSmsViaAndroid(String destination, String message, String serverMsgId) {
         try {
             SmsManager smsManager = SmsManager.getDefault();
             ArrayList<String> parts = smsManager.divideMessage(message);
@@ -417,22 +449,40 @@ public class SmsGatewayPlugin extends Plugin {
             ArrayList<android.app.PendingIntent> deliveredIntents = new ArrayList<>();
 
             for (int i = 0; i < parts.size(); i++) {
-                Intent sentIntent = new Intent("SMS_SENT_" + destination + "_" + i);
-                Intent deliveredIntent = new Intent("SMS_DELIVERED_" + destination + "_" + i);
+                Intent sentIntent = new Intent(ACTION_SMS_SENT).setPackage(context.getPackageName());
+                sentIntent.putExtra(EXTRA_MSG_ID, serverMsgId != null ? serverMsgId : destination);
+                sentIntent.putExtra(EXTRA_PART, i);
+                sentIntent.putExtra(EXTRA_PARTS, parts.size());
+                sentIntent.putExtra(EXTRA_DEST, destination);
+                sentIntents.add(android.app.PendingIntent.getBroadcast(context,
+                        (serverMsgId != null ? serverMsgId : destination).hashCode() + i,
+                        sentIntent, android.app.PendingIntent.FLAG_IMMUTABLE | android.app.PendingIntent.FLAG_UPDATE_CURRENT));
 
-                sentIntents.add(android.app.PendingIntent.getBroadcast(context, 0,
-                        sentIntent, android.app.PendingIntent.FLAG_IMMUTABLE));
-                deliveredIntents.add(android.app.PendingIntent.getBroadcast(context, 0,
-                        deliveredIntent, android.app.PendingIntent.FLAG_IMMUTABLE));
+                Intent deliveredIntent = new Intent(ACTION_SMS_DELIVERED).setPackage(context.getPackageName());
+                deliveredIntent.putExtra(EXTRA_MSG_ID, serverMsgId != null ? serverMsgId : destination);
+                deliveredIntent.putExtra(EXTRA_PART, i);
+                deliveredIntent.putExtra(EXTRA_PARTS, parts.size());
+                deliveredIntent.putExtra(EXTRA_DEST, destination);
+                deliveredIntents.add(android.app.PendingIntent.getBroadcast(context,
+                        (serverMsgId != null ? serverMsgId : destination).hashCode() + 1000 + i,
+                        deliveredIntent, android.app.PendingIntent.FLAG_IMMUTABLE | android.app.PendingIntent.FLAG_UPDATE_CURRENT));
             }
 
             smsManager.sendMultipartTextMessage(destination, null, parts,
                     sentIntents, deliveredIntents);
-            Log.i(TAG, "MT SMS sent to " + destination + " (" + parts.size() + " parts)");
+            // Track in-flight so the reaper can resolve it if broadcasts are lost
+            if (serverMsgId != null) {
+                context.getSharedPreferences("sms_gateway", Context.MODE_PRIVATE)
+                        .edit()
+                        .putLong("inflight_" + serverMsgId, System.currentTimeMillis())
+                        .apply();
+            }
+            Log.i(TAG, "MT SMS dispatched to " + destination + " (" + parts.size() + " parts, dlr tracked)" );
         } catch (Exception e) {
             Log.e(TAG, "Failed to send MT SMS: " + e.getMessage());
-            if (offlineQueue != null) {
-                offlineQueue.enqueueMtDlr(destination, message, System.currentTimeMillis(), "FAILED");
+            // Send never happened — report FAILED to the server (queued for retry)
+            if (offlineQueue != null && serverMsgId != null) {
+                offlineQueue.enqueueMtDlr(serverMsgId, "FAILED:001", System.currentTimeMillis(), "FAILED");
             }
         }
     }
@@ -450,7 +500,7 @@ public class SmsGatewayPlugin extends Plugin {
         executor.execute(() -> sendMoViaHttp(from, text, timestamp));
     }
 
-    private void sendMoViaHttp(String from, String text, long timestamp) {
+    private boolean sendMoViaHttp(String from, String text, long timestamp) {
         try {
             String auth = android.util.Base64.encodeToString(
                     (username + ":" + password).getBytes("UTF-8"),
@@ -461,6 +511,7 @@ public class SmsGatewayPlugin extends Plugin {
             conn.setRequestMethod("POST");
             conn.setRequestProperty("Content-Type", "application/json");
             conn.setRequestProperty("Authorization", "Basic " + auth);
+            conn.setRequestProperty("X-API-Key", apiKey);
             conn.setConnectTimeout(10000);
             conn.setReadTimeout(10000);
             conn.setDoOutput(true);
@@ -481,9 +532,13 @@ public class SmsGatewayPlugin extends Plugin {
                 if (offlineQueue != null) {
                     offlineQueue.markSentBySource(from, text, timestamp);
                 }
+                return true;
             }
+            Log.w(TAG, "MO HTTP forward failed: HTTP " + status);
+            return false;
         } catch (Exception e) {
             Log.w(TAG, "MO HTTP forward failed (queued): " + e.getMessage());
+            return false;
         }
     }
 
@@ -491,7 +546,7 @@ public class SmsGatewayPlugin extends Plugin {
         executor.execute(() -> sendDlrViaHttp(msgId, status, errorCode));
     }
 
-    private void sendDlrViaHttp(String msgId, String dlrStatus, String errorCode) {
+    private boolean sendDlrViaHttp(String msgId, String dlrStatus, String errorCode) {
         try {
             String auth = android.util.Base64.encodeToString(
                     (username + ":" + password).getBytes("UTF-8"),
@@ -502,6 +557,7 @@ public class SmsGatewayPlugin extends Plugin {
             conn.setRequestMethod("POST");
             conn.setRequestProperty("Content-Type", "application/json");
             conn.setRequestProperty("Authorization", "Basic " + auth);
+            conn.setRequestProperty("X-API-Key", apiKey);
             conn.setConnectTimeout(10000);
             conn.setReadTimeout(10000);
             conn.setDoOutput(true);
@@ -518,19 +574,146 @@ public class SmsGatewayPlugin extends Plugin {
             int status = conn.getResponseCode();
             if (status == 200) {
                 Log.i(TAG, "DLR reported: " + msgId + " -> " + dlrStatus);
+                return true;
             }
+            Log.w(TAG, "DLR HTTP report failed: HTTP " + status + " (will retry: " + msgId + ")");
+            return false;
         } catch (Exception e) {
-            Log.w(TAG, "DLR HTTP report failed (queued): " + e.getMessage());
-            if (offlineQueue != null) {
-                offlineQueue.enqueueMtDlr(msgId, dlrStatus + ":" + errorCode,
-                        System.currentTimeMillis(), dlrStatus);
-            }
+            Log.w(TAG, "DLR HTTP report failed (will retry): " + e.getMessage());
+            return false;
         }
     }
 
     // ============================================================
-    // SMS RECEIVER (MO detection)
+    // REAL DLR — delivery broadcast receiver + reaper
     // ============================================================
+
+    /**
+     * Receives the pending-intent broadcasts fired by SmsManager when a part
+     * is SENT (radio ack) and DELIVERED (handset confirmation). The first
+     * DELIVERED part for a message triggers a single DELIVRD DLR to the
+     * server; a failed sent/delivery triggers FAILED with the radio error.
+     */
+    private void registerDlrReceiver() {
+        if (dlrReceiverRegistered) return;
+        dlrReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context ctx, Intent intent) {
+                String msgId = intent.getStringExtra(EXTRA_MSG_ID);
+                int part = intent.getIntExtra(EXTRA_PART, 0);
+                int parts = intent.getIntExtra(EXTRA_PARTS, 1);
+                String dest = intent.getStringExtra(EXTRA_DEST);
+                boolean delivered = ACTION_SMS_DELIVERED.equals(intent.getAction());
+                int rc = getResultCode();
+
+                if (msgId == null) return;
+
+                // SENT broadcast: only fail fast on permanent radio errors.
+                // RESULT_ERROR_GENERIC_FAILURE (1) / RADIO_OFF (2) / NO_SERVICE (3)
+                if (!delivered && rc != android.app.Activity.RESULT_OK) {
+                    if (rc == android.telephony.SmsManager.RESULT_ERROR_GENERIC_FAILURE
+                            || rc == android.telephony.SmsManager.RESULT_ERROR_RADIO_OFF
+                            || rc == android.telephony.SmsManager.RESULT_ERROR_NO_SERVICE) {
+                        Log.w(TAG, "SMS part FAILED (sent rc=" + rc + ") msg=" + msgId);
+                        if (dlrReported.add(msgId)) {
+                            context.getSharedPreferences("sms_gateway", Context.MODE_PRIVATE)
+                                    .edit().remove("inflight_" + msgId).apply();
+                            if (offlineQueue != null) {
+                                offlineQueue.enqueueMtDlr(msgId, "FAILED:" + rc, System.currentTimeMillis(), "FAILED");
+                            } else {
+                                sendDlrViaHttp(msgId, "FAILED", String.valueOf(rc));
+                            }
+                        }
+                    }
+                    return; // sent-ack OK — wait for the delivered broadcast
+                }
+
+                if (delivered && rc == android.app.Activity.RESULT_OK) {
+                    Log.i(TAG, "SMS part DELIVERED (" + (part + 1) + "/" + parts + ") msg=" + msgId);
+                    // Report DELIVRD once per message (first part wins)
+                    if (dlrReported.add(msgId)) {
+                        // Clear in-flight marker — final status known
+                        context.getSharedPreferences("sms_gateway", Context.MODE_PRIVATE)
+                                .edit().remove("inflight_" + msgId).apply();
+                        if (offlineQueue != null) {
+                            offlineQueue.enqueueMtDlr(msgId, "DELIVRD:000", System.currentTimeMillis(), "DELIVRD");
+                        } else {
+                            sendDlrViaHttp(msgId, "DELIVRD", "000");
+                        }
+                    }
+                } else if (delivered) {
+                    Log.w(TAG, "SMS part NOT delivered (rc=" + rc + ") msg=" + msgId);
+                    if (dlrReported.add(msgId)) {
+                        context.getSharedPreferences("sms_gateway", Context.MODE_PRIVATE)
+                                .edit().remove("inflight_" + msgId).apply();
+                        if (offlineQueue != null) {
+                            offlineQueue.enqueueMtDlr(msgId, "UNDELIV:" + rc, System.currentTimeMillis(), "UNDELIV");
+                        } else {
+                            sendDlrViaHttp(msgId, "UNDELIV", String.valueOf(rc));
+                        }
+                    }
+                }
+            }
+        };
+
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(ACTION_SMS_SENT);
+        filter.addAction(ACTION_SMS_DELIVERED);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            context.registerReceiver(dlrReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            context.registerReceiver(dlrReceiver, filter);
+        }
+        dlrReceiverRegistered = true;
+        Log.i(TAG, "DLR delivery receiver registered");
+    }
+
+    private void unregisterDlrReceiver() {
+        if (dlrReceiver != null && dlrReceiverRegistered) {
+            try { context.unregisterReceiver(dlrReceiver); } catch (Exception ignored) {}
+        }
+        dlrReceiverRegistered = false;
+    }
+
+    /**
+     * Reaper pass: dispatched MT SMS whose delivery broadcast never arrived
+     * within the grace window (process death / reboot) are reported UNDELIV so
+     * the server never waits forever (no message stuck PENDING_ANDROID).
+     * In-flight msgIds are persisted in SharedPreferences — survives restarts.
+     */
+    private void startDlrReaper() {
+        if (dlrReaperHandler == null) {
+            dlrReaperHandler = new Handler(Looper.getMainLooper());
+        }
+        dlrReaperHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                executor.execute(() -> {
+                    try {
+                        android.content.SharedPreferences prefs = context.getSharedPreferences("sms_gateway", Context.MODE_PRIVATE);
+                        java.util.Map<String, ?> inflight = prefs.getAll();
+                        long now = System.currentTimeMillis();
+                        for (java.util.Map.Entry<String, ?> e : inflight.entrySet()) {
+                            String key = e.getKey();
+                            if (!key.startsWith("inflight_")) continue;
+                            long dispatchedAt = Long.parseLong(String.valueOf(e.getValue()));
+                            if (now - dispatchedAt > DLR_REAP_GRACE_MS) {
+                                String msgId = key.substring("inflight_".length());
+                                if (dlrReported.add(msgId)) {
+                                    Log.w(TAG, "Reaping in-flight MT " + msgId + " as UNDELIV (no broadcast in " + DLR_REAP_GRACE_MS / 1000 + "s)");
+                                    sendDlrViaHttp(msgId, "UNDELIV", "900");
+                                }
+                                prefs.edit().remove(key).apply();
+                            }
+                        }
+                    } catch (Exception ex) {
+                        Log.w(TAG, "DLR reaper pass failed: " + ex.getMessage());
+                    }
+                });
+                dlrReaperHandler.postDelayed(this, FLUSH_REAP_MS);
+            }
+        }, FLUSH_REAP_MS);
+    }
 
     private void registerSmsReceiver() {
         if (smsReceiverRegistered) return;
@@ -625,18 +808,25 @@ public class SmsGatewayPlugin extends Plugin {
 
         List<OfflineMessage> pending = offlineQueue.getPendingBatch(20);
         for (OfflineMessage msg : pending) {
+            boolean ok = false;
             try {
                 if ("mo".equals(msg.direction)) {
-                    sendMoViaHttp(msg.fromAddress, msg.messageText, msg.receivedAt);
+                    ok = sendMoViaHttp(msg.fromAddress, msg.messageText, msg.receivedAt);
                 } else if ("dlr".equals(msg.direction)) {
                     String[] parts = msg.messageText.split(":", 2);
-                    sendDlrViaHttp(msg.fromAddress,
+                    ok = sendDlrViaHttp(msg.fromAddress,
                             parts.length > 1 ? parts[0] : "DELIVRD",
                             parts.length > 1 ? parts[1] : "000");
                 }
+            } catch (Exception e) {
+                Log.w(TAG, "Flush attempt error for #" + msg.id + ": " + e.getMessage());
+            }
+            // Only mark sent on confirmed HTTP 200; otherwise count the attempt
+            // and leave the row pending — retried on the next flush/offline period.
+            if (ok) {
                 offlineQueue.markSent(msg.id);
                 flushed++;
-            } catch (Exception e) {
+            } else {
                 offlineQueue.recordAttempt(msg.id);
             }
         }
@@ -660,6 +850,7 @@ public class SmsGatewayPlugin extends Plugin {
     @Override
     protected void handleOnDestroy() {
         unregisterSmsReceiver();
+        unregisterDlrReceiver();
         if (heartbeatHandler != null && heartbeatRunnable != null) {
             heartbeatHandler.removeCallbacks(heartbeatRunnable);
         }

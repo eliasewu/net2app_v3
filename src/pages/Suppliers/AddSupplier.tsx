@@ -1,13 +1,15 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { ArrowLeft, Save, RefreshCw, TestTube, MessageSquare, Bot, Smartphone, Flashlight, ExternalLink, Download, Copy } from 'lucide-react';
+import { ArrowLeft, Save, RefreshCw, TestTube, MessageSquare, Bot, Smartphone, Flashlight, ExternalLink, Download, Copy, QrCode } from 'lucide-react';
 import { useData } from '../../store/DataContext';
 import { Card } from '../../components/UI/Card';
 import { Button } from '../../components/UI/Button';
 import { Badge } from '../../components/UI/Badge';
 import { Input, Select } from '../../components/UI/Input';
+import { QrBox } from '../../components/UI/QrBox';
 import { ConnectionType, Currency } from '../../types';
 import api from '../../services/api';
+import QRCode from 'qrcode';
 
 interface ApiConnector { id:string; name:string; provider:string; auth_type:string; status:string; is_active:boolean; base_url?:string; send_url?:string; api_key?:string; api_secret?:string; dlr_url?:string; http_method?:string; }
 interface OttDevice { id:string; name:string; phone:string; session_status:string; type?:string; }
@@ -15,7 +17,7 @@ interface OttDevice { id:string; name:string; phone:string; session_status:strin
 export const AddSupplier: React.FC = () => {
   const navigate = useNavigate();
   const { id } = useParams();
-  const { addSupplier, getSupplierById, updateSupplier } = useData();
+  const { addSupplier, getSupplierById, updateSupplier, suppliers } = useData();
   const existingSupplier = id ? getSupplierById(id) : undefined;
   const isEditing = !!existingSupplier;
 
@@ -79,52 +81,89 @@ export const AddSupplier: React.FC = () => {
     fetchEndpoints();
   }, []);
 
-  const [formData, setFormData] = useState({
-    supplier_code: existingSupplier?.supplier_code || '',
-    company_name: existingSupplier?.company_name || '',
-    contact_person: existingSupplier?.contact_person || '',
-    email: existingSupplier?.email || '',
-    phone: existingSupplier?.phone || '',
-    connection_type: (existingSupplier?.connection_type || 'smpp') as ConnectionType,
-    smpp_host: existingSupplier?.smpp_host || '',
-    smpp_port: existingSupplier?.smpp_port || 2775,
-    smpp_username: existingSupplier?.smpp_username || '',
-    smpp_password: existingSupplier?.smpp_password || '',
-    system_id: existingSupplier?.system_id || '',
-    smpp_version: existingSupplier?.smpp_version || 'auto',
-    smpp_system_type: existingSupplier?.smpp_system_type || '',
-    smpp_bind_type: existingSupplier?.smpp_bind_type || 'trx',
-    smpp_addr_ton: existingSupplier?.smpp_addr_ton ?? 0,
-    smpp_addr_npi: existingSupplier?.smpp_addr_npi ?? 0,
-    smpp_addr_range: existingSupplier?.smpp_addr_range || '',
-    is_inbound: existingSupplier?.is_inbound || false,
-    api_url: existingSupplier?.api_url || '',
-    api_key: existingSupplier?.api_key || '',
-    api_method: (existingSupplier?.api_method || 'POST') as 'GET' | 'POST',
-    force_dlr: existingSupplier?.force_dlr || false,
-    force_dlr_timeout: (existingSupplier as any)?.force_dlr_timeout || (existingSupplier as any)?.dlr_timeout || 150,
-    force_dlr_timeout_mode: (existingSupplier as any)?.force_dlr_timeout_mode || 'fixed',
-    balance: existingSupplier?.balance || 0,
-    credit_limit: existingSupplier?.credit_limit || 0,
-    currency: (existingSupplier?.currency || 'EUR') as Currency,
-    billing_mode: (existingSupplier?.billing_mode || 'dlr') as 'submit' | 'dlr' | 'credit',
-    status: existingSupplier?.status || 'active',
-    bind_status: existingSupplier?.bind_status || 'unbound',
-    consecutive_failures: existingSupplier?.consecutive_failures || 0,
-    api_connector_id: existingSupplier?.api_connector_id ? parseInt(String(existingSupplier.api_connector_id)) || null : null,
-    voice_otp_config_id: existingSupplier?.voice_otp_config_id || null,
-    voice_otp_mode: existingSupplier?.voice_otp_mode || null,
-    dst_sip_address: existingSupplier?.dst_sip_address || '',
-    reconnect_schedule: existingSupplier?.reconnect_schedule || '0,1,2',
-    max_queue_size: existingSupplier?.max_queue_size ?? 1000,
-    dlr_timeout: existingSupplier?.dlr_timeout ?? 300,
-    portal_access: (existingSupplier as any)?.portal_access || false,
-    max_failures: existingSupplier?.max_failures ?? 20,
+  const buildSupplierForm = (s?: typeof suppliers[number]) => ({
+    supplier_code: s?.supplier_code || '',
+    company_name: s?.company_name || '',
+    contact_person: s?.contact_person || '',
+    email: s?.email || '',
+    phone: s?.phone || '',
+    connection_type: (s?.connection_type || 'smpp') as ConnectionType,
+    smpp_host: s?.smpp_host || '',
+    smpp_port: s?.smpp_port || 2775,
+    smpp_username: s?.smpp_username || '',
+    smpp_password: s?.smpp_password || '',
+    system_id: s?.system_id || '',
+    smpp_version: (s?.smpp_version || 'auto'),
+    smpp_system_type: s?.smpp_system_type || '',
+    smpp_bind_type: (s?.smpp_bind_type || 'trx') as 'trx' | 'tx' | 'rx',
+    smpp_addr_ton: s?.smpp_addr_ton ?? 0,
+    smpp_addr_npi: s?.smpp_addr_npi ?? 0,
+    smpp_addr_range: s?.smpp_addr_range || '',
+    is_inbound: s?.is_inbound || false,
+    api_url: s?.api_url || '',
+    api_key: s?.api_key || '',
+    api_method: (s?.api_method || 'POST') as 'GET' | 'POST',
+    force_dlr: s?.force_dlr || false,
+    force_dlr_timeout: (s as any)?.force_dlr_timeout || (s as any)?.dlr_timeout || 150,
+    force_dlr_timeout_mode: ((s as any)?.force_dlr_timeout_mode || 'fixed'),
+    balance: s?.balance || 0,
+    credit_limit: s?.credit_limit || 0,
+    currency: (s?.currency || 'EUR') as Currency,
+    billing_mode: ((s?.billing_mode || 'dlr') as 'submit' | 'dlr' | 'credit'),
+    status: s?.status || 'active',
+    bind_status: s?.bind_status || 'unbound',
+    consecutive_failures: s?.consecutive_failures || 0,
+    api_connector_id: s?.api_connector_id ? parseInt(String(s.api_connector_id)) || null : null,
+    voice_otp_config_id: s?.voice_otp_config_id || null,
+    voice_otp_mode: s?.voice_otp_mode || null,
+    dst_sip_address: s?.dst_sip_address || '',
+    reconnect_schedule: s?.reconnect_schedule || '0,1,2',
+    max_queue_size: (s as any)?.max_queue_size ?? 1000,
+    dlr_timeout: s?.dlr_timeout ?? 300,
+    portal_access: (s as any)?.portal_access || false,
+    max_failures: s?.max_failures ?? 20,
   });
+
+  const [formData, setFormData] = useState(buildSupplierForm(existingSupplier));
+
+  // Sync the form once the suppliers list finishes loading (direct-URL edit:
+  // the record isn't in DataContext on first render). Only when the form is
+  // still untouched, so in-progress edits are never clobbered.
+  const formSyncedRef = React.useRef(false);
+  useEffect(() => {
+    if (existingSupplier && !formSyncedRef.current) {
+      formSyncedRef.current = true;
+      setFormData(prev => ({ ...buildSupplierForm(existingSupplier), status: prev.status, balance: prev.balance }));
+    }
+  }, [existingSupplier?.id]);
 
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(false);
   const [testResult, setTestResult] = useState<{ success: boolean; message: string } | null>(null);
+  const [pairingQr, setPairingQr] = useState<string | null>(null);
+
+  // Live pairing QR for the Android SMS section: encodes server URL + the
+  // credentials being typed so the Net2appPro app auto-configures on scan.
+  useEffect(() => {
+    if (formData.connection_type !== 'android_SMS' || !formData.smpp_username) {
+      setPairingQr(null);
+      return;
+    }
+    const payload = {
+      v: 1,
+      app: 'net2apppro',
+      server_url: window.location.origin,
+      username: formData.smpp_username,
+      password: formData.smpp_password || '',
+      api_key: formData.api_key || undefined,
+      mode: 'http_rest',
+      smpp_port: 2775,
+      device_name: (formData.company_name || formData.smpp_username || 'device').replace(/[^a-zA-Z0-9 _-]/g, '').substring(0, 24),
+    };
+    QRCode.toDataURL(JSON.stringify(payload), { errorCorrectionLevel: 'M', margin: 1, width: 300 })
+      .then(setPairingQr)
+      .catch(() => setPairingQr(null));
+  }, [formData.connection_type, formData.smpp_username, formData.smpp_password, formData.company_name]);
 
   const connectionTypes = [
     { value: 'smpp', label: 'SMPP', desc: 'Standard SMPP protocol' },
@@ -142,6 +181,15 @@ export const AddSupplier: React.FC = () => {
     const c = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%';
     let p = ''; for (let i = 0; i < 12; i++) p += c.charAt(Math.floor(Math.random() * c.length));
     setFormData(prev => ({ ...prev, smpp_password: p }));
+  };
+
+  // Generate a gateway API key locally (saved with the supplier on Submit).
+  const generateApiKey = () => {
+    const code = (formData.supplier_code || formData.company_name || 'sup').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 12) || 'sup';
+    const bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+    setFormData(prev => ({ ...prev, api_key: `${code}_gw_${hex}` }));
   };
 
   const validate = () => {
@@ -329,7 +377,7 @@ export const AddSupplier: React.FC = () => {
         </Card>
 
         {formData.connection_type === 'android_SMS' && (
-          <Card title="📱 Android Gateway Setup" subtitle="Install the NET2APP Gateway APK on your Android phone to use it as an SMS supplier">
+          <Card title="📱 Net2appPro Android Gateway" subtitle="Download the APK, save the supplier, then scan the pairing QR — the phone connects itself">
             <div className="space-y-4">
               {/* APK Download Section */}
               <div className="bg-gradient-to-r from-green-50 to-emerald-50 rounded-xl p-5 border border-green-200">
@@ -338,14 +386,14 @@ export const AddSupplier: React.FC = () => {
                     <Download size={20} className="text-white" />
                   </div>
                   <div>
-                    <p className="font-semibold text-gray-800">Download Gateway APK</p>
-                    <p className="text-xs text-gray-500">Version 1.0 — 6.5 MB</p>
+                    <p className="font-semibold text-gray-800">Download Net2appPro APK</p>
+                    <p className="text-xs text-gray-500">Version 3.0 — QR pairing · HTTP REST + SMPP inbound · 3.2 MB</p>
                   </div>
                 </div>
 
                 {/* Direct download button */}
                 <a
-                  href="/download/net2app-gateway.apk"
+                  href="/download/net2apppro-3.0.0.apk"
                   download
                   className="inline-flex items-center gap-2 px-5 py-3 bg-green-600 text-white rounded-lg font-medium hover:bg-green-700 transition-colors shadow-sm"
                 >
@@ -358,12 +406,12 @@ export const AddSupplier: React.FC = () => {
                   <p className="text-xs font-medium text-gray-500 mb-2">External Download URL (for sharing)</p>
                   <div className="flex items-center gap-2">
                     <code className="flex-1 text-xs bg-gray-50 px-3 py-2 rounded font-mono text-gray-700 break-all select-all">
-                      {window.location.origin}/download/net2app-gateway.apk
+                      {window.location.origin}/download/net2apppro-3.0.0.apk
                     </code>
                     <button
                       type="button"
                       onClick={() => {
-                        navigator.clipboard.writeText(`${window.location.origin}/download/net2app-gateway.apk`);
+                        navigator.clipboard.writeText(`${window.location.origin}/download/net2apppro-3.0.0.apk`);
                       }}
                       className="p-2 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors"
                       title="Copy URL"
@@ -374,44 +422,57 @@ export const AddSupplier: React.FC = () => {
                 </div>
               </div>
 
-              {/* Setup Instructions */}
+              {/* Pairing QR — live from the credentials typed in this form */}
               <div className="bg-blue-50 rounded-xl p-5 border border-blue-200">
-                <p className="font-semibold text-gray-800 mb-3">📋 Setup Instructions</p>
-                <ol className="space-y-2 text-sm text-gray-600">
-                  <li className="flex gap-2">
-                    <span className="font-bold text-blue-600">1.</span>
-                    Download and install the APK on your Android phone (allow "Install from unknown sources")
-                  </li>
-                  <li className="flex gap-2">
-                    <span className="font-bold text-blue-600">2.</span>
-                    Open the app and grant <strong>SMS</strong> permissions when prompted
-                  </li>
-                  <li className="flex gap-2">
-                    <span className="font-bold text-blue-600">3.</span>
-                    Enter the server URL: <code className="bg-blue-100 px-1.5 py-0.5 rounded text-xs font-mono">{window.location.origin}</code>
-                  </li>
-                  <li className="flex gap-2">
-                    <span className="font-bold text-blue-600">4.</span>
-                    Use the supplier credentials set below as <strong>Username</strong> and <strong>Password</strong>
-                  </li>
-                  <li className="flex gap-2">
-                    <span className="font-bold text-blue-600">5.</span>
-                    Tap <strong>Save &amp; Connect</strong> — the phone will register as an inbound SMS supplier
-                  </li>
-                </ol>
-              </div>
-
-              {/* How it works */}
-              <div className="text-xs text-gray-400 space-y-1">
-                <p><strong>How it works:</strong> The app polls the server every 5 seconds for pending MT messages, sends them via the phone's SIM, and forwards incoming (MO) SMS back to the server. All undelivered messages are queued locally in a Room database for retry.</p>
-              </div>
-
-              {/* Credentials hint */}
-              <div className="p-3 bg-amber-50 rounded-lg border border-amber-200 text-sm">
-                <p className="font-medium text-amber-800">⚡ Quick Setup</p>
-                <p className="text-amber-700 mt-1">
-                  Set the <strong>Username</strong> and <strong>Password</strong> fields below. These will be the login credentials for the Android app. The supplier will auto-register as <code className="bg-amber-100 px-1 rounded text-xs">android_SMS</code> type with <code className="bg-amber-100 px-1 rounded text-xs">is_inbound=true</code>.
+                <p className="font-semibold text-gray-800 mb-3 flex items-center gap-2">
+                  <QrCode size={18} className="text-blue-600" /> Scan &amp; Connect
                 </p>
+                {pairingQr ? (
+                  <div className="flex flex-col sm:flex-row items-center gap-5">
+                    <img src={pairingQr} alt="Net2appPro pairing QR" className="rounded-xl border border-blue-200 bg-white p-2" width={230} height={230} />
+                    <div className="text-sm text-gray-600 space-y-2">
+                      <p><strong>1.</strong> Install &amp; open <b>Net2appPro</b> on the phone</p>
+                      <p><strong>2.</strong> Tap <b>📷 Scan Pairing QR</b></p>
+                      <p><strong>3.</strong> Point at this code — server <code className="bg-blue-100 px-1 rounded text-xs">{window.location.origin}</code>, username <code className="bg-blue-100 px-1 rounded text-xs">{formData.smpp_username || '…'}</code> and mode fill in automatically</p>
+                      <p><strong>4.</strong> Press <b>Save &amp; Connect</b> in the app — the device registers as an inbound SMS supplier</p>
+                    </div>
+                  </div>
+                ) : (
+                  <p className="text-sm text-amber-700">
+                    Set a <strong>Username</strong> for this supplier (and save it) — the pairing QR appears here automatically.
+                  </p>
+                )}
+                <p className="text-xs text-gray-400 mt-3">
+                  MT SMS: the app polls this server every 5s and sends via the phone's SIM. MO SMS: delivered to <b>SMS Inbox</b> (sms-inbox) and logged with source <code className="bg-gray-100 px-1 rounded">android_gateway_mo</code>.
+                </p>
+              </div>
+
+              {/* Credentials — the pairing QR generates live from these */}
+              <div className="p-4 bg-amber-50 rounded-lg border border-amber-200">
+                <p className="font-medium text-amber-800 mb-3">⚡ Device credentials <span className="font-normal text-amber-700">— these become the app's login; the QR updates as you type</span></p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <Input label="Username (System ID)" value={formData.smpp_username} onChange={e => updateField('smpp_username', e.target.value)} error={errors.smpp_username} required />
+                  <div className="flex gap-2"><div className="flex-1"><Input label="Password" value={formData.smpp_password} onChange={e => updateField('smpp_password', e.target.value)} /></div><button type="button" onClick={generatePassword} title="Generate password" className="mt-7 p-2.5 bg-white rounded-lg border border-amber-200 hover:bg-amber-100"><RefreshCw size={18} className="text-amber-600" /></button></div>
+                </div>
+                <p className="text-xs text-amber-600 mt-2">The supplier registers as <code className="bg-amber-100 px-1 rounded">android_SMS</code> with <code className="bg-amber-100 px-1 rounded">is_inbound=true</code>.</p>
+              </div>
+
+              {/* Gateway API key — for servers/clients that push via x-api-key instead of scanning */}
+              <div className="p-4 bg-purple-50 rounded-lg border border-purple-200">
+                <p className="font-medium text-purple-800 mb-3">🔑 Gateway API Key <span className="font-normal text-purple-700">— alternative login for the app &amp; HTTP API (<code className="bg-purple-100 px-1 rounded text-xs">x-api-key</code>)</span></p>
+                <div className="flex flex-col sm:flex-row items-start gap-5">
+                  <div className="flex-1 w-full space-y-3">
+                    <div className="flex gap-2">
+                      <div className="flex-1"><Input label="" value={formData.api_key} onChange={e => updateField('api_key', e.target.value)} placeholder="(not generated yet)" /></div>
+                      <button type="button" onClick={generateApiKey} title="Generate API key" className="mt-1 p-2.5 bg-white rounded-lg border border-purple-200 hover:bg-purple-100"><RefreshCw size={18} className="text-purple-600" /></button>
+                      <button type="button" onClick={() => formData.api_key && navigator.clipboard?.writeText(formData.api_key)} title="Copy API key" className="mt-1 p-2.5 bg-white rounded-lg border border-purple-200 hover:bg-purple-100"><Copy size={18} className="text-purple-600" /></button>
+                    </div>
+                    <p className="text-xs text-purple-600">The key authenticates <code className="bg-purple-100 px-1 rounded">/api/gateway/*</code> calls (heartbeat, MO, DLR) with the <code className="bg-purple-100 px-1 rounded">x-api-key</code> header — no username/password needed.</p>
+                  </div>
+                  {formData.api_key && (
+                    <QrBox payload={formData.api_key} hint="Scan to copy the API key" size={170} />
+                  )}
+                </div>
               </div>
             </div>
           </Card>

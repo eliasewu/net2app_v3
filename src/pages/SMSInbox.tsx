@@ -24,7 +24,9 @@ interface MOSMS {
   notes?: string;
 }
 
-// MO SMS inbox — real data from sms_logs where source='smpp_mo'
+// MO SMS inbox — real data from sms_logs. Includes both classic SMPP MO
+// receipts (source='smpp_mo') and Android gateway MO messages
+// (source='android_gateway_mo') from Net2appPro devices.
 export const SMSInbox: React.FC = () => {
   const [search, setSearch] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
@@ -37,7 +39,7 @@ export const SMSInbox: React.FC = () => {
   const fetchMoMessages = useCallback(async () => {
     setError(null);
     try {
-      const res: any = await smsApi.getLogs({ source: 'smpp_mo', limit: 200, offset: 0 });
+      const res: any = await smsApi.getLogs({ source: 'smpp_mo,android_gateway_mo', limit: 200, offset: 0 });
       if (res.success && res.data) {
         const rows = res.data.data || res.data.rows || res.data || [];
         const mapped: MOSMS[] = rows.map((r: any) => ({

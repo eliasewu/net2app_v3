@@ -479,6 +479,11 @@ export const licenseApi = {
   generateKey: (data: any) => api.post<{ key: string }>('/license/generate', data),
 };
 
+// ==================== AUDIT API ====================
+export const auditApi = {
+  getLogs: (limit = 100) => api.get<any[]>(`/system/audit-logs?limit=${limit}`),
+};
+
 // ==================== DASHBOARD API ====================
 export const dashboardApi = {
   getTenantVolume: () => api.get<any[]>('/dashboard/tenant-volume'),

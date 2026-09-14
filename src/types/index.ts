@@ -164,6 +164,8 @@ export interface Supplier {
   max_failures?: number;
   routed_via_asterisk?: boolean;
   force_dlr_timeout_mode?: string;
+  /** Android gateway: timestamp of the last heartbeat (null = never seen) */
+  last_heartbeat_at?: string | null;
 
   created_at: string;
   updated_at: string;

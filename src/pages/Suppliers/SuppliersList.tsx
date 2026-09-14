@@ -1,12 +1,13 @@
 import React, { useState, useRef } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { Plus, Search, Download, Upload, MoreVertical, Edit, Trash2, Eye, Wifi, WifiOff, RotateCcw, CheckCircle, Ban } from 'lucide-react';
+import { Plus, Search, Download, Upload, MoreVertical, Edit, Trash2, Eye, Wifi, WifiOff, RotateCcw, CheckCircle, Ban, Smartphone, QrCode } from 'lucide-react';
 import { useData } from '../../store/DataContext';
 import { Card } from '../../components/UI/Card';
 import { Button } from '../../components/UI/Button';
 import { Badge } from '../../components/UI/Badge';
 import { Table, Pagination } from '../../components/UI/Table';
 import { Modal } from '../../components/UI/Modal';
+import { api } from '../../services/api';
 import { Supplier } from '../../types';
 import { connectorIsBound } from '../../utils/bindStatus';
 
@@ -21,6 +22,24 @@ export const SuppliersList: React.FC = () => {
   const [currentPage, setCurrentPage] = useState(1);
   const [deleteModal, setDeleteModal] = useState<Supplier | null>(null);
   const [actionMenu, setActionMenu] = useState<string | null>(null);
+  const [pairingModal, setPairingModal] = useState<{ supplier: Supplier; qr: string } | null>(null);
+  const [pairingLoading, setPairingLoading] = useState(false);
+  const [pairingMode, setPairingMode] = useState<'http_rest' | 'smpp_inbound'>('http_rest');
+
+  const openPairingQr = async (supplier: Supplier, mode: 'http_rest' | 'smpp_inbound' = pairingMode) => {
+    setPairingLoading(true);
+    setPairingModal({ supplier, qr: '' });
+    try {
+      const res: any = await api.get(`/suppliers/${supplier.id}/pairing-qr?mode=${mode}`);
+      const data = res.data?.data || res.data;
+      setPairingModal({ supplier, qr: data.qr });
+    } catch (e: any) {
+      alert('Failed to generate pairing QR: ' + (e?.message || e));
+      setPairingModal(null);
+    } finally {
+      setPairingLoading(false);
+    }
+  };
 
   const itemsPerPage = 10;
 
@@ -145,11 +164,24 @@ export const SuppliersList: React.FC = () => {
       render: (supplier: Supplier) => {
         const ct = supplier.connection_type;
         const isSMPP = ct === 'smpp';
+        const isAndroid = ct === 'android_SMS';
         // Only SMPP has a real bound/unbound state. HTTP/VoiceOTP/OTT are always
         // available, so they show as bound whenever the supplier is active.
         const onlineLabel = isSMPP ? 'bound' : (ct === 'http' || ct === 'voice_otp') ? 'bound' : 'connected';
         const offlineLabel = isSMPP ? 'unbound' : 'offline';
-        const isOnline = connectorIsBound(ct, supplier.bind_status, supplier.status === 'active');
+        // Android devices are only online if they heartbeated recently
+        // (poll interval 5s → 15s grace = 3 missed beats).
+        const HEARTBEAT_TIMEOUT_MS = 15000;
+        const lastBeat = supplier.last_heartbeat_at ? new Date(supplier.last_heartbeat_at).getTime() : null;
+        const beatAge = lastBeat ? Date.now() - lastBeat : null;
+        const isOnline = isAndroid
+          ? (beatAge !== null && beatAge < HEARTBEAT_TIMEOUT_MS)
+          : connectorIsBound(ct, supplier.bind_status, supplier.status === 'active');
+        const lastSeenLabel = lastBeat
+          ? (beatAge! < 60000 ? `${Math.max(1, Math.floor(beatAge! / 1000))}s ago`
+            : beatAge! < 3600000 ? `${Math.floor(beatAge! / 60000)}m ago`
+            : `${Math.floor(beatAge! / 3600000)}h ago`)
+          : 'never';
         return (
         <div className="flex items-center gap-2">
           {supplier.status === 'inactive' ? (
@@ -167,6 +199,11 @@ export const SuppliersList: React.FC = () => {
             >
               {isOnline ? onlineLabel : offlineLabel}
             </Badge>
+          )}
+          {isAndroid && (
+            <span className="text-xs text-gray-400" title={lastBeat ? `Last heartbeat: ${new Date(lastBeat).toLocaleString()}` : 'Device has never heartbeated'}>
+              {lastSeenLabel}
+            </span>
           )}
           {supplier.status === 'inactive' && (
             <button
@@ -266,6 +303,18 @@ export const SuppliersList: React.FC = () => {
                 <Edit size={14} />
                 Edit
               </button>
+              {(supplier.connection_type === 'android_SMS' || (supplier as any).connector_type === 'android') && (
+                <>
+                  <button
+                    onClick={() => { openPairingQr(supplier); setActionMenu(null); }}
+                    className="w-full flex items-center gap-2 px-4 py-2 text-sm text-blue-600 hover:bg-blue-50"
+                  >
+                    <Smartphone size={14} />
+                    Pairing QR (Net2appPro)
+                  </button>
+                  <hr className="my-1" />
+                </>
+              )}
               <hr className="my-1" />
               {supplier.status === 'active' ? (
                 <button
@@ -445,6 +494,51 @@ export const SuppliersList: React.FC = () => {
           itemsPerPage={itemsPerPage}
         />
       </Card>
+
+      {/* Pairing QR Modal (Net2appPro Android app) */}
+      <Modal
+        isOpen={!!pairingModal}
+        onClose={() => setPairingModal(null)}
+        title={`Pair Net2appPro — ${pairingModal?.supplier.company_name || ''}`}
+        size="md"
+      >
+        <div className="text-center space-y-4">
+          <p className="text-sm text-gray-600">
+            Open <b>Net2appPro</b> on the phone → <b>Scan Pairing QR</b>. The app fills in the server, credentials and mode automatically — no manual IP entry.
+          </p>
+          <div className="flex items-center justify-center gap-2">
+            <label className="text-sm text-gray-600">Mode:</label>
+            <select
+              className="border border-gray-300 rounded-lg px-2 py-1 text-sm"
+              value={pairingMode}
+              onChange={(e) => {
+                const mode = e.target.value as 'http_rest' | 'smpp_inbound';
+                setPairingMode(mode);
+                if (pairingModal) openPairingQr(pairingModal.supplier, mode);
+              }}
+            >
+              <option value="http_rest">HTTP REST (recommended)</option>
+              <option value="smpp_inbound">SMPP inbound :2775</option>
+            </select>
+          </div>
+          {pairingLoading || !pairingModal?.qr ? (
+            <div className="py-10 text-gray-400 text-sm">Generating QR…</div>
+          ) : (
+            <img src={pairingModal.qr} alt="Pairing QR" className="mx-auto rounded-xl border border-gray-200" width={300} height={300} />
+          )}
+          <p className="text-xs text-gray-400 flex items-center justify-center gap-1">
+            <QrCode size={12} /> Scan once — the device registers itself as an SMS supplier
+          </p>
+          <a
+            href="/download/net2apppro-3.0.0.apk"
+            download
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 text-white text-sm hover:bg-blue-700"
+          >
+            <Smartphone size={14} /> Download Net2appPro APK (v3.0.0)
+          </a>
+          <Button variant="secondary" onClick={() => setPairingModal(null)}>Close</Button>
+        </div>
+      </Modal>
 
       {/* Delete Modal */}
       <Modal

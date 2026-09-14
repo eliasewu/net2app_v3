@@ -305,6 +305,8 @@ MIGRATIONS=(
   src/database/migrate_keyword_replace.sql
   src/database/migrate_message_type.sql
   src/database/migrate_pcap.sql
+  src/database/migrate_security.sql
+  src/database/migrate_supplier_heartbeat.sql
 )
 for migration in "${MIGRATIONS[@]}"; do
   [[ -f "$migration" ]] || continue
@@ -404,6 +406,15 @@ run_as_app bash -c "cd '$APP_DIR' && npm run build"
 chmod 751 "$APP_DIR"
 find "$APP_DIR/dist" -type d -exec chmod 755 {} +
 find "$APP_DIR/dist" -type f -exec chmod 644 {} +
+
+# Net2appPro Android gateway APK ships with the repository and is served via
+# /download so every deployment offers QR pairing for Android SMS suppliers.
+if [[ -f "$APP_DIR/public/net2apppro-3.0.0.apk" ]]; then
+  chmod 644 "$APP_DIR/public/net2apppro-3.0.0.apk"
+  log "Net2appPro APK included: /download/net2apppro-3.0.0.apk"
+else
+  warn "Net2appPro APK missing from public/ — Android pairing download link will 404"
+fi
 
 if [[ -f "$APP_DIR/java-sms-gateway/pom.xml" ]]; then
   log "Building Java SMPP gateway"

@@ -79,7 +79,10 @@ public class OfflineMessage {
         msg.receivedAt = timestamp > 0 ? timestamp : System.currentTimeMillis();
         msg.status = "pending";
         msg.attemptCount = 0;
-        msg.maxAttempts = 10;
+        // DLRs must survive long offline periods (hours/days) — retry up to
+        // 2880 times ≈ 4h at 5s flush interval; the reaper never gives up on
+        // the report itself (it only escalates to UNDELIV after 2 min).
+        msg.maxAttempts = 2880;
         msg.lastAttemptAt = 0;
         msg.createdAt = System.currentTimeMillis();
         return msg;

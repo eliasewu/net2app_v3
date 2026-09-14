@@ -17,6 +17,7 @@ const crypto = require('crypto');
 const multer = require('multer');
 const cookieParser = require('cookie-parser');
 const WebSocket = require('ws');
+const QRCode = require('qrcode');
 
 // Parse PostgreSQL NUMERIC/DECIMAL columns as JavaScript numbers (not strings).
 // OID 1700 = NUMERIC. Without this, all DECIMAL columns (rates, balances,
@@ -2347,29 +2348,21 @@ let _wsBroadcast = null; // WebSocket broadcast function (set after server start
 const JWT_SECRET = process.env.JWT_SECRET || 'net2app-hub-secret-key-2024';
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
-// ── JWT access + refresh token split ──
-// Access token: short-lived (30 min), returned in the login/refresh response body
-//   and kept in the frontend's in-memory state (never localStorage). Sent on every
-//   request via `Authorization: Bearer <token>`.
-// Refresh token: long-lived (7 days), stored in an httpOnly cookie so the browser
-//   sends it automatically (JS cannot read it). Used ONLY by /api/auth/refresh.
-const ACCESS_TOKEN_TTL = '30m';
-const REFRESH_TOKEN_TTL = '7d';
+// ── JWT access + database-backed refresh session split ──
+// Access tokens are short-lived and kept only in frontend memory.
+// Refresh tokens are opaque, httpOnly-cookie values; only SHA-256 hashes are stored in PostgreSQL.
+const ACCESS_TOKEN_TTL = '15m';
+const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const REFRESH_COOKIE_NAME = 'refreshToken';
-const REFRESH_COOKIE_MAX_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days (ms)
+const REFRESH_COOKIE_MAX_AGE = REFRESH_TOKEN_TTL_MS;
 
-// HTTPS-ready: set COOKIE_SECURE=true in the environment once the site runs behind
-// TLS. Defaults to false so HTTP deployments keep working (browsers drop secure cookies over HTTP).
 const COOKIE_SECURE = process.env.COOKIE_SECURE === 'true';
 
 const COOKIE_OPTIONS = {
     httpOnly: true,
-    // Only set secure:true when behind HTTPS. The site currently runs on HTTP (port 80)
-    // via nginx reverse proxy. Browsers refuse to send secure cookies over HTTP,
-    // which breaks all API calls (401 → redirect loop).
     secure: COOKIE_SECURE,
     sameSite: 'lax',
-    maxAge: 24 * 60 * 60 * 1000, // 24 hours (legacy access-token cookie; retained for old sessions)
+    maxAge: 24 * 60 * 60 * 1000,
     path: '/',
 };
 
@@ -2381,20 +2374,59 @@ const REFRESH_COOKIE_OPTIONS = {
     path: '/',
 };
 
-// Sign a short-lived access token (stored in app memory, sent via Authorization header)
 function signAccessToken(payload) {
     return jwt.sign({ ...payload, type: 'access' }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_TTL });
 }
 
-// Sign a long-lived refresh token (stored in an httpOnly cookie)
-function signRefreshToken(payload) {
-    return jwt.sign({ ...payload, type: 'refresh' }, JWT_SECRET, { expiresIn: REFRESH_TOKEN_TTL });
+function hashRefreshToken(token) {
+    return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+async function issueRefreshToken(user, req, res) {
+    const rawToken = crypto.randomBytes(48).toString('base64url');
+    await pool.query(
+        `INSERT INTO auth_refresh_sessions
+         (user_id, token_hash, expires_at, ip_address, user_agent)
+         VALUES ($1, $2, NOW() + INTERVAL '7 days', $3, $4)`,
+        [user.id, hashRefreshToken(rawToken), req.ip || null, req.get('user-agent') || null]
+    );
+    res.cookie(REFRESH_COOKIE_NAME, rawToken, REFRESH_COOKIE_OPTIONS);
+}
+
+async function revokeRefreshToken(rawToken, replacementHash = null) {
+    if (!rawToken) return;
+    await pool.query(
+        `UPDATE auth_refresh_sessions
+         SET revoked_at = COALESCE(revoked_at, NOW()), replaced_by_hash = COALESCE($2, replaced_by_hash), last_used_at = NOW()
+         WHERE token_hash = $1 AND revoked_at IS NULL`,
+        [hashRefreshToken(rawToken), replacementHash]
+    );
+}
+
+async function revokeUserRefreshTokens(userId) {
+    await pool.query('UPDATE auth_refresh_sessions SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL', [userId]);
+}
+
+function sanitizeUser(user) {
+    if (!user) return user;
+    const { password_hash, ...safe } = user;
+    return safe;
+}
+
+async function writeAudit(req, action, entityType, entityId, details = {}) {
+    try {
+        await pool.query(
+            `INSERT INTO audit_logs (user_id, username, action, entity_type, entity_id, details, ip_address, user_agent, created_at)
+             VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,NOW())`,
+            [req.user?.id || null, req.user?.username || 'system', action, entityType || null, entityId || null,
+             JSON.stringify(details), req.ip || null, req.get('user-agent') || null]
+        );
+    } catch (e) {
+        console.error('[AUDIT] Failed to write audit record:', e.message);
+    }
 }
 
 const extractToken = (req) => {
-    // Access token is sent via `Authorization: Bearer <token>` (kept in app memory).
-    // Fall back to the legacy 'token' cookie for sessions created before the
-    // access/refresh split was introduced.
     const authHeader = req.headers.authorization;
     if (authHeader) {
         const parts = authHeader.trim().split(' ');
@@ -2432,7 +2464,16 @@ const auth = async (req, res, next) => {
     }
 };
 
-// Super Admin only — gates license, tenant, and system-level operations
+const adminAuth = async (req, res, next) => {
+    await auth(req, res, () => {
+        if (!['admin', 'super_admin'].includes(req.user?.role)) {
+            return res.status(403).json({ error: 'Administrator access required' });
+        }
+        next();
+    });
+};
+
+// Super Admin only — gates license, tenant, audit and system-level operations
 const superAuth = async (req, res, next) => {
     try {
         const token = extractToken(req);
@@ -2501,9 +2542,10 @@ app.post('/api/auth/login', async (req, res) => {
             const validPassword = await bcrypt.compare(password, user.password_hash);
             if (validPassword) {
                 const accessToken = signAccessToken({ id: user.id, username: user.username, role: user.role });
-                const refreshToken = signRefreshToken({ id: user.id, username: user.username, role: user.role });
-                res.cookie(REFRESH_COOKIE_NAME, refreshToken, REFRESH_COOKIE_OPTIONS);
-                return res.json({ success: true, token: accessToken, user });
+                await issueRefreshToken(user, req, res);
+                await pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.id]).catch(() => {});
+                await writeAudit(req, 'login', 'user', user.id, { role: user.role });
+                return res.json({ success: true, token: accessToken, user: sanitizeUser(user) });
             }
         }
         // 2. Fallback: try client portal login (client_code + smpp_password)
@@ -2518,9 +2560,8 @@ app.post('/api/auth/login', async (req, res) => {
             if (uid) {
                 const userR = await pool.query('SELECT * FROM users WHERE id = $1', [uid]);
                 const accessToken = signAccessToken({ id: uid, username: c.client_code, role: 'client' });
-                const refreshToken = signRefreshToken({ id: uid, username: c.client_code, role: 'client' });
-                res.cookie(REFRESH_COOKIE_NAME, refreshToken, REFRESH_COOKIE_OPTIONS);
-                return res.json({ success: true, token: accessToken, user: userR.rows[0] });
+                await issueRefreshToken({ id: uid }, req, res);
+                return res.json({ success: true, token: accessToken, user: sanitizeUser(userR.rows[0]) });
             }
         }
         // 3. Fallback: try supplier portal login (supplier_code + smpp_password)
@@ -2534,9 +2575,8 @@ app.post('/api/auth/login', async (req, res) => {
             if (uid) {
                 const userR = await pool.query('SELECT * FROM users WHERE id = $1', [uid]);
                 const accessToken = signAccessToken({ id: uid, username: s.supplier_code, role: 'supplier' });
-                const refreshToken = signRefreshToken({ id: uid, username: s.supplier_code, role: 'supplier' });
-                res.cookie(REFRESH_COOKIE_NAME, refreshToken, REFRESH_COOKIE_OPTIONS);
-                return res.json({ success: true, token: accessToken, user: userR.rows[0] });
+                await issueRefreshToken({ id: uid }, req, res);
+                return res.json({ success: true, token: accessToken, user: sanitizeUser(userR.rows[0]) });
             }
         }
         return res.status(401).json({ error: 'Invalid credentials' });
@@ -2546,34 +2586,36 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
-// Exchange the httpOnly refresh-token cookie for a new access token.
-// Called automatically by the frontend when the 30-min access token expires,
-// so the user stays logged in without re-entering credentials. When this
-// endpoint 401s (refresh token expired/revoked), the user must log in again.
+// Exchange and rotate the httpOnly refresh-token cookie.
 app.post('/api/auth/refresh', async (req, res) => {
     try {
-        const refreshToken = req.cookies && req.cookies[REFRESH_COOKIE_NAME];
-        if (!refreshToken) return res.status(401).json({ error: 'No refresh token' });
-
-        let decoded;
-        try {
-            decoded = jwt.verify(refreshToken, JWT_SECRET);
-        } catch (e) {
-            return res.status(401).json({ error: 'Invalid or expired refresh token' });
-        }
-        // Only refresh tokens may mint new access tokens (never an access token).
-        if (decoded.type !== 'refresh') return res.status(401).json({ error: 'Invalid refresh token' });
-
-        // Re-check the user still exists and is active, so disabling a user also
-        // blocks them from silently refreshing their session.
-        const userR = await pool.query(
-            'SELECT id, username, role FROM users WHERE id = $1 AND is_active = true',
-            [decoded.id]
+        const rawToken = req.cookies && req.cookies[REFRESH_COOKIE_NAME];
+        if (!rawToken) return res.status(401).json({ error: 'No refresh token' });
+        const tokenHash = hashRefreshToken(rawToken);
+        const sessionR = await pool.query(
+            `SELECT s.id, s.user_id, s.expires_at, u.id, u.username, u.role, u.is_active
+             FROM auth_refresh_sessions s JOIN users u ON u.id = s.user_id
+             WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND s.expires_at > NOW() AND u.is_active = true`,
+            [tokenHash]
         );
-        if (userR.rows.length === 0) return res.status(401).json({ error: 'User not found or inactive' });
-
-        const u = userR.rows[0];
-        const accessToken = signAccessToken({ id: u.id, username: u.username, role: u.role });
+        if (sessionR.rows.length === 0) return res.status(401).json({ error: 'Invalid or expired refresh token' });
+        const u = sessionR.rows[0];
+        const replacement = crypto.randomBytes(48).toString('base64url');
+        const replacementHash = hashRefreshToken(replacement);
+        const db = await pool.connect();
+        try {
+            await db.query('BEGIN');
+            const locked = await db.query(
+                `SELECT id FROM auth_refresh_sessions WHERE id = $1 AND revoked_at IS NULL AND expires_at > NOW() FOR UPDATE`,
+                [sessionR.rows[0].id]
+            );
+            if (!locked.rows.length) { await db.query('ROLLBACK'); return res.status(401).json({ error: 'Refresh token already used' }); }
+            await db.query(`UPDATE auth_refresh_sessions SET revoked_at=NOW(), replaced_by_hash=$2, last_used_at=NOW() WHERE id=$1`, [sessionR.rows[0].id, replacementHash]);
+            await db.query(`INSERT INTO auth_refresh_sessions (user_id, token_hash, expires_at, ip_address, user_agent) VALUES ($1,$2,NOW()+INTERVAL '7 days',$3,$4)`, [u.user_id, replacementHash, req.ip || null, req.get('user-agent') || null]);
+            await db.query('COMMIT');
+        } catch (e) { await db.query('ROLLBACK').catch(() => {}); throw e; } finally { db.release(); }
+        res.cookie(REFRESH_COOKIE_NAME, replacement, REFRESH_COOKIE_OPTIONS);
+        const accessToken = signAccessToken({ id: u.user_id, username: u.username, role: u.role });
         return res.json({ success: true, token: accessToken });
     } catch (error) {
         console.error('[AUTH] Refresh error:', error.message);
@@ -2584,10 +2626,7 @@ app.post('/api/auth/refresh', async (req, res) => {
 // Check current session — returns user data if token cookie is valid
 app.get('/api/auth/me', auth, async (req, res) => {
     try {
-        const result = await pool.query(
-            `SELECT id, username, email, role, permissions, name, is_active, last_login, created_at FROM users WHERE id = $1`,
-            [req.user.id]
-        );
+        const result = await pool.query('SELECT id, username, email, role, permissions, name, is_active, last_login, created_at FROM users WHERE id = $1', [req.user.id]);
         if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
         const user = result.rows[0];
         // For client/supplier portal users, resolve entity IDs
@@ -2598,7 +2637,7 @@ app.get('/api/auth/me', auth, async (req, res) => {
             const sR = await pool.query('SELECT id FROM suppliers WHERE (supplier_code = $1 OR smpp_username = $1) AND status = $2 AND (is_deleted IS NULL OR is_deleted = false)', [user.username, 'active']);
             if (sR.rows.length > 0) user.supplier_id = sR.rows[0].id;
         }
-        res.json({ success: true, data: user });
+        res.json({ success: true, data: sanitizeUser(user) });
     } catch (error) {
         res.status(500).json({ error: 'Internal server error' });
     }
@@ -2614,63 +2653,79 @@ app.post('/api/auth/change-password', auth, async (req, res) => {
         const user = userR.rows[0];
         const valid = await bcrypt.compare(oldPassword, user.password_hash);
         if (!valid) return res.status(400).json({ error: 'Current password is incorrect' });
-        const hash = await bcrypt.hash(newPassword, 10);
-        await pool.query('UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2', [hash, req.user.id]);
+        const hash = await bcrypt.hash(newPassword, 12);
+        await pool.query('UPDATE users SET password_hash = $1, password_changed_at = NOW(), updated_at = NOW() WHERE id = $2', [hash, req.user.id]);
+        await revokeUserRefreshTokens(req.user.id);
+        await writeAudit(req, 'password_changed', 'user', req.user.id);
         res.json({ success: true, message: 'Password changed successfully' });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Logout must NOT require a valid access token: if the access token has already
-// expired when the user clicks logout, the endpoint would 401 and leave the
-// refresh cookie behind — silently re-logging the user in on the next page load.
-// It only needs the cookie to clear it (idempotent).
+// Logout is idempotent and revokes the current database refresh session.
 app.post('/api/auth/logout', async (req, res) => {
     try {
-        // Clear both the legacy access-token cookie and the refresh-token cookie
-        // (must match the same domain/path as when set).
-        res.clearCookie('token', { httpOnly: true, secure: false, sameSite: 'lax', path: '/' });
+        const rawToken = req.cookies && req.cookies[REFRESH_COOKIE_NAME];
+        if (rawToken) await revokeRefreshToken(rawToken);
+        res.clearCookie('token', { httpOnly: true, secure: COOKIE_SECURE, sameSite: 'lax', path: '/' });
         res.clearCookie(REFRESH_COOKIE_NAME, REFRESH_COOKIE_OPTIONS);
         res.json({ success: true, message: 'Logged out successfully' });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ==================== USERS ====================
-app.get('/api/users', auth, async (req, res) => {
+app.get('/api/users', adminAuth, async (req, res) => {
     try {
-        const result = await pool.query('SELECT id, username, email, role, permissions, name, is_active, last_login, created_at FROM users ORDER BY id');
+        const isSuperAdmin = req.user?.role === 'super_admin';
+        const result = await pool.query(
+            `SELECT id, username, email, role, permissions, name, is_active, last_login, created_at
+             FROM users ${isSuperAdmin ? '' : "WHERE role <> 'super_admin'"} ORDER BY id`
+        );
         res.json({ success: true, data: result.rows });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/users', auth, async (req, res) => {
+app.post('/api/users', adminAuth, async (req, res) => {
     try {
         const { username, password, email, role, permissions, name } = req.body;
         if (!username || !password) return res.status(400).json({ error: 'username and password required' });
-        const hash = await bcrypt.hash(password, 10);
+        if (role === 'super_admin' && req.user?.role !== 'super_admin') return res.status(403).json({ error: 'Only Super Admin can create a Super Admin' });
+        const hash = await bcrypt.hash(password, 12);
         const result = await pool.query(
-            `INSERT INTO users (username, password_hash, email, role, permissions, name, is_active, created_at, updated_at)
-             VALUES ($1,$2,$3,$4,$5,$6,true,NOW(),NOW()) RETURNING id, username, email, role, permissions, name, is_active, last_login, created_at`,
+            `INSERT INTO users (username, password_hash, password_changed_at, email, role, permissions, name, is_active, created_at, updated_at)
+             VALUES ($1,$2,NOW(),$3,$4,$5,$6,true,NOW(),NOW()) RETURNING id, username, email, role, permissions, name, is_active, last_login, created_at`,
             [username, hash, email || '', role || 'client', permissions || [], name || '']
         );
+        await writeAudit(req, 'user_created', 'user', result.rows[0].id, { role: result.rows[0].role });
         res.json({ success: true, data: result.rows[0] });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.put('/api/users/:id', auth, async (req, res) => {
+app.put('/api/users/:id', adminAuth, async (req, res) => {
     try {
         const { id } = req.params;
-        const fields = req.body;
+        const fields = { ...(req.body || {}) };
+        const targetR = await pool.query('SELECT id, role FROM users WHERE id = $1', [id]);
+        if (!targetR.rows.length) return res.status(404).json({ error: 'User not found' });
+        if (targetR.rows[0].role === 'super_admin' && req.user?.role !== 'super_admin') return res.status(403).json({ error: 'Super Admin accounts are private' });
+        if (fields.role === 'super_admin' && req.user?.role !== 'super_admin') return res.status(403).json({ error: 'Only Super Admin can assign Super Admin role' });
         if (fields.password) {
-            fields.password_hash = await bcrypt.hash(fields.password, 10);
+            fields.password_hash = await bcrypt.hash(fields.password, 12);
+            fields.password_changed_at = new Date();
             delete fields.password;
         }
         delete fields.current_password;
+        delete fields.password_hash;
         const setParts = []; const values = []; let idx = 1;
-        for (const [key, value] of Object.entries(fields)) {
-            if (value !== undefined && key !== 'id') {
+        const allowed = ['username','email','role','permissions','name','is_active','password_changed_at'];
+        for (const key of allowed) {
+            if (fields[key] !== undefined && key !== 'id') {
                 setParts.push(`${key} = $${idx++}`);
-                values.push(value);
+                values.push(fields[key]);
             }
+        }
+        if (req.body?.password) {
+            setParts.push(`password_hash = $${idx++}`);
+            values.push(fields.password_hash);
         }
         if (setParts.length === 0) return res.status(400).json({ error: 'No fields to update' });
         setParts.push(`updated_at = NOW()`);
@@ -2679,15 +2734,19 @@ app.put('/api/users/:id', auth, async (req, res) => {
             `UPDATE users SET ${setParts.join(', ')} WHERE id = $${values.length} RETURNING id, username, email, role, permissions, name, is_active, last_login, created_at`,
             values
         );
-        if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+        if (req.body?.password) await revokeUserRefreshTokens(id);
+        await writeAudit(req, 'user_updated', 'user', id, { changed_fields: Object.keys(req.body || {}).filter(k => k !== 'password') });
         res.json({ success: true, data: result.rows[0] });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.delete('/api/users/:id', auth, async (req, res) => {
+app.delete('/api/users/:id', adminAuth, async (req, res) => {
     try {
+        const targetR = await pool.query('SELECT id, role FROM users WHERE id = $1', [req.params.id]);
+        if (!targetR.rows.length) return res.status(404).json({ error: 'User not found' });
+        if (targetR.rows[0].role === 'super_admin' && req.user?.role !== 'super_admin') return res.status(403).json({ error: 'Super Admin accounts are private' });
         const result = await pool.query('DELETE FROM users WHERE id = $1 RETURNING id, username', [req.params.id]);
-        if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+        await writeAudit(req, 'user_deleted', 'user', req.params.id);
         res.json({ success: true, message: 'User deleted', username: result.rows[0].username });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -3169,6 +3228,47 @@ app.get('/api/suppliers', auth, async (req, res) => {
     }
 });
 
+// ============================================================
+// ANDROID GATEWAY PAIRING QR
+// Generates a one-scan pairing payload for the Net2appPro Android app.
+// The QR encodes: server base URL, supplier SMPP credentials, connection
+// mode (http_rest or smpp_inbound) and an optional device name. The app
+// scans it, auto-fills its setup form, registers via /api/gateway/register
+// and starts working — no manual IP/username/password entry needed.
+// ============================================================
+app.get('/api/suppliers/:id/pairing-qr', auth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const result = await pool.query('SELECT * FROM suppliers WHERE id = $1', [id]);
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Supplier not found' });
+        const s = result.rows[0];
+
+        // Public base URL: prefer the request's own host so it always matches
+        // what the phone can reach (works behind proxies/NAT as configured).
+        const proto = req.get('x-forwarded-proto') || req.protocol || 'http';
+        const host = req.get('x-forwarded-host') || req.get('host') || `127.0.0.1:${process.env.PORT || 3001}`;
+        const baseUrl = `${proto}://${host}`;
+
+        const mode = (req.query.mode === 'smpp_inbound') ? 'smpp_inbound' : 'http_rest';
+        const payload = {
+            v: 1,
+            app: 'net2apppro',
+            server_url: baseUrl,
+            username: s.smpp_username || '',
+            password: s.smpp_password || '',
+            mode,
+            smpp_host: s.smpp_host && s.smpp_host !== '0.0.0.0' ? s.smpp_host : (req.get('host') || '').split(':')[0],
+            smpp_port: parseInt(process.env.SMPP_PORT || '2775', 10),
+            device_name: (s.company_name || s.supplier_code || 'device').replace(/[^a-zA-Z0-9 _-]/g, '').substring(0, 24),
+        };
+        const qrDataUrl = await QRCode.toDataURL(JSON.stringify(payload), { errorCorrectionLevel: 'M', margin: 1, width: 360 });
+        res.json({ success: true, data: { qr: qrDataUrl, payload, pairing_hint: 'Open Net2appPro app → Scan Pairing QR' } });
+    } catch (e) {
+        console.error('[PAIRING-QR] Failed:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
 app.get('/api/suppliers/:id', auth, async (req, res) => {
     try {
         const { id } = req.params;
@@ -3269,6 +3369,32 @@ app.post('/api/suppliers', auth, async (req, res) => {
             sendWelcomeEmail('supplier', supplier).catch(e => console.error('[WELCOME] Supplier welcome email failed:', e.message));
         }
         res.json({ success: true, data: supplier });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Generate a gateway API key for an Android SMS supplier. Used by Net2appPro
+// (x-api-key header) and shown as a QR code in the UI.
+function genSupplierApiKey(supplierCode) {
+    const code = String(supplierCode || 'sup').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 12) || 'sup';
+    return `${code}_gw_${crypto.randomBytes(32).toString('hex')}`;
+}
+
+app.post('/api/suppliers/:id/generate-api-key', auth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const supR = await pool.query(
+            'SELECT id, supplier_code FROM suppliers WHERE id = $1 AND (is_deleted IS NULL OR is_deleted = false)',
+            [id]
+        );
+        if (supR.rows.length === 0) return res.status(404).json({ error: 'Supplier not found' });
+        const apiKey = genSupplierApiKey(supR.rows[0].supplier_code);
+        const result = await pool.query(
+            'UPDATE suppliers SET api_key = $1, updated_at = NOW() WHERE id = $2 RETURNING api_key',
+            [apiKey, id]
+        );
+        res.json({ success: true, data: { id: String(id), api_key: result.rows[0].api_key } });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -9113,6 +9239,20 @@ app.get('/api/dashboard/tenant-volume', auth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ==================== AUDIT LOGS ====================
+// Super Admin activity is intentionally invisible to Admin and lower roles.
+app.get('/api/system/audit-logs', superAuth, async (req, res) => {
+    try {
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 100, 1), 500);
+        const result = await pool.query(
+            `SELECT id, user_id, username, action, entity_type, entity_id, details, ip_address, user_agent, created_at
+             FROM audit_logs ORDER BY created_at DESC LIMIT $1`,
+            [limit]
+        );
+        res.json({ success: true, data: result.rows });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ==================== LICENSE ====================
 app.get('/api/license/info', superAuth, async (req, res) => {
     try {
@@ -9200,6 +9340,7 @@ app.post('/api/license/activate', superAuth, async (req, res) => {
             [key, licenseType, req.user?.username || 'unknown', system_ip || null, system_mac || null,
              JSON.stringify(features), JSON.stringify(limits)]
         );
+        await writeAudit(req, 'license_activated', 'license', result.rows[0].id, { license_type: licenseType });
         res.json({ success: true, data: result.rows[0], message: 'License activated' });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -9209,7 +9350,7 @@ app.post('/api/license/deactivate', superAuth, async (req, res) => {
         const result = await pool.query(
             `UPDATE license SET status = 'expired' WHERE status = 'active' RETURNING id, license_key, status`
         );
-        if (result.rows.length === 0) return res.json({ success: true, message: 'No active license to deactivate' });
+        await writeAudit(req, 'license_deactivated', 'license', result.rows[0]?.id || null);
         res.json({ success: true, data: result.rows[0], message: 'License deactivated' });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -9316,6 +9457,7 @@ app.post('/api/license/generate', superAuth, async (req, res) => {
                  JSON.stringify(pkg.features), JSON.stringify(pkg.limits)]
             ).catch(() => {});
         }
+        await writeAudit(req, 'license_generated', 'license', result.rows[0].id, { license_type: licenseType, tenant_code: tenant_code || null });
         res.json({ success: true, data: { key, license: result.rows[0] } });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -9401,7 +9543,7 @@ app.post('/api/license/tenants/:id/extend', superAuth, async (req, res) => {
              WHERE id = $1 RETURNING *`,
             [id, parseInt(days)]
         );
-        if (result.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+        await writeAudit(req, 'tenant_expiry_extended', 'tenant', id, { days: parseInt(days) });
         res.json({ success: true, data: result.rows[0], message: `Extended by ${days} days` });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -9470,7 +9612,7 @@ app.post('/api/license/tenants/:id/volume', superAuth, async (req, res) => {
                 action === 'add' ? 'info' : 'warning', id,
             ]
         ).catch(() => {});
-        await db.query('COMMIT');
+        await writeAudit(req, action === 'add' ? 'tenant_volume_added' : 'tenant_volume_deducted', 'tenant', id, { volume: tier.volume, new_limit: newLimit, price_usd: action === 'add' ? tier.price_usd : 0 });
         res.json({ success: true, data: { tenant: updated.rows[0], used, limit: newLimit, available: Math.max(0, newLimit - used), price_usd: action === 'add' ? tier.price_usd : 0 }, message: `Tenant volume ${action === 'add' ? 'added' : 'deducted'}` });
     } catch (e) {
         await db.query('ROLLBACK').catch(() => {});
@@ -9702,29 +9844,45 @@ app.post('/api/gateway/register', async (req, res) => {
  */
 app.post('/api/gateway/heartbeat', async (req, res) => {
     try {
+        // Auth: x-api-key header (supplier gateway key) OR Basic username/password.
+        // Both are optional in the request; at least one must match a supplier.
         const authHeader = req.headers.authorization;
-        if (!authHeader || !authHeader.startsWith('Basic ')) {
-            return res.status(401).json({ success: false, error: 'Missing auth header' });
+        let username = '', password = '';
+        if (authHeader && authHeader.startsWith('Basic ')) {
+            const decoded = Buffer.from(authHeader.substring(6), 'base64').toString('utf8');
+            const colonIdx = decoded.indexOf(':');
+            username = decoded.substring(0, colonIdx);
+            password = decoded.substring(colonIdx + 1);
         }
-        const decoded = Buffer.from(authHeader.substring(6), 'base64').toString('utf8');
-        const colonIdx = decoded.indexOf(':');
-        const username = decoded.substring(0, colonIdx);
-        const password = decoded.substring(colonIdx + 1);
 
-        const supplierR = await pool.query(
-            `SELECT id, supplier_code FROM suppliers
-             WHERE smpp_username = $1 AND smpp_password = $2
-               AND connection_type = 'android_SMS' AND status = 'active'
-               AND (is_deleted IS NULL OR is_deleted = false)`,
-            [username, password]
-        );
+        // Auth: either Basic (username/password) or x-api-key header
+        // (the supplier's API key — shown as QR in the UI).
+        const apiKeyHeader = req.headers['x-api-key'];
+        let supplierR;
+        if (apiKeyHeader) {
+            supplierR = await pool.query(
+                `SELECT id, supplier_code FROM suppliers
+                 WHERE api_key = $1
+                   AND connection_type = 'android_SMS' AND status = 'active'
+                   AND (is_deleted IS NULL OR is_deleted = false)`,
+                [String(apiKeyHeader)]
+            );
+        } else {
+            supplierR = await pool.query(
+                `SELECT id, supplier_code FROM suppliers
+                 WHERE smpp_username = $1 AND smpp_password = $2
+                   AND connection_type = 'android_SMS' AND status = 'active'
+                   AND (is_deleted IS NULL OR is_deleted = false)`,
+                [username, password]
+            );
+        }
         if (supplierR.rows.length === 0) {
             return res.status(403).json({ success: false, error: 'Invalid credentials or not an Android gateway' });
         }
         const supplier = supplierR.rows[0];
 
         await pool.query(
-            `UPDATE suppliers SET bind_status = 'bound', updated_at = NOW() WHERE id = $1`,
+            `UPDATE suppliers SET bind_status = 'bound', last_heartbeat_at = NOW(), updated_at = NOW() WHERE id = $1`,
             [supplier.id]
         ).catch(() => {});
 
@@ -9793,11 +9951,19 @@ app.post('/api/gateway/mo-sms', async (req, res) => {
         const decoded = Buffer.from(authHeader.substring(6), 'base64').toString('utf8');
         const [username] = decoded.split(':');
 
-        const supplierR = await pool.query(
-            `SELECT id, supplier_code FROM suppliers
-             WHERE smpp_username = $1 AND connection_type = 'android_SMS' AND status = 'active'`,
-            [username]
-        );
+        // Auth: Basic username or x-api-key (supplier gateway key)
+        const apiKeyHeader = req.headers['x-api-key'];
+        const supplierR = apiKeyHeader
+            ? await pool.query(
+                `SELECT id, supplier_code FROM suppliers
+                 WHERE api_key = $1 AND connection_type = 'android_SMS' AND status = 'active'`,
+                [String(apiKeyHeader)]
+            )
+            : await pool.query(
+                `SELECT id, supplier_code FROM suppliers
+                 WHERE smpp_username = $1 AND connection_type = 'android_SMS' AND status = 'active'`,
+                [username]
+            );
         if (supplierR.rows.length === 0) {
             return res.status(403).json({ success: false, error: 'Not authorized' });
         }
@@ -9848,11 +10014,19 @@ app.post('/api/gateway/mt-dlr', async (req, res) => {
         const decoded = Buffer.from(authHeader.substring(6), 'base64').toString('utf8');
         const [username] = decoded.split(':');
 
-        const supplierR = await pool.query(
-            `SELECT id FROM suppliers WHERE smpp_username = $1
-             AND connection_type = 'android_SMS' AND status = 'active'`,
-            [username]
-        );
+        // Auth: Basic username or x-api-key (supplier gateway key)
+        const apiKeyHeader = req.headers['x-api-key'];
+        const supplierR = apiKeyHeader
+            ? await pool.query(
+                `SELECT id FROM suppliers WHERE api_key = $1
+                 AND connection_type = 'android_SMS' AND status = 'active'`,
+                [String(apiKeyHeader)]
+            )
+            : await pool.query(
+                `SELECT id FROM suppliers WHERE smpp_username = $1
+                 AND connection_type = 'android_SMS' AND status = 'active'`,
+                [username]
+            );
         if (supplierR.rows.length === 0) {
             return res.status(403).json({ success: false, error: 'Not authorized' });
         }
@@ -9873,9 +10047,17 @@ app.post('/api/gateway/mt-dlr', async (req, res) => {
              error_code = CASE WHEN $4 != '' THEN $4 ELSE error_code END
              WHERE message_id = $3
              RETURNING client_id, client_code, destination, submit_time,
-                       client_rate, message_parts, billing_mode_snapshot, webhook_url`,
+                       client_rate, message_parts, billing_mode_snapshot`,
             [dlrStatus, finalStatus, message_id, error_code || '']
         );
+
+        // Client webhook lives on the clients table (same convention as the
+        // DLR-outbox path) — sms_logs has no webhook_url column.
+        let clientWebhookUrl = '';
+        if (logUpdate.rows.length > 0 && logUpdate.rows[0].client_id) {
+            const whR = await pool.query('SELECT webhook_url FROM clients WHERE id = $1 LIMIT 1', [logUpdate.rows[0].client_id]);
+            clientWebhookUrl = whR.rows[0]?.webhook_url || '';
+        }
 
         if (isDlrDelivered(status) && logUpdate.rows.length > 0) {
             const log = logUpdate.rows[0];
@@ -9896,8 +10078,8 @@ app.post('/api/gateway/mt-dlr', async (req, res) => {
                 clientForceDlr: false,
                 supplierForceDlr: false
             });
-            if (log.webhook_url && queueManager) {
-                queueManager.sendWebhook(log.webhook_url, message_id, log.destination,
+            if (clientWebhookUrl && queueManager) {
+                queueManager.sendWebhook(clientWebhookUrl, message_id, log.destination,
                     'delivered', 'DELIVRD', log.client_code).catch(() => {});
             }
             if (smppServer) {
@@ -10094,11 +10276,18 @@ app.get('/api/gateway/stats', async (req, res) => {
         const decoded = Buffer.from(authHeader.substring(6), 'base64').toString('utf8');
         const [username] = decoded.split(':');
 
-        const supplierR = await pool.query(
-            `SELECT id, balance, currency, bind_status FROM suppliers
-             WHERE smpp_username = $1 AND connection_type = 'android_SMS' AND status = 'active'`,
-            [username]
-        );
+        const apiKeyHeader = req.headers['x-api-key'];
+        const supplierR = apiKeyHeader
+            ? await pool.query(
+                `SELECT id, balance, currency, bind_status FROM suppliers
+                 WHERE api_key = $1 AND connection_type = 'android_SMS' AND status = 'active'`,
+                [String(apiKeyHeader)]
+            )
+            : await pool.query(
+                `SELECT id, balance, currency, bind_status FROM suppliers
+                 WHERE smpp_username = $1 AND connection_type = 'android_SMS' AND status = 'active'`,
+                [username]
+            );
         if (supplierR.rows.length === 0) {
             return res.status(403).json({ success: false, error: 'Not authorized' });
         }

@@ -18,6 +18,7 @@ public/qr/
 *.keystore
 *.apk
 *.idsig
+android-gateway/android/app/release-signing.properties
 server.cjs.bak*
 server.cjs.backup*
 server.*.bak

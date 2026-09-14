@@ -48,8 +48,15 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
   return <>{children}</>;
 }
 
-function PublicRoute({ children }: { children: React.ReactNode }) {
-  const { isAuthenticated, isLoading } = useAuth();
+function SuperAdminRoute({ children }: { children: React.ReactNode }) {
+  const { user, isAuthenticated, isLoading } = useAuth();
+  if (isLoading) return <div className="min-h-screen flex items-center justify-center bg-gray-50"><div className="animate-spin rounded-full h-10 w-10 border-b-2 border-blue-600" /></div>;
+  if (!isAuthenticated) return <Navigate to="/login" replace />;
+  if (user?.role !== 'super_admin') return <Navigate to="/" replace />;
+  return <>{children}</>;
+}
+
+function PublicRoute({ children }: { children: React.ReactNode }) {  const { isAuthenticated, isLoading } = useAuth();
   if (isLoading) return <div className="min-h-screen flex items-center justify-center bg-gray-50"><div className="animate-spin rounded-full h-10 w-10 border-b-2 border-blue-600" /></div>;
   if (isAuthenticated) return <Navigate to="/" replace />;
   return <>{children}</>;
@@ -107,7 +114,7 @@ function AppRoutes() {
         <Route path="users" element={<UserManagement />} />
         <Route path="users/roles" element={<RolesPage />} />
         <Route path="system/settings" element={<PlatformSettings />} />
-        <Route path="system/license" element={<License />} />
+        <Route path="system/license" element={<SuperAdminRoute><License /></SuperAdminRoute>} />
         <Route path="system/database" element={<DatabasePage />} />
         <Route path="system/backup" element={<BackupPage />} />
         <Route path="system/api-docs" element={<ApiDocs />} />

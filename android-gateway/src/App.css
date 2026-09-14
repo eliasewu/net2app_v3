@@ -556,3 +556,43 @@ select {
 .connection-dot.online {
   animation: pulse 2s ease-in-out infinite;
 }
+
+/* ==================== QR PAIRING ==================== */
+.btn-qr {
+  width: 100%;
+  padding: 14px;
+  font-size: 16px;
+  font-weight: 600;
+  background: linear-gradient(135deg, #1d4ed8, #3b82f6);
+  color: #fff;
+  border: none;
+  border-radius: 10px;
+  cursor: pointer;
+  margin-bottom: 6px;
+}
+.qr-scan-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(2, 6, 23, 0.96);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+.qr-scan-box {
+  background: #0f172a;
+  border: 1px solid #1e40af;
+  border-radius: 14px;
+  padding: 18px;
+  max-width: 420px;
+  width: 100%;
+  text-align: center;
+  color: #e2e8f0;
+}
+.qr-scan-hint { font-size: 13px; color: #94a3b8; margin-bottom: 12px; }
+.qr-reader { width: 100%; min-height: 260px; border-radius: 10px; overflow: hidden; }
+.qr-reader video { width: 100% !important; }
+.qr-scan-status { margin-top: 10px; font-size: 14px; color: #94a3b8; }
+.qr-scan-status.qr-error { color: #f87171; }
+.qr-scan-box .btn { margin-top: 14px; width: 100%; }
