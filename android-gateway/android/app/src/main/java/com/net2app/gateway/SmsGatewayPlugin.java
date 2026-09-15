@@ -43,12 +43,36 @@ public class SmsGatewayPlugin extends Plugin {
     private ExecutorService executor;
     private PluginCall pendingPermissionCall;
 
-    // HTTP heartbeat config
-    private String serverUrl = "";
+    // HTTP heartbeat config — MULTI-NODE aware (phone connects to ALL hub nodes)
+    private String serverUrl = "";      // primary (first) node URL — legacy single-server mirror
     private String username = "";
     private String password = "";
     private String apiKey = "";
-    private boolean isRegistered = false;
+    private volatile boolean isRegistered = false;
+
+    /** One hub node this phone connects to. 1..N nodes supported. */
+    static class NodeConfig {
+        final String url;
+        final String username;
+        final String password;
+        final String apiKey;
+        volatile boolean registered = false;
+        volatile long lastOkAt = 0;
+        NodeConfig(String url, String username, String password, String apiKey) {
+            this.url = url;
+            this.username = username == null ? "" : username;
+            this.password = password == null ? "" : password;
+            this.apiKey = apiKey == null ? "" : apiKey;
+        }
+    }
+
+    /** All paired hub nodes (source of truth persisted in nodes_json). */
+    private final List<NodeConfig> nodes = new ArrayList<>();
+    /** msgId → node URL that issued the MT message (so DLRs go to the right hub). */
+    private final java.util.Map<String, String> dlrNodeByMsgId = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Parallel HTTP pool so heartbeats to N nodes don't serialize behind timeouts. */
+    private ExecutorService hbExecutor;
 
     // SMPP integration
     private SmppGatewayClient smppClient;
@@ -91,6 +115,7 @@ public class SmsGatewayPlugin extends Plugin {
         activity = getActivity();
         context = getContext();
         executor = Executors.newSingleThreadExecutor();
+        hbExecutor = Executors.newFixedThreadPool(3);
 
         // Initialize offline queue
         offlineQueue = new OfflineQueueManager(context);
@@ -103,26 +128,20 @@ public class SmsGatewayPlugin extends Plugin {
         // an app restart, so the background heartbeat/receivers survive without
         // the user pressing Save & Connect every time.
         android.content.SharedPreferences prefs = context.getSharedPreferences("sms_gateway", Context.MODE_PRIVATE);
-        String savedUrl = prefs.getString("server_url", "");
-        String savedUser = prefs.getString("username", "");
-        if (!savedUrl.isEmpty() && !savedUser.isEmpty()) {
-            serverUrl = savedUrl;
-            username = savedUser;
-            password = prefs.getString("password", "");
-            apiKey = prefs.getString("api_key", "");
-            smppEnabled = prefs.getBoolean("smpp_enabled", false);
+        smppEnabled = prefs.getBoolean("smpp_enabled", false);
+        loadNodesFromPrefs(prefs);
+        if (!nodes.isEmpty()) {
             executor.execute(() -> {
-                boolean registered = registerWithServer();
-                if (registered) {
-                    isRegistered = true;
-                    startGatewayService();
-                    startHeartbeat();
-                    startQueueFlusher();
-                    startDlrReaper();
-                    registerSmsReceiver();
-                    registerDlrReceiver();
-                    Log.i(TAG, "Gateway auto-started from saved config: " + username);
-                }
+                registerAllNodes();
+                // Start unconditionally when nodes exist: heartbeat self-heals
+                // (re-registers) once the network/server comes back.
+                startGatewayService();
+                startHeartbeat();
+                startQueueFlusher();
+                startDlrReaper();
+                registerSmsReceiver();
+                registerDlrReceiver();
+                Log.i(TAG, "Gateway auto-started from saved config: " + username + " (" + nodes.size() + " node(s))");
             });
         }
     }
@@ -344,50 +363,277 @@ public class SmsGatewayPlugin extends Plugin {
 
     @PluginMethod
     public void configure(PluginCall call) {
-        serverUrl = call.getString("serverUrl", "");
-        username = call.getString("username", "");
-        password = call.getString("password", "");
-        apiKey = call.getString("apiKey", "");
+        // MULTI-NODE: JS sends `nodes: [...]` (full list) and/or a legacy single
+        // `serverUrl`. The newly scanned node is upserted (same URL → refresh
+        // credentials, e.g. a fresh QR) without wiping previously paired nodes.
+        JSONArray nodesArr = call.getArray("nodes");
+        String singleUrl = call.getString("serverUrl", "");
+        String singleUser = call.getString("username", "");
+        String singlePass = call.getString("password", "");
+        String singleKey = call.getString("apiKey", "");
         smppEnabled = call.getBoolean("smppEnabled", false);
 
-        // Strip trailing slash
-        if (serverUrl.endsWith("/")) {
-            serverUrl = serverUrl.substring(0, serverUrl.length() - 1);
+        if (singleUrl.endsWith("/")) {
+            singleUrl = singleUrl.substring(0, singleUrl.length() - 1);
         }
 
-        // Save to shared preferences
-        activity.getSharedPreferences("sms_gateway", Context.MODE_PRIVATE)
-                .edit()
-                .putString("server_url", serverUrl)
-                .putString("username", username)
-                .putString("password", password)
-                .putString("api_key", apiKey)
-                .putBoolean("smpp_enabled", smppEnabled)
-                .apply();
-
-        if (serverUrl.isEmpty() || username.isEmpty()) {
-            call.reject("Server URL and username are required");
-            return;
-        }            executor.execute(() -> {
-                // Register with server
-                boolean registered = registerWithServer();
-                if (registered) {
-                    isRegistered = true;
-                    startGatewayService();
-                    startHeartbeat();
-                    startQueueFlusher();
-                    startDlrReaper();
-                    registerSmsReceiver();
-                    registerDlrReceiver();
-                    Log.i(TAG, "Gateway configured and registered: " + username);
+        synchronized (nodes) {
+            nodes.clear();
+            if (nodesArr != null) {
+                for (int i = 0; i < nodesArr.length(); i++) {
+                    JSONObject o = nodesArr.optJSONObject(i);
+                    if (o == null) continue;
+                    String u = o.optString("url", "").trim();
+                    if (u.isEmpty()) continue;
+                    if (u.endsWith("/")) u = u.substring(0, u.length() - 1);
+                    nodes.add(new NodeConfig(u, o.optString("username", ""), o.optString("password", ""), o.optString("apiKey", "")));
                 }
+            }
+            if (!singleUrl.isEmpty() && !singleUser.isEmpty()) {
+                boolean found = false;
+                for (int i = 0; i < nodes.size(); i++) {
+                    if (nodes.get(i).url.equals(singleUrl)) {
+                        // Fresh scan of a known node → refresh its credentials
+                        nodes.set(i, new NodeConfig(singleUrl, singleUser, singlePass, singleKey));
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) nodes.add(new NodeConfig(singleUrl, singleUser, singlePass, singleKey));
+            }
+        }
+
+        if (nodes.isEmpty()) {
+            call.reject("At least one server node (URL + username) is required");
+            return;
+        }
+
+        // Legacy single-server mirror (first node) for BootReceiver / old UIs
+        NodeConfig first = nodes.get(0);
+        serverUrl = first.url;
+        username = first.username;
+        password = first.password;
+        apiKey = first.apiKey;
+
+        persistNodes();
+
+        executor.execute(() -> {
+            registerAllNodes();
+            // Start everything unconditionally — heartbeat self-heals per node
+            startGatewayService();
+            startHeartbeat();
+            startQueueFlusher();
+            startDlrReaper();
+            registerSmsReceiver();
+            registerDlrReceiver();
+            Log.i(TAG, "Gateway configured: " + nodes.size() + " node(s), user " + username);
 
             JSObject result = new JSObject();
-            result.put("success", registered);
+            result.put("success", isRegistered);
             result.put("username", username);
             result.put("serverUrl", serverUrl);
+            result.put("nodes", nodesStatusJson());
+            result.put("registeredCount", registeredCount());
+            result.put("totalCount", nodes.size());
             call.resolve(result);
         });
+    }
+
+    // ============================================================
+    // MULTI-NODE HELPERS
+    // ============================================================
+
+    private void loadNodesFromPrefs(android.content.SharedPreferences prefs) {
+        synchronized (nodes) {
+            nodes.clear();
+            String raw = prefs.getString("nodes_json", "");
+            try {
+                if (!raw.isEmpty()) {
+                    JSONArray arr = new JSONArray(raw);
+                    for (int i = 0; i < arr.length(); i++) {
+                        JSONObject o = arr.optJSONObject(i);
+                        if (o == null) continue;
+                        String u = o.optString("url", "").trim();
+                        if (u.isEmpty()) continue;
+                        if (u.endsWith("/")) u = u.substring(0, u.length() - 1);
+                        nodes.add(new NodeConfig(u, o.optString("username", ""), o.optString("password", ""), o.optString("apiKey", "")));
+                    }
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "nodes_json parse failed: " + e.getMessage());
+            }
+            // Migration: legacy single-server prefs → first node
+            if (nodes.isEmpty()) {
+                String legacyUrl = prefs.getString("server_url", "");
+                String legacyUser = prefs.getString("username", "");
+                if (!legacyUrl.isEmpty() && !legacyUser.isEmpty()) {
+                    nodes.add(new NodeConfig(legacyUrl, legacyUser, prefs.getString("password", ""), prefs.getString("api_key", "")));
+                }
+            }
+            if (!nodes.isEmpty()) {
+                NodeConfig f = nodes.get(0);
+                serverUrl = f.url;
+                username = f.username;
+                password = f.password;
+                apiKey = f.apiKey;
+            }
+        }
+    }
+
+    private void persistNodes() {
+        try {
+            JSONArray arr = new JSONArray();
+            synchronized (nodes) {
+                for (NodeConfig n : nodes) {
+                    JSONObject o = new JSONObject();
+                    o.put("url", n.url);
+                    o.put("username", n.username);
+                    o.put("password", n.password);
+                    o.put("apiKey", n.apiKey);
+                    arr.put(o);
+                }
+            }
+            android.content.SharedPreferences prefs = context.getSharedPreferences("sms_gateway", Context.MODE_PRIVATE);
+            android.content.SharedPreferences.Editor ed = prefs.edit();
+            ed.putString("nodes_json", arr.toString());
+            if (!nodes.isEmpty()) {
+                NodeConfig f = nodes.get(0);
+                ed.putString("server_url", f.url);
+                ed.putString("username", f.username);
+                ed.putString("password", f.password);
+                ed.putString("api_key", f.apiKey);
+            }
+            ed.apply();
+        } catch (Exception e) {
+            Log.e(TAG, "persistNodes failed: " + e.getMessage());
+        }
+    }
+
+    private void registerAllNodes() {
+        List<NodeConfig> snapshot;
+        synchronized (nodes) { snapshot = new ArrayList<>(nodes); }
+        boolean any = false;
+        for (NodeConfig n : snapshot) {
+            n.registered = registerWithServer(n);
+            if (n.registered) any = true;
+        }
+        isRegistered = any;
+    }
+
+    private int registeredCount() {
+        int c = 0;
+        synchronized (nodes) { for (NodeConfig n : nodes) if (n.registered) c++; }
+        return c;
+    }
+
+    /** Per-node status (no credentials) for the UI. */
+    private JSONArray nodesStatusJson() {
+        JSONArray arr = new JSONArray();
+        synchronized (nodes) {
+            for (NodeConfig n : nodes) {
+                try {
+                    JSONObject o = new JSONObject();
+                    o.put("url", n.url);
+                    o.put("username", n.username);
+                    o.put("connected", n.registered);
+                    o.put("lastOkAt", n.lastOkAt);
+                    arr.put(o);
+                } catch (Exception ignored) {}
+            }
+        }
+        return arr;
+    }
+
+    /** Add or replace one node (JS "Add server via QR" flow). */
+    @PluginMethod
+    public void addNode(PluginCall call) {
+        String url = call.getString("url", "");
+        String nodeUser = call.getString("username", "");
+        String nodePass = call.getString("password", "");
+        String nodeKey = call.getString("apiKey", "");
+        if (url == null || url.isEmpty() || nodeUser == null || nodeUser.isEmpty()) {
+            call.reject("url and username are required");
+            return;
+        }
+        if (url.endsWith("/")) url = url.substring(0, url.length() - 1);
+        final boolean wasEmptyBefore;
+        final boolean replaced;
+        final NodeConfig[] added = new NodeConfig[1];
+        synchronized (nodes) {
+            wasEmptyBefore = nodes.isEmpty();
+            Integer idx = null;
+            for (int i = 0; i < nodes.size(); i++) {
+                if (nodes.get(i).url.equals(url)) { idx = i; break; }
+            }
+            if (idx != null) {
+                added[0] = new NodeConfig(url, nodeUser, nodePass, nodeKey);
+                nodes.set(idx, added[0]);
+            } else {
+                added[0] = new NodeConfig(url, nodeUser, nodePass, nodeKey);
+                nodes.add(added[0]);
+            }
+            replaced = idx != null;
+        }
+        persistNodes();
+        executor.execute(() -> {
+            boolean ok = added[0] != null && registerWithServer(added[0]);
+            if (ok) {
+                added[0].registered = true;
+                added[0].lastOkAt = System.currentTimeMillis();
+                isRegistered = true;
+            }
+            // All starters are idempotent — safe to call on every add
+            if (ok || wasEmptyBefore) {
+                startGatewayService();
+                startHeartbeat();
+                startQueueFlusher();
+                startDlrReaper();
+                registerSmsReceiver();
+                registerDlrReceiver();
+            }
+            JSObject result = new JSObject();
+            result.put("success", ok);
+            result.put("replaced", replaced);
+            result.put("nodes", nodesStatusJson());
+            result.put("registeredCount", registeredCount());
+            result.put("totalCount", nodes.size());
+            call.resolve(result);
+        });
+    }
+
+    @PluginMethod
+    public void removeNode(PluginCall call) {
+        String url = call.getString("url", "");
+        boolean removed = false;
+        synchronized (nodes) {
+            java.util.Iterator<NodeConfig> it = nodes.iterator();
+            while (it.hasNext()) {
+                if (it.next().url.equals(url)) { it.remove(); removed = true; }
+            }
+        }
+        persistNodes();
+        isRegistered = registeredCount() > 0;
+        if (nodes.isEmpty()) {
+            // Last node gone — stop the gateway loops
+            if (heartbeatHandler != null && heartbeatRunnable != null) heartbeatHandler.removeCallbacks(heartbeatRunnable);
+            if (flushHandler != null && flushRunnable != null) flushHandler.removeCallbacks(flushRunnable);
+            unregisterSmsReceiver();
+            unregisterDlrReceiver();
+        }
+        JSObject result = new JSObject();
+        result.put("success", removed);
+        result.put("nodes", nodesStatusJson());
+        result.put("totalCount", nodes.size());
+        call.resolve(result);
+    }
+
+    @PluginMethod
+    public void getNodes(PluginCall call) {
+        JSObject result = new JSObject();
+        result.put("nodes", nodesStatusJson());
+        result.put("registeredCount", registeredCount());
+        result.put("totalCount", nodes.size());
+        call.resolve(result);
     }
 
     @PluginMethod
@@ -401,6 +647,9 @@ public class SmsGatewayPlugin extends Plugin {
         result.put("offlineQueuePending", offlineQueue != null ? offlineQueue.getPendingCount() : 0);
         result.put("smppEnabled", smppEnabled);
         result.put("foregroundServiceRunning", GatewayService.running);
+        result.put("nodes", nodesStatusJson());
+        result.put("registeredCount", registeredCount());
+        result.put("totalCount", nodes.size());
         if (smppClient != null) {
             result.put("smppConnected", smppClient.isConnected());
         } else {
@@ -516,13 +765,28 @@ public class SmsGatewayPlugin extends Plugin {
     @PluginMethod
     public void loadSavedConfig(PluginCall call) {
         android.content.SharedPreferences prefs =
-                activity.getSharedPreferences("sms_gateway", Context.MODE_PRIVATE);
+                context.getSharedPreferences("sms_gateway", Context.MODE_PRIVATE);
         JSObject result = new JSObject();
         result.put("serverUrl", prefs.getString("server_url", ""));
         result.put("username", prefs.getString("username", ""));
         result.put("password", prefs.getString("password", ""));
         result.put("apiKey", prefs.getString("api_key", ""));
         result.put("smppEnabled", prefs.getBoolean("smpp_enabled", false));
+        // Full node list WITH credentials so the JS UI can render/edit it
+        JSONArray nodeCreds = new JSONArray();
+        synchronized (nodes) {
+            for (NodeConfig n : nodes) {
+                try {
+                    JSONObject o = new JSONObject();
+                    o.put("url", n.url);
+                    o.put("username", n.username);
+                    o.put("password", n.password);
+                    o.put("apiKey", n.apiKey);
+                    nodeCreds.put(o);
+                } catch (Exception ignored) {}
+            }
+        }
+        result.put("nodes", nodeCreds);
         call.resolve(result);
     }
 
@@ -530,9 +794,9 @@ public class SmsGatewayPlugin extends Plugin {
     // HTTP SERVER COMMUNICATION
     // ============================================================
 
-    private boolean registerWithServer() {
+    private boolean registerWithServer(NodeConfig n) {
         try {
-            java.net.URL url = new java.net.URL(serverUrl + "/api/gateway/register");
+            java.net.URL url = new java.net.URL(n.url + "/api/gateway/register");
             java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
             conn.setRequestProperty("Content-Type", "application/json");
@@ -541,8 +805,8 @@ public class SmsGatewayPlugin extends Plugin {
             conn.setDoOutput(true);
 
             JSONObject payload = new JSONObject();
-            payload.put("username", username);
-            payload.put("password", password);
+            payload.put("username", n.username);
+            payload.put("password", n.password);
             payload.put("device_name", Build.MODEL + " (" + Build.MANUFACTURER + ")");
 
             java.io.OutputStream os = conn.getOutputStream();
@@ -551,83 +815,96 @@ public class SmsGatewayPlugin extends Plugin {
 
             int status = conn.getResponseCode();
             if (status == 200 || status == 201) {
-                Log.i(TAG, "Registered with server: " + username);
+                Log.i(TAG, "Registered with server [" + n.url + "]: " + n.username);
                 return true;
             } else {
-                Log.e(TAG, "Server registration failed: HTTP " + status);
+                Log.e(TAG, "Server registration failed [" + n.url + "]: HTTP " + status);
                 return false;
             }
         } catch (Exception e) {
-            Log.e(TAG, "Server registration error: " + e.getMessage());
+            Log.e(TAG, "Server registration error [" + n.url + "]: " + e.getMessage());
             return false;
         }
     }
 
+    /** Heartbeat to EVERY node so the phone works with all hubs at once. */
     private void doHeartbeat() {
-        executor.execute(() -> {
-            try {
-                String auth = android.util.Base64.encodeToString(
-                        (username + ":" + password).getBytes("UTF-8"),
-                        android.util.Base64.NO_WRAP);
+        List<NodeConfig> snapshot;
+        synchronized (nodes) { snapshot = new ArrayList<>(nodes); }
+        for (NodeConfig n : snapshot) {
+            final NodeConfig node = n;
+            hbExecutor.execute(() -> heartbeatNode(node));
+        }
+        isRegistered = registeredCount() > 0;
+    }
 
-                java.net.URL url = new java.net.URL(serverUrl + "/api/gateway/heartbeat");
-                java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
-                conn.setRequestMethod("POST");
-                conn.setRequestProperty("Content-Type", "application/json");
-                conn.setRequestProperty("Authorization", "Basic " + auth);
-                conn.setRequestProperty("X-API-Key", apiKey);
-                conn.setConnectTimeout(10000);
-                conn.setReadTimeout(10000);
-                conn.setDoOutput(true);
+    private void heartbeatNode(NodeConfig n) {
+        try {
+            String auth = android.util.Base64.encodeToString(
+                    (n.username + ":" + n.password).getBytes("UTF-8"),
+                    android.util.Base64.NO_WRAP);
 
-                JSONObject payload = new JSONObject();
-                payload.put("device_name", Build.MODEL);
-                payload.put("android_version", "Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")");
-                payload.put("sim_ready", isSimReady());
-                payload.put("sim_carrier", getSimCarrier());
-                payload.put("sim_number", getSimNumber());
-                payload.put("pending_mt_count", offlineQueue != null ? offlineQueue.getPendingCount() : 0);
+            java.net.URL url = new java.net.URL(n.url + "/api/gateway/heartbeat");
+            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setRequestProperty("Authorization", "Basic " + auth);
+            if (!n.apiKey.isEmpty()) conn.setRequestProperty("X-API-Key", n.apiKey);
+            conn.setConnectTimeout(10000);
+            conn.setReadTimeout(10000);
+            conn.setDoOutput(true);
 
-                java.io.OutputStream os = conn.getOutputStream();
-                os.write(payload.toString().getBytes("UTF-8"));
-                os.close();
+            JSONObject payload = new JSONObject();
+            payload.put("device_name", Build.MODEL);
+            payload.put("android_version", "Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")");
+            payload.put("sim_ready", isSimReady());
+            payload.put("sim_carrier", getSimCarrier());
+            payload.put("sim_number", getSimNumber());
+            payload.put("pending_mt_count", offlineQueue != null ? offlineQueue.getPendingCount() : 0);
 
-                int status = conn.getResponseCode();
-                if (status == 200) {
-                    isRegistered = true;
-                    // Read pending MT messages
-                    java.io.BufferedReader reader = new java.io.BufferedReader(
-                            new java.io.InputStreamReader(conn.getInputStream()));
-                    StringBuilder sb = new StringBuilder();
-                    String line;
-                    while ((line = reader.readLine()) != null) sb.append(line);
-                    reader.close();
+            java.io.OutputStream os = conn.getOutputStream();
+            os.write(payload.toString().getBytes("UTF-8"));
+            os.close();
 
-                    JSONObject resp = new JSONObject(sb.toString());
-                    if (resp.has("pending_mt")) {
-                        JSONArray pendingMt = resp.getJSONArray("pending_mt");
-                        for (int i = 0; i < pendingMt.length(); i++) {
-                            JSONObject mt = pendingMt.getJSONObject(i);
-                            String msgId = mt.optString("message_id", "");
-                            String dest = mt.optString("destination", "");
-                            String msg = mt.optString("message", "");
-                            if (!dest.isEmpty()) {
-                                // DLR is reported by the delivery broadcast receiver
-                                // (real handset status), NOT optimistically here.
-                                sendSmsViaAndroid(dest, msg, msgId);
-                            }
+            int status = conn.getResponseCode();
+            if (status == 200) {
+                n.registered = true;
+                n.lastOkAt = System.currentTimeMillis();
+                // Read pending MT messages
+                java.io.BufferedReader reader = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(conn.getInputStream()));
+                StringBuilder sb = new StringBuilder();
+                String line;
+                while ((line = reader.readLine()) != null) sb.append(line);
+                reader.close();
+
+                JSONObject resp = new JSONObject(sb.toString());
+                if (resp.has("pending_mt")) {
+                    JSONArray pendingMt = resp.getJSONArray("pending_mt");
+                    for (int i = 0; i < pendingMt.length(); i++) {
+                        JSONObject mt = pendingMt.getJSONObject(i);
+                        String msgId = mt.optString("message_id", "");
+                        String dest = mt.optString("destination", "");
+                        String msg = mt.optString("message", "");
+                        if (!dest.isEmpty()) {
+                            // Remember which node issued this MT so the DLR is
+                            // routed back to the same hub.
+                            if (!msgId.isEmpty()) dlrNodeByMsgId.put(msgId, n.url);
+                            // DLR is reported by the delivery broadcast receiver
+                            // (real handset status), NOT optimistically here.
+                            sendSmsViaAndroid(dest, msg, msgId);
                         }
                     }
-                } else {
-                    Log.w(TAG, "Heartbeat failed: HTTP " + status);
-                    isRegistered = false;
-                    // Retry registration on next beat; do not block the executor
                 }
-            } catch (Exception e) {
-                Log.w(TAG, "Heartbeat error: " + e.getMessage());
-                isRegistered = false;
+            } else {
+                Log.w(TAG, "Heartbeat failed [" + n.url + "]: HTTP " + status);
+                n.registered = false;
+                // Retry registration on next beat; do not block
             }
-        });
+        } catch (Exception e) {
+            Log.w(TAG, "Heartbeat error [" + n.url + "]: " + e.getMessage());
+            n.registered = false;
+        }
     }
 
     // ============================================================
@@ -704,18 +981,32 @@ public class SmsGatewayPlugin extends Plugin {
         executor.execute(() -> sendMoViaHttp(from, text, timestamp));
     }
 
+    /** MO SMS is forwarded to EVERY node — each hub gets the inbound message. */
     private boolean sendMoViaHttp(String from, String text, long timestamp) {
+        List<NodeConfig> snapshot;
+        synchronized (nodes) { snapshot = new ArrayList<>(nodes); }
+        boolean anyOk = false;
+        for (NodeConfig n : snapshot) {
+            if (sendMoToNode(n, from, text, timestamp)) anyOk = true;
+        }
+        if (anyOk && offlineQueue != null) {
+            offlineQueue.markSentBySource(from, text, timestamp);
+        }
+        return anyOk;
+    }
+
+    private boolean sendMoToNode(NodeConfig n, String from, String text, long timestamp) {
         try {
             String auth = android.util.Base64.encodeToString(
-                    (username + ":" + password).getBytes("UTF-8"),
+                    (n.username + ":" + n.password).getBytes("UTF-8"),
                     android.util.Base64.NO_WRAP);
 
-            java.net.URL url = new java.net.URL(serverUrl + "/api/gateway/mo-sms");
+            java.net.URL url = new java.net.URL(n.url + "/api/gateway/mo-sms");
             java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
             conn.setRequestProperty("Content-Type", "application/json");
             conn.setRequestProperty("Authorization", "Basic " + auth);
-            conn.setRequestProperty("X-API-Key", apiKey);
+            if (!n.apiKey.isEmpty()) conn.setRequestProperty("X-API-Key", n.apiKey);
             conn.setConnectTimeout(10000);
             conn.setReadTimeout(10000);
             conn.setDoOutput(true);
@@ -724,6 +1015,7 @@ public class SmsGatewayPlugin extends Plugin {
             payload.put("from", from);
             payload.put("text", text);
             payload.put("timestamp", timestamp);
+            payload.put("device_name", Build.MODEL);
 
             java.io.OutputStream os = conn.getOutputStream();
             os.write(payload.toString().getBytes("UTF-8"));
@@ -731,17 +1023,13 @@ public class SmsGatewayPlugin extends Plugin {
 
             int status = conn.getResponseCode();
             if (status == 200) {
-                Log.i(TAG, "MO forwarded via HTTP: " + from);
-                // Mark as sent in offline queue
-                if (offlineQueue != null) {
-                    offlineQueue.markSentBySource(from, text, timestamp);
-                }
+                Log.i(TAG, "MO forwarded via HTTP [" + n.url + "]: " + from);
                 return true;
             }
-            Log.w(TAG, "MO HTTP forward failed: HTTP " + status);
+            Log.w(TAG, "MO HTTP forward failed [" + n.url + "]: HTTP " + status);
             return false;
         } catch (Exception e) {
-            Log.w(TAG, "MO HTTP forward failed (queued): " + e.getMessage());
+            Log.w(TAG, "MO HTTP forward failed [" + n.url + "] (queued): " + e.getMessage());
             return false;
         }
     }
@@ -750,18 +1038,43 @@ public class SmsGatewayPlugin extends Plugin {
         executor.execute(() -> sendDlrViaHttp(msgId, status, errorCode));
     }
 
+    /** DLR goes to the node that issued the MT; fallback tries every node. */
     private boolean sendDlrViaHttp(String msgId, String dlrStatus, String errorCode) {
+        String nodeUrl = dlrNodeByMsgId.remove(msgId);
+        if (nodeUrl != null) {
+            NodeConfig n = findNode(nodeUrl);
+            if (n != null && sendDlrToNode(n, msgId, dlrStatus, errorCode)) return true;
+        }
+        // Unknown origin (e.g. process restart) — try every node; hubs ignore
+        // message_ids they don't know, the issuing hub accepts the report.
+        List<NodeConfig> snapshot;
+        synchronized (nodes) { snapshot = new ArrayList<>(nodes); }
+        boolean anyOk = false;
+        for (NodeConfig n : snapshot) {
+            if (sendDlrToNode(n, msgId, dlrStatus, errorCode)) anyOk = true;
+        }
+        return anyOk;
+    }
+
+    private NodeConfig findNode(String url) {
+        synchronized (nodes) {
+            for (NodeConfig n : nodes) if (n.url.equals(url)) return n;
+        }
+        return null;
+    }
+
+    private boolean sendDlrToNode(NodeConfig n, String msgId, String dlrStatus, String errorCode) {
         try {
             String auth = android.util.Base64.encodeToString(
-                    (username + ":" + password).getBytes("UTF-8"),
+                    (n.username + ":" + n.password).getBytes("UTF-8"),
                     android.util.Base64.NO_WRAP);
 
-            java.net.URL url = new java.net.URL(serverUrl + "/api/gateway/mt-dlr");
+            java.net.URL url = new java.net.URL(n.url + "/api/gateway/mt-dlr");
             java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
             conn.setRequestProperty("Content-Type", "application/json");
             conn.setRequestProperty("Authorization", "Basic " + auth);
-            conn.setRequestProperty("X-API-Key", apiKey);
+            if (!n.apiKey.isEmpty()) conn.setRequestProperty("X-API-Key", n.apiKey);
             conn.setConnectTimeout(10000);
             conn.setReadTimeout(10000);
             conn.setDoOutput(true);
@@ -777,13 +1090,13 @@ public class SmsGatewayPlugin extends Plugin {
 
             int status = conn.getResponseCode();
             if (status == 200) {
-                Log.i(TAG, "DLR reported: " + msgId + " -> " + dlrStatus);
+                Log.i(TAG, "DLR reported [" + n.url + "]: " + msgId + " -> " + dlrStatus);
                 return true;
             }
-            Log.w(TAG, "DLR HTTP report failed: HTTP " + status + " (will retry: " + msgId + ")");
+            Log.w(TAG, "DLR HTTP report failed [" + n.url + "]: HTTP " + status + " (will retry: " + msgId + ")");
             return false;
         } catch (Exception e) {
-            Log.w(TAG, "DLR HTTP report failed (will retry): " + e.getMessage());
+            Log.w(TAG, "DLR HTTP report failed [" + n.url + "] (will retry): " + e.getMessage());
             return false;
         }
     }
@@ -1063,6 +1376,9 @@ public class SmsGatewayPlugin extends Plugin {
         }
         if (smppClient != null) {
             smppClient.shutdown();
+        }
+        if (hbExecutor != null) {
+            hbExecutor.shutdown();
         }
         if (executor != null) {
             executor.shutdown();

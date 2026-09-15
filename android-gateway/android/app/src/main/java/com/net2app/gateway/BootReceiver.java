@@ -13,17 +13,8 @@ public class BootReceiver extends BroadcastReceiver {
     @Override
     public void onReceive(Context context, Intent intent) {
         if (!Intent.ACTION_BOOT_COMPLETED.equals(intent.getAction())) return;
-
-        SharedPreferences prefs = context.getSharedPreferences("sms_gateway", Context.MODE_PRIVATE);
-        String url = prefs.getString("server_url", "");
-        String user = prefs.getString("username", "");
-        if (url.isEmpty() || user.isEmpty()) return; // never configured
-
-        Intent svc = new Intent(context, GatewayService.class);
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-            context.startForegroundService(svc);
-        } else {
-            context.startService(svc);
-        }
+        // MULTI-NODE engine handles its own "never configured" case (idle),
+        // the foreground service, heartbeats to ALL nodes and receivers.
+        GatewayCore.start(context);
     }
 }

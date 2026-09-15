@@ -13,6 +13,38 @@ export interface GatewayConfig {
   deviceName: string;
   smppHost?: string;
   smppPort?: number;
+  /** MULTI-NODE: all hub nodes this phone connects to (serverUrl above = primary). */
+  nodes?: NodeCreds[];
+}
+
+/** Credentials for one hub node (persisted natively in nodes_json). */
+export interface NodeCreds {
+  url: string;
+  username: string;
+  password: string;
+  apiKey?: string;
+}
+
+/** Live per-node status reported by the native plugin. */
+export interface NodeStatus {
+  url: string;
+  username: string;
+  connected: boolean;
+  lastOkAt: number;
+}
+
+/** Pairing QR payload (server: GET /api/suppliers/:id/pairing-qr). */
+export interface PairingPayload {
+  v: number;
+  app: string;
+  server_url: string;
+  username: string;
+  password: string;
+  api_key?: string;
+  mode: 'http_rest' | 'smpp_inbound';
+  smpp_host?: string;
+  smpp_port?: number;
+  device_name?: string;
 }
 
 export interface SmsMessage {
@@ -74,6 +106,10 @@ interface GatewayContextType {
   openPermissionSettings: () => Promise<void>;
   deviceInfo: DeviceInfo | null;
   isConfigured: boolean;
+  /** MULTI-NODE */
+  nodeStatuses: NodeStatus[];
+  addNodeFromPairing: (p: PairingPayload) => Promise<{ ok: boolean; message: string }>;
+  removeNode: (url: string) => Promise<boolean>;
 }
 
 const GatewayContext = createContext<GatewayContextType | null>(null);
@@ -144,6 +180,16 @@ async function callPlugin(method: string, args?: any): Promise<any> {
   }
 }
 
+/**
+ * Plain WebView native bridge (window.Net2appNative) — registered by
+ * MainActivity. PRIMARY path for config persistence: bypasses the Capacitor
+ * plugin layer entirely, so the native multi-node engine always gets the
+ * config even if the plugin bridge is broken.
+ */
+function nativeBridge(): any {
+  return (window as any).Net2appNative || null;
+}
+
 // ============================================================
 // Provider
 // ============================================================
@@ -174,13 +220,21 @@ export function GatewayProvider({ children }: { children: ReactNode }) {
   const [startTime] = useState(Date.now);
 
   const isConfigured = !!config.serverUrl && !!config.username;
+  const [nodeStatuses, setNodeStatuses] = useState<NodeStatus[]>([]);
 
-  // Persist config — configure native plugin
+  // Persist config — configure native plugin (MULTI-NODE aware)
   const saveConfig = useCallback(async (c: GatewayConfig) => {
     setConfigState(c);
     localStorage.setItem(STORAGE_KEY, JSON.stringify(c));
+    // Build the full node list: explicit c.nodes, or derive the single node
+    const nodeList: NodeCreds[] = (c.nodes && c.nodes.length > 0)
+      ? c.nodes
+      : [{ url: c.serverUrl, username: c.username, password: c.password, apiKey: c.apiKey || '' }];
     try {
       await callPlugin('configure', {
+        // Full multi-node list
+        nodes: nodeList.map(n => ({ url: n.url, username: n.username, password: n.password, apiKey: n.apiKey || '' })),
+        // Legacy single-server fields (primary node) for old builds
         serverUrl: c.serverUrl,
         username: c.username,
         password: c.password,
@@ -196,9 +250,96 @@ export function GatewayProvider({ children }: { children: ReactNode }) {
         });
       }
       setConnectionStatus(prev => ({ ...prev, serverConnected: true }));
-    } catch (e) {
-      console.error('Failed to configure gateway:', e);
+    try {
+      const ns = await callPlugin('getNodes');
+      if (ns?.nodes) setNodeStatuses(ns.nodes);
+    } catch {}
+    // PRIMARY: persist natively via the plain WebView bridge and start the
+    // multi-node engine. Works regardless of Capacitor plugin health.
+    const nb = nativeBridge();
+    if (nb && typeof nb.saveConfig === 'function') {
+      try {
+        const res = nb.saveConfig(JSON.stringify({
+          serverUrl: c.serverUrl,
+          username: c.username,
+          password: c.password,
+          apiKey: c.apiKey || '',
+          nodes: nodeList.map(n => ({ url: n.url, username: n.username, password: n.password, apiKey: n.apiKey || '' })),
+        }));
+        console.log('[Net2app] native saveConfig:', res);
+        const st = JSON.parse(nb.status());
+        if (Array.isArray(st.nodes)) setNodeStatuses(st.nodes);
+        setConnectionStatus(prev => ({ ...prev, serverConnected: st.registeredCount > 0 || prev.serverConnected }));
+      } catch (e) {
+        console.error('[Net2app] native bridge saveConfig failed:', e);
+      }
     }
+  } catch (e) {
+    console.error('Failed to configure gateway:', e);
+  }
+}, []);
+
+  // MULTI-NODE: add a hub node from a scanned pairing QR without touching
+  // the existing nodes — the phone then connects to BOTH hubs.
+  const addNodeFromPairing = useCallback(async (p: PairingPayload) => {
+    const url = (p.server_url || '').replace(/\/$/, '');
+    if (!url || !p.username) return { ok: false, message: '❌ Invalid pairing QR (missing server_url/username)' };
+    // PRIMARY: plain native bridge
+    const nb = nativeBridge();
+    if (nb && typeof nb.addNode === 'function') {
+      try {
+        const res = nb.addNode(JSON.stringify({
+          url,
+          username: p.username,
+          password: p.password || '',
+          apiKey: p.api_key || '',
+        }));
+        const st = JSON.parse(nb.status());
+        if (Array.isArray(st.nodes)) setNodeStatuses(st.nodes);
+        const ok = typeof res === 'string' && res.startsWith('ok');
+        const total = st.totalCount ?? '?';
+        const reg = st.registeredCount ?? '?';
+        return {
+          ok,
+          message: ok
+            ? `✅ Node added: ${url} as ${p.username} — connected nodes: ${reg}/${total}`
+            : `⚠ Node saved (${total} total) but registration failed — heartbeat keeps retrying.`,
+        };
+      } catch (e) {
+        console.error('[Net2app] native addNode failed:', e);
+      }
+    }
+    const result = await callPlugin('addNode', {
+      url,
+      username: p.username,
+      password: p.password || '',
+      apiKey: p.api_key || '',
+    });
+    if (result && result.nodes) setNodeStatuses(result.nodes);
+    const ok = !!(result && result.success);
+    const total = result?.totalCount ?? '?';
+    const reg = result?.registeredCount ?? '?';
+    return {
+      ok,
+      message: ok
+        ? `✅ Node added: ${url} as ${p.username} — connected nodes: ${reg}/${total}`
+        : `⚠ Node saved (${total} total) but registration failed — check the server URL is reachable from this phone. Heartbeat keeps retrying.`,
+    };
+  }, []);
+
+  const removeNodeByUrl = useCallback(async (url: string) => {
+    const nb = nativeBridge();
+    if (nb && typeof nb.removeNode === 'function') {
+      try {
+        const res = nb.removeNode(url);
+        const st = JSON.parse(nb.status());
+        if (Array.isArray(st.nodes)) setNodeStatuses(st.nodes);
+        return typeof res === 'string' && res.startsWith('ok');
+      } catch {}
+    }
+    const result = await callPlugin('removeNode', { url });
+    if (result && result.nodes) setNodeStatuses(result.nodes);
+    return !!(result && result.success);
   }, []);
 
   const setConfig = useCallback((c: GatewayConfig) => {
@@ -313,7 +454,32 @@ export function GatewayProvider({ children }: { children: ReactNode }) {
             // Background = foreground service alive (or at minimum the SMS
             // receiver is registered on builds predating the service).
             backgroundService: status.foregroundServiceRunning === true || status.smsReceiverActive || status.isRegistered,
+            // MULTI-NODE: online when at least one hub node answers
+            lastServerPing: Array.isArray(status.nodes) && status.nodes.some((n: any) => n.lastOkAt > 0)
+              ? Math.max(...status.nodes.filter((n: any) => n.lastOkAt > 0).map((n: any) => n.lastOkAt))
+              : prev.lastServerPing,
           }));
+          if (Array.isArray(status.nodes)) setNodeStatuses(status.nodes);
+        }
+      } catch {}
+      // PRIMARY multi-node truth from the plain native bridge
+      try {
+        const nb = nativeBridge();
+        if (nb && typeof nb.status === 'function') {
+          const st = JSON.parse(nb.status());
+          if (Array.isArray(st.nodes)) {
+            setNodeStatuses(st.nodes);
+            const anyUp = (st.registeredCount || 0) > 0;
+            setConnectionStatus(prev => ({
+              ...prev,
+              serverConnected: anyUp,
+              backgroundService: st.engineStarted === true || prev.backgroundService,
+              smsPermission: typeof st.smsPermissionGranted === 'boolean' ? st.smsPermissionGranted : prev.smsPermission,
+              lastServerPing: anyUp && st.nodes.some((n: any) => n.lastOkAt > 0)
+                ? Math.max(...st.nodes.filter((n: any) => n.lastOkAt > 0).map((n: any) => n.lastOkAt))
+                : prev.lastServerPing,
+            }));
+          }
         }
       } catch {}
       // Refresh device/SIM snapshot (cheap local call — reflects permission
@@ -349,9 +515,24 @@ export function GatewayProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     callPlugin('loadSavedConfig').then(saved => {
       if (saved?.serverUrl) {
-        setConfigState(prev => ({ ...prev, serverUrl: saved.serverUrl, username: saved.username, password: saved.password, apiKey: saved.apiKey || '' }));
+        setConfigState(prev => ({
+          ...prev,
+          serverUrl: saved.serverUrl,
+          username: saved.username,
+          password: saved.password,
+          apiKey: saved.apiKey || '',
+          nodes: Array.isArray(saved.nodes) && saved.nodes.length > 0 ? saved.nodes : prev.nodes,
+        }));
       }
     });
+    // Multi-node status from the plain native bridge (survives plugin issues)
+    try {
+      const nb = nativeBridge();
+      if (nb && typeof nb.status === 'function') {
+        const st = JSON.parse(nb.status());
+        if (Array.isArray(st.nodes) && st.nodes.length > 0) setNodeStatuses(st.nodes);
+      }
+    } catch {}
     callPlugin('getStatus').then(status => {
       if (status) {
         setConnectionStatus(prev => ({
@@ -399,6 +580,9 @@ export function GatewayProvider({ children }: { children: ReactNode }) {
     openPermissionSettings,
     deviceInfo,
     isConfigured,
+    nodeStatuses,
+    addNodeFromPairing,
+    removeNode: removeNodeByUrl,
   };
 
   return (

@@ -5,7 +5,7 @@ import { ApiClient } from '../services/ApiClient';
 import { QrPairingScanner } from '../components/QrPairingScanner';
 
 export default function SetupPage() {
-  const { config, saveConfig, requestSmsPermission, connectionStatus } = useGateway();
+  const { config, saveConfig, requestSmsPermission, connectionStatus, addNodeFromPairing } = useGateway();
   const navigate = useNavigate();
 
   const [form, setForm] = useState<GatewayConfig>({ ...config });
@@ -19,8 +19,20 @@ export default function SetupPage() {
     setForm(prev => ({ ...prev, [field]: value }));
   };
 
-  const handlePaired = (paired: Partial<GatewayConfig>) => {
+  const handlePaired = async (paired: Partial<GatewayConfig>) => {
     setShowScanner(false);
+    // MULTI-NODE: if this phone already has a server and the scanned QR is a
+    // DIFFERENT server, ADD it as an extra node (phone connects to both hubs)
+    // instead of overwriting the existing setup.
+    const scannedUrl = (paired.serverUrl || '').replace(/\/$/, '');
+    const currentUrl = (config.serverUrl || '').replace(/\/$/, '');
+    if (currentUrl && scannedUrl && currentUrl !== scannedUrl) {
+      setPairBanner('⏳ Adding new node…');
+      const res = await addNodeFromPairing(paired as any);
+      setPairBanner(res.message + ' — opening dashboard');
+      setTimeout(() => navigate('/dashboard'), 1200);
+      return;
+    }
     setForm(prev => ({ ...prev, ...paired }));
     setPairBanner(`✅ QR paired: ${paired.serverUrl} as ${paired.username} (${paired.connectionType === 'smpp_inbound' ? 'SMPP inbound' : 'HTTP REST'}) — review and press Save & Connect`);
   };

@@ -2,15 +2,18 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useGateway } from '../services/GatewayContext';
 import { ApiClient } from '../services/ApiClient';
+import { QrPairingScanner } from '../components/QrPairingScanner';
 
 export default function DashboardPage() {
-  const { config, connectionStatus, stats, sendSms, refreshMessages, checkSmsPermissions, openPermissionSettings, deviceInfo } = useGateway();
+  const { config, connectionStatus, stats, sendSms, refreshMessages, checkSmsPermissions, openPermissionSettings, deviceInfo, nodeStatuses, addNodeFromPairing, removeNode } = useGateway();
   const navigate = useNavigate();
 
   const [quickSms, setQuickSms] = useState({ to: '', text: '' });
   const [sending, setSending] = useState(false);
   const [sendResult, setSendResult] = useState<{ ok: boolean; msg: string } | null>(null);
   const [testingConn, setTestingConn] = useState(false);
+  const [showNodeScanner, setShowNodeScanner] = useState(false);
+  const [nodeMsg, setNodeMsg] = useState<string | null>(null);
 
   useEffect(() => {
     const interval = setInterval(refreshMessages, 10000);
@@ -64,6 +67,11 @@ export default function DashboardPage() {
           {connectionStatus.serverConnected ? '🟢 Online' : '🔴 Offline'}
         </div>
       </div>
+      {nodeStatuses.length > 1 && (
+        <p style={{ margin: '4px 0 0', fontSize: 12, opacity: 0.75 }}>
+          🖧 {nodeStatuses.filter(n => n.connected).length}/{nodeStatuses.length} hub nodes connected
+        </p>
+      )}
 
       {/* Status Cards */}
       <div className="status-cards">
@@ -201,6 +209,48 @@ export default function DashboardPage() {
           </button>
         </div>
       </div>
+
+      {/* Connected Nodes (MULTI-NODE) */}
+      <div className="status-details-card">
+        <h3>🖧 Connected Nodes</h3>
+        <div className="status-rows">
+          {nodeStatuses.length === 0 && (
+            <div className="status-row"><span>No nodes</span><span className="warn">⚠</span></div>
+          )}
+          {nodeStatuses.map(n => (
+            <div className="status-row" key={n.url}>
+              <span style={{ maxWidth: '55%', wordBreak: 'break-all' }}>{n.url}</span>
+              <span className={n.connected ? 'ok' : 'error'} style={{ marginLeft: 'auto' }}>
+                {n.connected ? '✅ Connected' : '❌ Offline'}
+              </span>
+              <button
+                className="btn btn-secondary"
+                style={{ marginLeft: 8, padding: '2px 8px', fontSize: 11 }}
+                onClick={async () => {
+                  if (await removeNode(n.url)) setNodeMsg(`🗑 Node removed: ${n.url}`);
+                }}
+              >✖</button>
+            </div>
+          ))}
+          {nodeMsg && <div className="status-row"><span className="info" style={{ fontSize: 12 }}>{nodeMsg}</span></div>}
+        </div>
+        <div className="status-actions">
+          <button className="btn btn-sm btn-outline" onClick={() => { setNodeMsg(null); setShowNodeScanner(true); }}>
+            ➕ Add Server (Scan QR)
+          </button>
+        </div>
+      </div>
+      {showNodeScanner && (
+        <QrPairingScanner
+          onPaired={async (paired: any) => {
+            setShowNodeScanner(false);
+            setNodeMsg('⏳ Connecting to new node…');
+            const res = await addNodeFromPairing(paired as any);
+            setNodeMsg(res.message);
+          }}
+          onCancel={() => setShowNodeScanner(false)}
+        />
+      )}
 
       {/* Device & SIM */}
       <div className="status-details-card">
