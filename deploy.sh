@@ -11,28 +11,51 @@
 # install.sh. For example:
 #   sudo env MYSQL_REGISTER_CLUSTER=false bash deploy.sh
 #
-# Post-deploy self-heal (added 2026-09-15):
-#   - Ensures .env DB password actually matches PostgreSQL (recreates sms_user
-#     password from .env if mismatched — the #1 cause of "HikariPool total=0"
-#     and android gateway 'unbound/offline' symptoms).
-#   - Creates android gateway columns on suppliers (device_name,
-#     last_heartbeat_at, android_version, sim_ready, sim_carrier, sim_number,
-#     battery_level, signal_strength, last_device_info_at).
-#   - Allows 'android_SMS' in suppliers.connection_type.
-#   - Rebuilds the java SMPP gateway jar if missing (service needs
-#     java-sms-gateway/target/sms-gateway-1.0.0.jar).
-#   - Adds .env.production (DB_* subset) for the net2app-smpg systemd unit
-#     when that unit references it.
-#   - Verifies hub + SMPP gateway health at the end.
-#
 # Update an ALREADY-DEPLOYED node without reinstalling (runs only the
-# self-heal fixes above):
+# post-deploy self-heal fixes below):
 #   curl -fsSL https://raw.githubusercontent.com/eliasewu/net2app_v3/main/deploy.sh | sudo SELF_HEAL_ONLY=1 bash
+#
+# Post-deploy self-heal (see self_heal()). Previously observed breakage, in the
+# order the fixes are applied:
+#   1. .env DB password drifting from PostgreSQL — the #1 cause of
+#      "HikariPool total=0" and android gateways stuck 'unbound/offline'.
+#   2. Android gateway columns on suppliers (device_name, last_heartbeat_at,
+#      android_version, sim_ready, sim_carrier, sim_number, battery_level,
+#      signal_strength, last_device_info_at) and android_SMS in
+#      suppliers.connection_type.
+#   3. Frontend bundle integrity (added 2026-09-15). dist/index.html references
+#      content-hashed files ("/assets/index-<hash>.js"). If those hashes are
+#      missing from dist/assets — e.g. index.html was copied without its bundle
+#      — nginx answers "404 text/html" for the ES module and every page renders
+#      a blank white screen. deploy.sh now detects the mismatch, rebuilds the
+#      SPA and verifies the referenced files are actually served.
+#   4. java-sms-gateway/target/sms-gateway-1.0.0.jar is missing or older than
+#      its sources; .env.production (DB_* subset) is created when the
+#      net2app-smpg unit references it but it does not exist.
+#   5. Services are reloaded — "pm2 startOrReload" when pm2 owns the apps (so
+#      .env changes actually take effect) with a systemctl fallback — then the
+#      hub, frontend, java bridge and SMPP port are health-checked.
+#
+# Safety: install.sh aligns an existing checkout with "git reset --hard
+# origin/<ref>", which silently discards node-local hotfixes. A full run
+# therefore refuses to continue when the app checkout has uncommitted changes
+# unless ALLOW_DIRTY=1 is set.
+#
+# Other knobs:
+#   SKIP_FRONTEND_BUILD=1  report missing frontend assets without rebuilding.
+#   APP_DIR=/path          override app directory detection.
 
 set -Eeuo pipefail
 
 readonly INSTALL_URL="${INSTALL_URL:-https://raw.githubusercontent.com/eliasewu/net2app_v3/main/install.sh}"
-readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+readonly SCRIPT_DIR
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+info() { printf '%b[self-heal]%b %s\n' "$CYAN" "$NC" "$*"; }
+ok()   { printf '%b[self-heal]%b %s\n' "$GREEN" "$NC" "$*"; }
+warn() { printf '%b[self-heal]%b %s\n' "$YELLOW" "$NC" "$*" >&2; }
+fail() { printf '%b[self-heal]%b %s\n' "$RED" "$NC" "$*" >&2; }
 
 printf '\033[0;36mNet2App deployment bootstrap\033[0m\n'
 printf 'Installer source: %s\n' "$INSTALL_URL"
@@ -85,6 +108,10 @@ run_installer() {
 # Find where the app lives: /opt/net2app-v3 (newer installs) or
 # /home/ubuntu/net2app-v3 (original node layout).
 locate_app_dir() {
+  if [[ -n "${APP_DIR:-}" ]]; then
+    [[ -f "$APP_DIR/server.cjs" ]] && { echo "$APP_DIR"; return 0; }
+    return 1
+  fi
   if [[ -d /opt/net2app-v3 && -f /opt/net2app-v3/server.cjs ]]; then
     echo /opt/net2app-v3
   elif [[ -d /home/ubuntu/net2app-v3 && -f /home/ubuntu/net2app-v3/server.cjs ]]; then
@@ -94,39 +121,235 @@ locate_app_dir() {
   fi
 }
 
+# ---------------------------------------------------------------- small helpers
+# Read KEY from a dotenv file, tolerating "export KEY=" and surrounding quotes
+# (a quoted DB_PASS must not be handed to PostgreSQL verbatim).
+env_value() {
+  local key=$1 file=$2 value
+  value=$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null | head -1 | cut -d= -f2- || true)
+  value=${value%$'\r'}
+  if [[ ${#value} -ge 2 && ( $value == \"*\" || $value == \'*\' ) ]]; then
+    value=${value:1:${#value}-2}
+  fi
+  printf '%s' "$value"
+}
+
+app_user_for() {
+  local owner
+  owner=$(stat -c '%U' "$1" 2>/dev/null || true)
+  printf '%s' "${owner:-root}"
+}
+
+run_as_app() {
+  local dir=$1 app_user=$2
+  shift 2
+  ( cd "$dir" && runuser -u "$app_user" -- env HOME="/home/$app_user" "$@" )
+}
+
+psql_super() {
+  if command -v runuser >/dev/null 2>&1; then
+    runuser -u postgres -- psql "$@"
+  else
+    sudo -u postgres psql "$@"
+  fi
+}
+
+# ---------------------------------------------------------------- frontend bundle
+# dist/index.html references "/assets/index-<hash>.js"; the entry bundle in turn
+# references its lazily-loaded chunks as "./index-<hash>.js". A hash present in
+# index.html but missing from dist/assets makes every page render blank.
+frontend_entry_refs() {
+  local dist=$1
+  grep -oE '(src|href)="[^"]+"' "$dist/index.html" 2>/dev/null \
+    | sed -E 's/.*="([^"]+)".*/\1/' \
+    | grep -E '^/assets/' \
+    | sed 's|^/||' || true
+}
+
+frontend_chunk_refs() {
+  local dist=$1 ref
+  while IFS= read -r ref; do
+    [[ -n "$ref" && -f "$dist/$ref" ]] || continue
+    grep -oE '"\./[A-Za-z0-9._-]+\.(js|css)"' "$dist/$ref" 2>/dev/null \
+      | tr -d '"' | sed 's|^\./|assets/|' || true
+  done < <(frontend_entry_refs "$dist")
+}
+
+frontend_missing_assets() {
+  local dist=$1 ref
+  { frontend_entry_refs "$dist"; frontend_chunk_refs "$dist"; } | sort -u | while IFS= read -r ref; do
+    if [[ -n "$ref" && ! -f "$dist/$ref" ]]; then printf '%s\n' "$ref"; fi
+  done || true
+}
+
+# True when the built bundle predates the frontend sources, i.e. a code sync
+# landed but the SPA was never rebuilt (deployed UI would be stale).
+frontend_build_stale() {
+  local APP_DIR=$1
+  local DIST="$APP_DIR/dist"
+  [[ -f "$DIST/index.html" ]] || return 0
+  [[ -n "$(find "$APP_DIR/src" "$APP_DIR/index.html" "$APP_DIR/vite.config.ts" -newer "$DIST/index.html" -print -quit 2>/dev/null)" ]]
+}
+
+# "vite build" empties dist/, which would delete artifacts it does not produce
+# (Android APKs, QR images) and break the pairing/download links.
+preserve_dist_extras() {
+  local DIST=$1 target=$2
+  ( cd "$DIST" && find . -mindepth 1 -maxdepth 1 \( -name '*.apk' -o -name '*.idsig' -o -name 'qr' -o -name 'download' \) -exec cp -a {} "$target"/ \; ) 2>/dev/null || true
+}
+
+# Rebuild the SPA when the served index.html and dist/assets disagree (white
+# screen) or when the sources moved ahead of the build (stale UI).
+ensure_frontend_bundle() {
+  local APP_DIR=$1 APP_USER=$2 missing
+  local DIST="$APP_DIR/dist"
+  if [[ ! -f "$DIST/index.html" ]]; then
+    warn "no $DIST/index.html — skipping frontend bundle checks"
+    return 0
+  fi
+
+  local reason=""
+  missing=$(frontend_missing_assets "$DIST")
+  if [[ -n "$missing" ]]; then
+    reason='dist/index.html references assets that are missing from dist/assets — the web UI renders as a blank white page (nginx/app fallback answers text/html for the ES module)'
+  elif frontend_build_stale "$APP_DIR"; then
+    reason='frontend sources are newer than dist/index.html — the deployed UI is stale'
+  fi
+
+  if [[ -z "$reason" ]]; then
+    ok "frontend bundle up to date ($(frontend_entry_refs "$DIST" | wc -l) entry refs present)"
+    return 0
+  fi
+
+  warn "$reason"
+  if [[ -n "$missing" ]]; then
+    warn 'missing assets:'
+    while IFS= read -r ref; do
+      if [[ -n "$ref" ]]; then printf '               %s\n' "$ref" >&2; fi
+    done <<< "$missing"
+  fi
+
+  if [[ "${SKIP_FRONTEND_BUILD:-0}" == "1" ]]; then
+    fail 'SKIP_FRONTEND_BUILD=1 — leaving the frontend bundle as is'
+    return 1
+  fi
+  if [[ ! -x "$APP_DIR/node_modules/.bin/vite" ]]; then
+    fail "vite is not installed in $APP_DIR/node_modules — cannot rebuild the frontend"
+    return 1
+  fi
+
+  local keep
+  keep=$(mktemp -d)
+  preserve_dist_extras "$DIST" "$keep"
+  info 'rebuilding frontend bundle (npm run build)...'
+  if ! run_as_app "$APP_DIR" "$APP_USER" npm run build; then
+    fail 'frontend build failed — the web UI may be broken'
+    rm -rf "$keep"
+    return 1
+  fi
+  preserve_dist_extras "$keep" "$DIST"
+  rm -rf "$keep"
+  chown -R "$APP_USER:$APP_USER" "$DIST"
+
+  missing=$(frontend_missing_assets "$DIST")
+  if [[ -n "$missing" ]]; then
+    fail 'frontend still references missing assets after rebuild:'
+    while IFS= read -r ref; do
+      if [[ -n "$ref" ]]; then printf '               %s\n' "$ref" >&2; fi
+    done <<< "$missing"
+    return 1
+  fi
+  ok 'frontend bundle rebuilt and consistent with index.html'
+}
+
+# ---------------------------------------------------------------- preflight
+# install.sh runs "git reset --hard origin/<ref> && git clean -fd" on an
+# existing checkout. Refuse to let that silently discard node-local hotfixes.
+preflight_checkout() {
+  local APP_DIR=$1 dirty
+  [[ -d "$APP_DIR/.git" ]] || return 0
+  dirty=$(git -C "$APP_DIR" -c safe.directory="$APP_DIR" status --porcelain 2>/dev/null | grep -vE '^(\?\?|!!)' || true)
+  if [[ -z "$dirty" ]]; then
+    return 0
+  fi
+  warn "app checkout at $APP_DIR has uncommitted changes:"
+  while IFS= read -r line; do
+    if [[ -n "$line" ]]; then printf '               %s\n' "$line" >&2; fi
+  done <<< "$dirty"
+  if [[ "${ALLOW_DIRTY:-0}" != "1" ]]; then
+    fail 'install.sh would discard these changes with "git reset --hard".'
+    fail 'Commit/push them, or re-run with ALLOW_DIRTY=1 to accept the reset.'
+    return 1
+  fi
+  warn 'ALLOW_DIRTY=1 — the changes above will be discarded by install.sh'
+  return 0
+}
+
 # ---------------------------------------------------------------- self_heal
-# Fix the classes of breakage observed on live nodes (see header).
 self_heal() {
   local APP_DIR
   APP_DIR="$(locate_app_dir)"
   if [[ -z "$APP_DIR" ]]; then
-    printf '\033[0;33m[self-heal]\033[0m app dir not found — skipping post-deploy fixes\n'
+    warn 'app dir not found — skipping post-deploy fixes'
     return 0
   fi
-  printf '\033[0;36m[self-heal]\033[0m applying post-deploy fixes in %s\n' "$APP_DIR"
+  info "applying post-deploy fixes in $APP_DIR"
 
-  local ENV_FILE="$APP_DIR/.env"
-  [[ -f "$ENV_FILE" ]] || { printf '\033[0;33m[self-heal]\033[0m no .env — skipping DB checks\n'; return 0; }
+  local APP_USER
+  APP_USER="$(app_user_for "$APP_DIR")"
 
-  local DB_HOST DB_PORT DB_NAME DB_USER DB_PASS
-  DB_HOST=$(grep -E '^DB_HOST=' "$ENV_FILE" | cut -d= -f2- || echo 127.0.0.1)
-  DB_PORT=$(grep -E '^DB_PORT=' "$ENV_FILE" | cut -d= -f2- || echo 5432)
-  DB_NAME=$(grep -E '^DB_NAME=' "$ENV_FILE" | cut -d= -f2- || echo sms_platform)
-  DB_USER=$(grep -E '^DB_USER=' "$ENV_FILE" | cut -d= -f2- || echo sms_user)
-  DB_PASS=$(grep -E '^DB_PASS=' "$ENV_FILE" | cut -d= -f2- || true)
+  # systemd unit list, read once. "systemctl list-unit-files | grep -q" would
+  # SIGPIPE systemctl as soon as grep matched, and "set -o pipefail" turns that
+  # into a failed condition — which silently skipped the restart step entirely.
+  local UNITS
+  UNITS=$(systemctl list-unit-files --type=service --no-legend --plain 2>/dev/null || true)
+  has_unit() { grep -qE "^$1(\.service)?[[:space:]]" <<< "$UNITS"; }
 
-  # --- 1) Make the .env DB password authoritative in PostgreSQL ------------
-  if PGPASSWORD="$DB_PASS" psql -h "${DB_HOST:-127.0.0.1}" -p "${DB_PORT:-5432}" -U "$DB_USER" -d "$DB_NAME" -tc 'select 1' >/dev/null 2>&1; then
-    printf '\033[0;32m[self-heal]\033[0m DB auth OK for %s\n' "$DB_USER"
+  # Older nodes keep their configuration in .env.production (no .env), so look
+  # for both before declaring the DB settings unavailable.
+  local ENV_FILE="" candidate
+  for candidate in "$APP_DIR/.env" "$APP_DIR/.env.production" "$APP_DIR/.env.local"; do
+    if [[ -f "$candidate" ]]; then ENV_FILE="$candidate"; break; fi
+  done
+  if [[ -z "$ENV_FILE" ]]; then
+    warn "no .env/.env.production in $APP_DIR — skipping DB checks"
   else
-    printf '\033[0;33m[self-heal]\033[0m DB auth FAILED for %s — resetting role password from .env\n' "$DB_USER"
-    sudo -u postgres psql -tc "ALTER ROLE $DB_USER WITH PASSWORD '$DB_PASS';" || {
-      printf '\033[0;31m[self-heal]\033[0m could not reset DB password (is postgres running?)\n' >&2
-    }
+    info "using configuration file $ENV_FILE"
   fi
 
-  # --- 2) Android gateway schema -------------------------------------------
-  PGPASSWORD="$DB_PASS" psql -h "${DB_HOST:-127.0.0.1}" -p "${DB_PORT:-5432}" -U "$DB_USER" -d "$DB_NAME" <<'SQL' || true
+  local DB_HOST DB_PORT DB_NAME DB_USER DB_PASS
+  DB_HOST=$(env_value DB_HOST "${ENV_FILE:-/dev/null}"); DB_HOST=${DB_HOST:-127.0.0.1}
+  DB_PORT=$(env_value DB_PORT "${ENV_FILE:-/dev/null}"); DB_PORT=${DB_PORT:-5432}
+  DB_NAME=$(env_value DB_NAME "${ENV_FILE:-/dev/null}"); DB_NAME=${DB_NAME:-sms_platform}
+  DB_USER=$(env_value DB_USER "${ENV_FILE:-/dev/null}"); DB_USER=${DB_USER:-sms_user}
+  DB_PASS=$(env_value DB_PASS "${ENV_FILE:-/dev/null}")
+
+  if [[ -z "$ENV_FILE" ]]; then
+    : # no configuration file — DB steps below are skipped
+  elif ! command -v psql >/dev/null 2>&1; then
+    warn 'psql is not installed — skipping database checks'
+  elif [[ -z "$DB_PASS" ]]; then
+    warn "DB_PASS is empty in $ENV_FILE — skipping database checks"
+  else
+    psql_app() {
+      PGPASSWORD="$DB_PASS" psql -v ON_ERROR_STOP=1 -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" "$@"
+    }
+
+    # --- 1) Make the .env DB password authoritative in PostgreSQL ------------
+    if psql_app -tAc 'select 1' >/dev/null 2>&1; then
+      ok "DB auth OK for $DB_USER@$DB_HOST:$DB_PORT/$DB_NAME"
+    else
+      warn "DB auth FAILED for $DB_USER — resetting role password from .env"
+      local escaped_pass=${DB_PASS//\'/\'\'}
+      if psql_super -tAc "ALTER ROLE $DB_USER WITH PASSWORD '$escaped_pass';" >/dev/null 2>&1; then
+        ok 'role password reset to match .env'
+      else
+        fail 'could not reset DB password (is PostgreSQL running?)'
+      fi
+    fi
+
+    # --- 2) Android gateway schema ------------------------------------------
+    if psql_app >/dev/null 2>&1 <<'SQL'
 ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS device_name VARCHAR(255);
 ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS last_heartbeat_at TIMESTAMP;
 ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS battery_level INTEGER;
@@ -137,63 +360,203 @@ ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS sim_carrier VARCHAR(120);
 ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS sim_number VARCHAR(40);
 ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS last_device_info_at TIMESTAMP;
 SQL
-  printf '\033[0;32m[self-heal]\033[0m android gateway columns ensured\n'
+    then
+      ok 'android gateway columns ensured'
+    else
+      fail 'could not apply android gateway columns (suppliers table/DB unreachable?)'
+    fi
 
-  # --- 3) Allow android_SMS connection type ---------------------------------
-  PGPASSWORD="$DB_PASS" psql -h "${DB_HOST:-127.0.0.1}" -p "${DB_PORT:-5432}" -U "$DB_USER" -d "$DB_NAME" -tc \
-    "SELECT 1 FROM pg_constraint WHERE conname='suppliers_connection_type_check' AND pg_get_constraintdef(oid) LIKE '%android_SMS%'" \
-    | grep -q 1 || {
-    PGPASSWORD="$DB_PASS" psql -h "${DB_HOST:-127.0.0.1}" -p "${DB_PORT:-5432}" -U "$DB_USER" -d "$DB_NAME" <<'SQL' || true
+    # --- 3) Allow android_SMS connection type -------------------------------
+    # Captured into a variable rather than piped into "grep -q": an early grep
+    # exit SIGPIPEs psql, and "set -o pipefail" would turn that into a false
+    # "constraint missing" verdict on every run.
+    local constraint_has_android
+    constraint_has_android=$(psql_app -tAc "SELECT 1 FROM pg_constraint WHERE conname='suppliers_connection_type_check' AND pg_get_constraintdef(oid) LIKE '%android_SMS%'" 2>/dev/null || true)
+    if [[ "$constraint_has_android" == 1 ]]; then
+      ok 'android_SMS connection type already allowed'
+    elif psql_app >/dev/null 2>&1 <<'SQL'
 ALTER TABLE suppliers DROP CONSTRAINT IF EXISTS suppliers_connection_type_check;
 ALTER TABLE suppliers ADD CONSTRAINT suppliers_connection_type_check
   CHECK (connection_type IN ('smpp','http','ott_whatsapp','ott_telegram','voice_otp','local_bypass','rcs','flash_sms','android_SMS'));
 SQL
-    printf '\033[0;32m[self-heal]\033[0m android_SMS connection type allowed\n'
+    then
+      ok 'android_SMS connection type allowed'
+    else
+      fail 'could not relax suppliers_connection_type_check'
+    fi
+  fi
+
+  # --- 4) Frontend bundle (white-screen guard) ------------------------------
+  local frontend_ok=1
+  ensure_frontend_bundle "$APP_DIR" "$APP_USER" || frontend_ok=0
+
+  # --- 5) java SMPP gateway jar + .env.production ---------------------------
+  local JAR="$APP_DIR/java-sms-gateway/target/sms-gateway-1.0.0.jar"
+  local needs_jar=0
+  if [[ ! -f "$JAR" ]]; then
+    needs_jar=1
+  elif [[ -n "$(find "$APP_DIR/java-sms-gateway/src" -newer "$JAR" -type f -print -quit 2>/dev/null)" ]]; then
+    needs_jar=1
+    info 'java SMPP sources are newer than the built jar'
+  fi
+  if [[ $needs_jar -eq 1 ]]; then
+    if command -v mvn >/dev/null 2>&1; then
+      info 'building SMPP jar (this can take minutes)...'
+      if run_as_app "$APP_DIR/java-sms-gateway" "$APP_USER" mvn -q clean package -DskipTests; then
+        ok 'SMPP jar built'
+      else
+        fail 'jar build failed — net2app-smpg will stay down'
+      fi
+    else
+      fail 'SMPP jar missing/stale and maven is not installed'
+    fi
+  fi
+  # The Java gateway reads DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASS straight from
+  # the environment (Database.init, no built-in fallback). Units written by hand
+  # on older nodes have no EnvironmentFile, so a freshly rebuilt jar dies with
+  # "SCRAM-based authentication, but the password is an empty string" and the
+  # node loses SMPP + the REST bridge. Give the unit a DB environment file.
+  if has_unit net2app-smpg; then
+    local smpg_env
+    smpg_env=$(systemctl cat net2app-smpg 2>/dev/null | grep -oE 'EnvironmentFile=-?[^ ]+' | head -1 | cut -d= -f2- || true)
+    if [[ -n "$smpg_env" && -f "$smpg_env" ]]; then
+      ok "SMPP unit DB environment: $smpg_env"
+    elif [[ -z "$ENV_FILE" ]]; then
+      warn 'net2app-smpg has no DB environment and no .env to copy it from'
+    else
+      local smpg_target="${smpg_env:-/etc/net2app/smpg-db.env}"
+      install -d -m 0755 "$(dirname "$smpg_target")"
+      {
+        printf 'DB_HOST=%s\n' "$DB_HOST"
+        printf 'DB_PORT=%s\n' "$DB_PORT"
+        printf 'DB_NAME=%s\n' "$DB_NAME"
+        printf 'DB_USER=%s\n' "$DB_USER"
+        printf 'DB_PASS="%s"\n' "${DB_PASS//\\/\\\\}"
+      } > "$smpg_target"
+      chmod 640 "$smpg_target"
+      chown root:root "$smpg_target"
+      if [[ -z "$smpg_env" ]]; then
+        # Unit has no EnvironmentFile at all: add one through a drop-in so the
+        # unit stays install-managed.
+        install -d -m 0755 /etc/systemd/system/net2app-smpg.service.d
+        printf '[Service]\nEnvironmentFile=%s\n' "$smpg_target" \
+          > /etc/systemd/system/net2app-smpg.service.d/10-db-env.conf
+        systemctl daemon-reload 2>/dev/null || true
+        ok "net2app-smpg had no EnvironmentFile — added $smpg_target via drop-in"
+      else
+        ok "created missing $smpg_target (was referenced by net2app-smpg)"
+      fi
+    fi
+  fi
+
+  # --- 6) Restart services ---------------------------------------------------
+  systemctl daemon-reload 2>/dev/null || true
+
+  restart_unit() {
+    local unit=$1 pid_before pid_after
+    pid_before=$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)
+    if ! systemctl restart "$unit"; then
+      fail "$unit restart failed"
+      return 1
+    fi
+    sleep 2
+    if ! systemctl is-active --quiet "$unit"; then
+      fail "$unit is not active after restart"
+      return 1
+    fi
+    pid_after=$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)
+    ok "$unit restarted (pid ${pid_before:-none} -> ${pid_after:-unknown})"
   }
 
-  # --- 4) java SMPP gateway jar + .env.production ---------------------------
-  local JAR="$APP_DIR/java-sms-gateway/target/sms-gateway-1.0.0.jar"
-  if [[ ! -f "$JAR" ]] && command -v mvn >/dev/null 2>&1; then
-    printf '\033[0;33m[self-heal]\033[0m SMPP jar missing — building (this can take minutes)...\n'
-    ( cd "$APP_DIR/java-sms-gateway" && mvn -q clean package -DskipTests ) || \
-      printf '\033[0;31m[self-heal]\033[0m jar build failed — net2app-smpg will stay down\n' >&2
+  local restarted=0
+  local unit
+  local ECOSYSTEM="$APP_DIR/ecosystem.config.cjs"
+  if command -v pm2 >/dev/null 2>&1 && [[ -f "$ECOSYSTEM" ]]; then
+    # startOrReload re-reads ecosystem.config.cjs (and the .env it loads), which
+    # "pm2 resurrect" from the systemd unit does not — otherwise config changes
+    # silently never reach the running processes.
+    info 'reloading pm2 apps from ecosystem.config.cjs'
+    if ( cd "$APP_DIR" && runuser -u "$APP_USER" -- env HOME="/home/$APP_USER" PM2_HOME="/home/$APP_USER/.pm2" pm2 startOrReload "$ECOSYSTEM" --update-env >/dev/null ); then
+      ( cd "$APP_DIR" && runuser -u "$APP_USER" -- env HOME="/home/$APP_USER" PM2_HOME="/home/$APP_USER/.pm2" pm2 save >/dev/null ) || true
+      ok 'pm2 apps reloaded from ecosystem.config.cjs'
+      restarted=1
+    else
+      fail 'pm2 reload failed'
+    fi
   fi
-  local SMPG_UNIT
-  SMPG_UNIT=$(systemctl cat net2app-smpg 2>/dev/null | grep -oE 'EnvironmentFile=.*' | head -1 | cut -d= -f2- || true)
-  if [[ -n "$SMPG_UNIT" && ! -f "$SMPG_UNIT" ]]; then
-    grep -E '^DB_(HOST|PORT|NAME|USER|PASS)=' "$ENV_FILE" > "$SMPG_UNIT" || true
-    chmod 640 "$SMPG_UNIT"
-    chown "$(stat -c '%U:%G' "$APP_DIR")" "$SMPG_UNIT" 2>/dev/null || true
-    printf '\033[0;32m[self-heal]\033[0m created %s (was referenced but missing)\n' "$SMPG_UNIT"
+  # Restart dependencies first: the hub round-trips to the gateway on startup.
+  for unit in net2app-smpg net2app-hub; do
+    if has_unit "$unit"; then
+      restart_unit "$unit" || true
+      restarted=1
+    fi
+  done
+  if [[ $restarted -eq 0 ]] && ! command -v pm2 >/dev/null 2>&1 && has_unit 'pm2-'; then
+    unit=$(awk '/^pm2-/{print $1; exit}' <<< "$UNITS")
+    [[ -n "$unit" ]] && { restart_unit "$unit" || true; restarted=1; }
   fi
-
-  # --- 5) Restart services ---------------------------------------------------
-  systemctl daemon-reload 2>/dev/null || true
-  if systemctl list-unit-files | grep -q '^net2app-hub'; then
-    systemctl restart net2app-hub 2>/dev/null || true
-  fi
-  if systemctl list-unit-files | grep -q '^net2app-smpg'; then
-    systemctl restart net2app-smpg 2>/dev/null || true
-  fi
-  if systemctl list-unit-files | grep -q '^pm2-net2app'; then
-    systemctl restart pm2-net2app 2>/dev/null || true
+  if [[ $restarted -eq 0 ]]; then
+    warn 'no net2app/pm2 service found to restart — is this app running as a service?'
   fi
   sleep 5
 
-  # --- 6) Health check --------------------------------------------------------
-  local ok=1
-  if curl -sf -o /dev/null http://127.0.0.1:3001/; then
-    printf '\033[0;32m[self-heal]\033[0m hub :3001 OK\n'
+  # --- 7) Health check --------------------------------------------------------
+  local healthy=1
+  if curl -sf -o /dev/null "http://127.0.0.1:3001/health"; then
+    ok 'hub :3001/health OK'
   else
-    printf '\033[0;31m[self-heal]\033[0m hub :3001 NOT responding\n' >&2
-    ok=0
+    fail 'hub :3001/health NOT responding'
+    healthy=0
   fi
-  if timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/2775' 2>/dev/null; then
-    printf '\033[0;32m[self-heal]\033[0m SMPP :2775 OK\n'
+
+  # The app answers unknown /assets/* paths with the SPA fallback (index.html),
+  # so a 200 alone proves nothing — the content type must be the real module.
+  local entry_ref ctype
+  while IFS= read -r entry_ref; do
+    [[ -n "$entry_ref" ]] || continue
+    ctype=$(curl -sf -o /dev/null -w '%{content_type}' "http://127.0.0.1:3001/$entry_ref" 2>/dev/null || true)
+    if [[ -n "$ctype" && "$ctype" != text/html* ]]; then
+      ok "frontend asset $entry_ref served OK ($ctype)"
+    else
+      fail "frontend asset $entry_ref is NOT served as a module (got '${ctype:-no response}') — web UI will be blank"
+      healthy=0
+    fi
+  done < <(frontend_entry_refs "$APP_DIR/dist")
+  [[ $frontend_ok -eq 1 ]] || healthy=0
+
+  # A gateway that must run here (systemd unit or pm2 ecosystem) failing to come
+  # up is a failed deploy, not a footnote: clients lose SMPP binds and DLRs.
+  local expect_gateway=0
+  if has_unit net2app-smpg || { command -v pm2 >/dev/null 2>&1 && [[ -f "$ECOSYSTEM" ]]; }; then
+    expect_gateway=1
+  fi
+
+  local wait_s java_ok=0 smpp_ok=0
+  for wait_s in 1 2 3 5 8 13 20; do
+    if curl -sf -o /dev/null "http://127.0.0.1:9091/health"; then java_ok=1; else sleep "$wait_s"; fi
+    if timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/2775' 2>/dev/null; then smpp_ok=1; else sleep "$wait_s"; fi
+    [[ $java_ok -eq 1 && $smpp_ok -eq 1 ]] && break
+  done
+
+  if [[ $java_ok -eq 1 ]]; then
+    ok 'java bridge :9091/health OK'
+  elif [[ $expect_gateway -eq 1 ]]; then
+    fail 'java bridge :9091/health NOT responding — the SMPP gateway failed to start'
+    healthy=0
   else
-    printf '\033[0;33m[self-heal]\033[0m SMPP :2775 not listening (java gateway down?)\n'
+    warn 'java bridge :9091/health not responding (no gateway service expected here?)'
   fi
-  [[ $ok -eq 1 ]] || return 1
+
+  if [[ $smpp_ok -eq 1 ]]; then
+    ok 'SMPP :2775 OK'
+  elif [[ $expect_gateway -eq 1 ]]; then
+    fail 'SMPP :2775 NOT listening — check: journalctl -u net2app-smpg -n 50'
+    healthy=0
+  else
+    warn 'SMPP :2775 not listening (no gateway service expected here?)'
+  fi
+
+  [[ $healthy -eq 1 ]]
 }
 
 # ---------------------------------------------------------------- main
@@ -205,6 +568,11 @@ if [[ "${SELF_HEAL_ONLY:-0}" == "1" ]]; then
   }
   printf '\033[0;32mSelf-heal complete.\033[0m\n'
   exit 0
+fi
+
+PREFLIGHT_APP_DIR="$(locate_app_dir)"
+if [[ -n "$PREFLIGHT_APP_DIR" ]]; then
+  preflight_checkout "$PREFLIGHT_APP_DIR" || exit 1
 fi
 
 run_installer "$@"
