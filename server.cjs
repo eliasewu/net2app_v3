@@ -9315,6 +9315,89 @@ app.get('/api/system/audit-logs', superAuth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ==================== DATABASE INVENTORY ====================
+// Backs the admin Database page (src/pages/RemainingPages.tsx DatabasePage),
+// which used to render a hardcoded table list — including a fabricated
+// "sms_logs 125,000 rows / 45MB" and a made-up 54.9MB total. Everything here is
+// read from the live catalog instead.
+const quoteIdent = (name) => '"' + String(name).replace(/"/g, '""') + '"';
+
+// Counting every table on each page load is wasteful, so results are cached and
+// an exact count is only taken while a table is small enough for count(*) to be
+// cheap; above that the planner's estimate is reported and flagged.
+const DB_TABLES_CACHE_MS = 60000;
+const DB_TABLES_EXACT_COUNT_LIMIT = 100000;
+let dbTablesCache = { at: 0, payload: null };
+
+app.get('/api/system/database', adminAuth, async (req, res) => {
+    try {
+        const info = await pool.query(`
+            SELECT current_database() AS database,
+                   current_setting('server_version') AS version,
+                   pg_database_size(current_database())::bigint AS bytes,
+                   (SELECT count(*) FROM pg_stat_activity WHERE datname = current_database())::int AS connections,
+                   EXTRACT(EPOCH FROM (now() - pg_postmaster_start_time()))::bigint AS uptime_seconds
+        `);
+        const row = info.rows[0] || {};
+        res.json({
+            success: true,
+            data: {
+                engine: 'PostgreSQL',
+                database: row.database,
+                version: row.version,
+                size_bytes: Number(row.bytes) || 0,
+                connections: Number(row.connections) || 0,
+                uptime_seconds: Number(row.uptime_seconds) || 0,
+            },
+        });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/system/database/tables', adminAuth, async (req, res) => {
+    try {
+        const now = Date.now();
+        if (dbTablesCache.payload && now - dbTablesCache.at < DB_TABLES_CACHE_MS) {
+            return res.json({ success: true, data: dbTablesCache.payload });
+        }
+
+        const catalog = await pool.query(`
+            SELECT c.relname AS name,
+                   COALESCE(st.n_live_tup, 0)::bigint AS estimate,
+                   pg_total_relation_size(c.oid)::bigint AS bytes
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              LEFT JOIN pg_stat_user_tables st ON st.relid = c.oid
+             WHERE n.nspname = 'public' AND c.relkind = 'r'
+             ORDER BY c.relname
+        `);
+
+        const tables = [];
+        for (const row of catalog.rows) {
+            const estimate = Number(row.estimate) || 0;
+            let rows = estimate;
+            let estimated = true;
+            if (estimate < DB_TABLES_EXACT_COUNT_LIMIT) {
+                const counted = await pool.query(`SELECT count(*)::bigint AS n FROM ${quoteIdent(row.name)}`);
+                rows = Number(counted.rows[0].n) || 0;
+                estimated = false;
+            }
+            tables.push({ name: row.name, rows, rows_estimated: estimated, bytes: Number(row.bytes) || 0 });
+        }
+        tables.sort((a, b) => b.bytes - a.bytes);
+
+        const payload = {
+            tables,
+            total_tables: tables.length,
+            total_rows: tables.reduce((sum, t) => sum + t.rows, 0),
+            total_bytes: tables.reduce((sum, t) => sum + t.bytes, 0),
+            rows_estimated: tables.some((t) => t.rows_estimated),
+            generated_at: new Date().toISOString(),
+        };
+        dbTablesCache = { at: now, payload };
+        res.json({ success: true, data: payload });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ==================== LICENSE ====================
 app.get('/api/license/info', superAuth, async (req, res) => {
     try {

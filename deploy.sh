@@ -32,7 +32,12 @@
 #   4. java-sms-gateway/target/sms-gateway-1.0.0.jar is missing or older than
 #      its sources; .env.production (DB_* subset) is created when the
 #      net2app-smpg unit references it but it does not exist.
-#   5. Services are reloaded — "pm2 startOrReload" when pm2 owns the apps (so
+#   5. net2app systemd units that have no EnvironmentFile get one, built from
+#      the node's .env/.env.production. server.cjs and the java gateway read
+#      process.env directly, so such a unit starts "active" with no database
+#      credentials and every API call fails ("client password must be a
+#      string").
+#   6. Services are reloaded — "pm2 startOrReload" when pm2 owns the apps (so
 #      .env changes actually take effect) with a systemctl fallback — then the
 #      hub, frontend, java bridge and SMPP port are health-checked.
 #
@@ -322,6 +327,47 @@ java_build_needed() {
   [[ -n "$(find "$APP_DIR/java-sms-gateway/src" "$APP_DIR/java-sms-gateway/pom.xml" -newer "$JAR" -type f -print -quit 2>/dev/null)" ]]
 }
 
+# ---------------------------------------------------------------- unit env
+# server.cjs reads process.env directly (there is no dotenv in it), and the java
+# gateway reads DB_* the same way. A systemd unit started without an
+# EnvironmentFile therefore runs with an empty/undefined DB password and loses
+# ALL database access — seen on 51.178.20.165 as:
+#   "SASL: SCRAM-SERVER-FIRST-MESSAGE: client password must be a string"
+# for every API call while the unit still reported "active". Materialize the
+# node's config file as an EnvironmentFile for any unit that has none.
+ensure_unit_env() {
+  local unit=$1
+  has_unit "$unit" || return 0
+
+  local referenced
+  referenced=$(systemctl cat "$unit" 2>/dev/null | grep -oE 'EnvironmentFile=-?[^ ]+' | head -1 | cut -d= -f2- || true)
+  if [[ -n "$referenced" && -f "$referenced" ]]; then
+    ok "$unit environment: $referenced"
+    return 0
+  fi
+  if [[ -z "$ENV_FILE" ]]; then
+    warn "$unit has no EnvironmentFile and no .env/.env.production to copy from"
+    return 0
+  fi
+
+  local target="${referenced:-/etc/net2app/net2app.env}"
+  install -d -m 0755 "$(dirname "$target")"
+  # Only KEY=VALUE lines: comments and blanks would be parsed by systemd too.
+  grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$ENV_FILE" > "$target" || true
+  chmod 640 "$target"
+  chown root:root "$target"
+
+  if [[ -z "$referenced" ]]; then
+    install -d -m 0755 "/etc/systemd/system/${unit}.service.d"
+    printf '[Service]\nEnvironmentFile=%s\n' "$target" \
+      > "/etc/systemd/system/${unit}.service.d/10-env.conf"
+    systemctl daemon-reload 2>/dev/null || true
+    ok "$unit had no EnvironmentFile — added $target via drop-in"
+  else
+    ok "created missing $target (referenced by $unit)"
+  fi
+}
+
 # ---------------------------------------------------------------- preflight
 # install.sh runs "git reset --hard origin/<ref> && git clean -fd" on an
 # existing checkout. Refuse to let that silently discard node-local hotfixes.
@@ -469,43 +515,13 @@ SQL
       fail 'SMPP jar missing/stale and maven is not installed'
     fi
   fi
-  # The Java gateway reads DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASS straight from
-  # the environment (Database.init, no built-in fallback). Units written by hand
-  # on older nodes have no EnvironmentFile, so a freshly rebuilt jar dies with
-  # "SCRAM-based authentication, but the password is an empty string" and the
-  # node loses SMPP + the REST bridge. Give the unit a DB environment file.
-  if has_unit net2app-smpg; then
-    local smpg_env
-    smpg_env=$(systemctl cat net2app-smpg 2>/dev/null | grep -oE 'EnvironmentFile=-?[^ ]+' | head -1 | cut -d= -f2- || true)
-    if [[ -n "$smpg_env" && -f "$smpg_env" ]]; then
-      ok "SMPP unit DB environment: $smpg_env"
-    elif [[ -z "$ENV_FILE" ]]; then
-      warn 'net2app-smpg has no DB environment and no .env to copy it from'
-    else
-      local smpg_target="${smpg_env:-/etc/net2app/smpg-db.env}"
-      install -d -m 0755 "$(dirname "$smpg_target")"
-      {
-        printf 'DB_HOST=%s\n' "$DB_HOST"
-        printf 'DB_PORT=%s\n' "$DB_PORT"
-        printf 'DB_NAME=%s\n' "$DB_NAME"
-        printf 'DB_USER=%s\n' "$DB_USER"
-        printf 'DB_PASS="%s"\n' "${DB_PASS//\\/\\\\}"
-      } > "$smpg_target"
-      chmod 640 "$smpg_target"
-      chown root:root "$smpg_target"
-      if [[ -z "$smpg_env" ]]; then
-        # Unit has no EnvironmentFile at all: add one through a drop-in so the
-        # unit stays install-managed.
-        install -d -m 0755 /etc/systemd/system/net2app-smpg.service.d
-        printf '[Service]\nEnvironmentFile=%s\n' "$smpg_target" \
-          > /etc/systemd/system/net2app-smpg.service.d/10-db-env.conf
-        systemctl daemon-reload 2>/dev/null || true
-        ok "net2app-smpg had no EnvironmentFile — added $smpg_target via drop-in"
-      else
-        ok "created missing $smpg_target (was referenced by net2app-smpg)"
-      fi
-    fi
-  fi
+  # systemd-managed nodes: neither the hub nor the Java gateway has a built-in
+  # credential fallback, so a unit without an EnvironmentFile silently runs with
+  # no database access. net2app-pcap does not use the database.
+  local unit_name
+  for unit_name in net2app-hub net2app-smpg; do
+    ensure_unit_env "$unit_name"
+  done
 
   # --- 6) Restart services ---------------------------------------------------
   systemctl daemon-reload 2>/dev/null || true
