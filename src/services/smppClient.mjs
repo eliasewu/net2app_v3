@@ -347,16 +347,19 @@ class SmppClient {
                                   FROM unnest(COALESCE(dlr_match_ids, ARRAY[]::TEXT[]) || ARRAY[$4]::TEXT[]) AS t(x)
                                  WHERE x IS NOT NULL AND x <> '')
              WHERE id = (SELECT id FROM sms_outbox
-                          WHERE message_id = ANY($3::TEXT[])
+                          WHERE (message_id = ANY($3::TEXT[])
                              OR connector_transaction_id = ANY($3::TEXT[])
-                             OR dlr_match_ids && $3::TEXT[]
+                             OR dlr_match_ids && $3::TEXT[])
+                            -- Never let a later non-DELIVRD receipt downgrade a
+                            -- message the supplier already confirmed delivered.
+                            AND ($5::BOOLEAN OR dlr_status IS DISTINCT FROM 'DELIVRD')
                           ORDER BY (dlr_status IS NULL OR dlr_status IN ('PENDING', 'UNDELIV')) DESC NULLS LAST,
                                    queued_at DESC NULLS LAST
                           LIMIT 1)
              RETURNING id, message_id, connector_transaction_id, dlr_match_ids,
                        client_id, client_code, supplier_id, destination, sender_id, source, queued_at,
                        client_rate, supplier_rate, message_parts, billing_mode, supplier_billing_mode`,
-            [finalDlr, finalStatus, candidateIds, dlrMessageId]
+            [finalDlr, finalStatus, candidateIds, dlrMessageId, isDelivered]
           );
 
           if (outboxR.rows.length > 0) {
@@ -365,6 +368,28 @@ class SmppClient {
               : (dlrMessageId === r.connector_transaction_id ? 'supplier-out-id'
               : (Array.isArray(r.dlr_match_ids) && r.dlr_match_ids.includes(dlrMessageId) ? 'dlr_match_ids' : 'id-from-receipt'));
             console.log(`[SMPP-CLIENT] ${supplier.supplier_code}: ✅ DLR id matched by ${matchedBy} — quoted="${dlrMessageId}" our_id=${r.message_id} supplier_id=${r.connector_transaction_id || '-'} (${candidateIds.length} id form(s) tested) → result=${finalDlr} err=${dlrError}`);
+          } else if (!isDelivered) {
+            // Nothing was updated. If the receipt's id(s) point at a message that
+            // is already DELIVRD, this is a stale/duplicate failure report and must
+            // be dropped — and it must NOT reach the destination+time-window guess
+            // below, which would attach it to a *different* in-flight message.
+            const dupR = await this.pool.query(
+              `SELECT message_id, connector_transaction_id, dlr_status, dlr_received_at
+                 FROM sms_outbox
+                WHERE dlr_status = 'DELIVRD'
+                  AND (message_id = ANY($1::TEXT[])
+                    OR connector_transaction_id = ANY($1::TEXT[])
+                    OR dlr_match_ids && $1::TEXT[])
+                ORDER BY queued_at DESC NULLS LAST
+                LIMIT 1`,
+              [candidateIds]
+            );
+            if (dupR.rows.length > 0) {
+              const d = dupR.rows[0];
+              const at = d.dlr_received_at ? new Date(d.dlr_received_at).toISOString() : '-';
+              console.log(`[SMPP-CLIENT] ${supplier.supplier_code}: ${finalDlr} IGNORED — ${d.message_id} already DELIVRD (quoted="${dlrMessageId}", supplier_id=${d.connector_transaction_id || '-'}, delivered_at=${at}); no downgrade, client not notified`);
+              return;
+            }
           }
 
           // Fallback: chain-forwarded gateways assign NEW IDs not in dlr_match_ids.
@@ -383,9 +408,10 @@ class SmppClient {
                      status = $2,
                      completed_at = NOW()
                    WHERE $3 = ANY(dlr_match_ids)
+                     AND ($4::BOOLEAN OR dlr_status IS DISTINCT FROM 'DELIVRD')
                    RETURNING id, message_id, client_id, client_code, supplier_id, destination, sender_id, source, queued_at,
                              client_rate, supplier_rate, message_parts, billing_mode, supplier_billing_mode`,
-                  [finalDlr, finalStatus, altId]
+                  [finalDlr, finalStatus, altId, isDelivered]
                 );
                 if (outboxR.rows.length > 0) {
                   console.log(`[SMPP-CLIENT] ${supplier.supplier_code}: ✅ DLR matched via forwarded-ID "${altId}" in dlr_match_ids`);

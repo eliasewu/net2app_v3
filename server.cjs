@@ -10339,14 +10339,19 @@ app.post('/api/gateway/mt-dlr', async (req, res) => {
             return res.status(403).json({ success: false, error: 'Not authorized' });
         }
 
-        const finalStatus = isDlrDelivered(status) ? 'delivered' : 'failed';
-        const dlrStatus = isDlrDelivered(status) ? 'DELIVRD'
+        const delivered = isDlrDelivered(status);
+        const finalStatus = delivered ? 'delivered' : 'failed';
+        const dlrStatus = delivered ? 'DELIVRD'
             : (status === 'UNDELIV' ? 'UNDELIV' : 'FAILED');
 
+        // A later non-DELIVRD device report must not downgrade a message the
+        // device already reported as delivered.
         await pool.query(
             `UPDATE sms_outbox SET dlr_status = $1, dlr_received_at = NOW(),
-             status = $2, completed_at = NOW() WHERE message_id = $3`,
-            [dlrStatus, finalStatus, message_id]
+             status = $2, completed_at = NOW()
+             WHERE message_id = $3
+               AND ($4::BOOLEAN OR dlr_status IS DISTINCT FROM 'DELIVRD')`,
+            [dlrStatus, finalStatus, message_id, delivered]
         );
 
         const logUpdate = await pool.query(
@@ -10354,9 +10359,10 @@ app.post('/api/gateway/mt-dlr', async (req, res) => {
              delivery_time = NOW(), dlr_timestamp = NOW(),
              error_code = CASE WHEN $4 != '' THEN $4 ELSE error_code END
              WHERE message_id = $3
+               AND ($5::BOOLEAN OR dlr_status IS DISTINCT FROM 'DELIVRD')
              RETURNING client_id, client_code, destination, submit_time,
                        client_rate, message_parts, billing_mode_snapshot`,
-            [dlrStatus, finalStatus, message_id, error_code || '']
+            [dlrStatus, finalStatus, message_id, error_code || '', delivered]
         );
 
         // Client webhook lives on the clients table (same convention as the
@@ -10470,10 +10476,11 @@ app.post('/api/supplier/dlr', async (req, res) => {
                completed_at = NOW()
              WHERE $3 = ANY(dlr_match_ids)
                AND status IN ('submitted', 'dead_letter')
+               AND ($4::BOOLEAN OR dlr_status IS DISTINCT FROM 'DELIVRD')
              RETURNING id, message_id, client_id, client_code, supplier_id, destination,
                        sender_id, source, queued_at,
                        client_rate, supplier_rate, message_parts, billing_mode, supplier_billing_mode`,
-            [finalDlr, finalStatus, String(message_id)]
+            [finalDlr, finalStatus, String(message_id), isDelivered]
         );
 
         // Fallback: match by any known id column — the SMSC's own id
@@ -10489,10 +10496,11 @@ app.post('/api/supplier/dlr', async (req, res) => {
                    completed_at = NOW()
                  WHERE (connector_transaction_id = $3 OR message_id = $3)
                    AND status IN ('submitted', 'dead_letter')
+                   AND ($4::BOOLEAN OR dlr_status IS DISTINCT FROM 'DELIVRD')
                  RETURNING id, message_id, client_id, client_code, supplier_id, destination,
                            sender_id, source, queued_at,
                            client_rate, supplier_rate, message_parts, billing_mode, supplier_billing_mode`,
-                [finalDlr, finalStatus, String(message_id)]
+                [finalDlr, finalStatus, String(message_id), isDelivered]
             );
             if (fallbackR.rows.length > 0) {
                 outboxR.rows = fallbackR.rows;
