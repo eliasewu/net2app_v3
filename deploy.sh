@@ -43,7 +43,10 @@
 #
 # Other knobs:
 #   SKIP_FRONTEND_BUILD=1  report missing frontend assets without rebuilding.
+#   FORCE_FRONTEND_BUILD=1 rebuild the SPA even when it looks up to date.
+#   FORCE_JAVA_BUILD=1     rebuild the SMPP jar even when it looks up to date.
 #   APP_DIR=/path          override app directory detection.
+#   ALLOW_DIRTY=1          let a full run reset an app checkout with local edits.
 
 set -Eeuo pipefail
 
@@ -182,12 +185,36 @@ frontend_missing_assets() {
   done || true
 }
 
-# True when the built bundle predates the frontend sources, i.e. a code sync
-# landed but the SPA was never rebuilt (deployed UI would be stale).
+# Content fingerprint of the frontend sources. Timestamps alone are not
+# trustworthy: a code sync (rsync -a, tar, a fresh copy) can land different
+# source while keeping older mtimes, and then a node quietly keeps serving a
+# bundle built from the previous source.
+frontend_source_fingerprint() {
+  local APP_DIR=$1 out
+  # "|| true" everywhere: a missing path (find exits non-zero) must not abort the
+  # deploy through "set -e" on a command substitution.
+  out=$( cd "$APP_DIR" 2>/dev/null && { find src index.html vite.config.ts -type f -print0 2>/dev/null \
+      | sort -z | xargs -0 md5sum 2>/dev/null | md5sum | cut -d' ' -f1; } ) || true
+  printf '%s' "$out"
+  return 0
+}
+
+# True when the built bundle does not match the frontend sources, i.e. a code
+# sync landed but the SPA was never rebuilt (deployed UI would be stale).
 frontend_build_stale() {
   local APP_DIR=$1
   local DIST="$APP_DIR/dist"
   [[ -f "$DIST/index.html" ]] || return 0
+
+  # Preferred: compare source content against the fingerprint recorded by the
+  # build deploy.sh performed.
+  if [[ -f "$DIST/.source-fingerprint" ]]; then
+    [[ "$(cat "$DIST/.source-fingerprint" 2>/dev/null)" != "$(frontend_source_fingerprint "$APP_DIR")" ]]
+    return
+  fi
+
+  # No recorded fingerprint (bundle produced outside deploy.sh): fall back to
+  # modification times.
   [[ -n "$(find "$APP_DIR/src" "$APP_DIR/index.html" "$APP_DIR/vite.config.ts" -newer "$DIST/index.html" -print -quit 2>/dev/null)" ]]
 }
 
@@ -212,8 +239,10 @@ ensure_frontend_bundle() {
   missing=$(frontend_missing_assets "$DIST")
   if [[ -n "$missing" ]]; then
     reason='dist/index.html references assets that are missing from dist/assets — the web UI renders as a blank white page (nginx/app fallback answers text/html for the ES module)'
+  elif [[ "${FORCE_FRONTEND_BUILD:-0}" == "1" ]]; then
+    reason='FORCE_FRONTEND_BUILD=1 was requested'
   elif frontend_build_stale "$APP_DIR"; then
-    reason='frontend sources are newer than dist/index.html — the deployed UI is stale'
+    reason='the built frontend does not match src/ (stale or partially synced sources) — the deployed UI is out of date'
   fi
 
   if [[ -z "$reason" ]]; then
@@ -250,6 +279,8 @@ ensure_frontend_bundle() {
   preserve_dist_extras "$keep" "$DIST"
   rm -rf "$keep"
   chown -R "$APP_USER:$APP_USER" "$DIST"
+  # Record what this bundle was built from so later runs compare content.
+  frontend_source_fingerprint "$APP_DIR" > "$DIST/.source-fingerprint" || true
 
   missing=$(frontend_missing_assets "$DIST")
   if [[ -n "$missing" ]]; then
@@ -260,6 +291,35 @@ ensure_frontend_bundle() {
     return 1
   fi
   ok 'frontend bundle rebuilt and consistent with index.html'
+}
+
+# ---------------------------------------------------------------- java gateway
+java_source_fingerprint() {
+  local APP_DIR=$1 out
+  out=$( cd "$APP_DIR/java-sms-gateway" 2>/dev/null && { find src pom.xml -type f -print0 2>/dev/null \
+      | sort -z | xargs -0 md5sum 2>/dev/null | md5sum | cut -d' ' -f1; } ) || true
+  printf '%s' "$out"
+  return 0
+}
+
+SMPP_JAR_NAME='sms-gateway-1.0.0.jar'
+
+# The jar must be rebuilt when it is missing, when its sources moved ahead, or
+# when its content no longer matches them (rsync/tar syncs keep old mtimes, so
+# timestamps alone can hide a changed source tree).
+java_build_needed() {
+  local APP_DIR=$1
+  local JAR="$APP_DIR/java-sms-gateway/target/$SMPP_JAR_NAME"
+  local MARKER="$APP_DIR/java-sms-gateway/target/.source-fingerprint"
+  [[ -f "$JAR" ]] || return 0
+  if [[ "${FORCE_JAVA_BUILD:-0}" == "1" ]]; then
+    return 0
+  fi
+  if [[ -f "$MARKER" ]]; then
+    [[ "$(cat "$MARKER" 2>/dev/null)" != "$(java_source_fingerprint "$APP_DIR")" ]] && return 0
+    return 1
+  fi
+  [[ -n "$(find "$APP_DIR/java-sms-gateway/src" "$APP_DIR/java-sms-gateway/pom.xml" -newer "$JAR" -type f -print -quit 2>/dev/null)" ]]
 }
 
 # ---------------------------------------------------------------- preflight
@@ -391,18 +451,16 @@ SQL
   ensure_frontend_bundle "$APP_DIR" "$APP_USER" || frontend_ok=0
 
   # --- 5) java SMPP gateway jar + .env.production ---------------------------
-  local JAR="$APP_DIR/java-sms-gateway/target/sms-gateway-1.0.0.jar"
-  local needs_jar=0
-  if [[ ! -f "$JAR" ]]; then
-    needs_jar=1
-  elif [[ -n "$(find "$APP_DIR/java-sms-gateway/src" -newer "$JAR" -type f -print -quit 2>/dev/null)" ]]; then
-    needs_jar=1
-    info 'java SMPP sources are newer than the built jar'
-  fi
-  if [[ $needs_jar -eq 1 ]]; then
+  local JAR="$APP_DIR/java-sms-gateway/target/$SMPP_JAR_NAME"
+  if java_build_needed "$APP_DIR"; then
+    if [[ -f "$JAR" ]]; then
+      info 'java SMPP jar is missing or out of date with its sources'
+    fi
     if command -v mvn >/dev/null 2>&1; then
       info 'building SMPP jar (this can take minutes)...'
       if run_as_app "$APP_DIR/java-sms-gateway" "$APP_USER" mvn -q clean package -DskipTests; then
+        java_source_fingerprint "$APP_DIR" \
+          > "$APP_DIR/java-sms-gateway/target/.source-fingerprint" || true
         ok 'SMPP jar built'
       else
         fail 'jar build failed — net2app-smpg will stay down'
