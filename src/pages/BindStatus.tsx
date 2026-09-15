@@ -52,6 +52,14 @@ interface SupplierBindInfo {
   session_status: string | null;
   bind_mode: string | null;
   session_state: 'connected' | 'disconnected';
+  last_heartbeat_at?: string | null;
+  device_name?: string | null;
+  android_version?: string | null;
+  sim_ready?: boolean | null;
+  sim_carrier?: string | null;
+  sim_number?: string | null;
+  battery_level?: number | null;
+  signal_strength?: number | null;
 }
 
 interface BindHistoryEntry {
@@ -88,6 +96,7 @@ export const BindStatus: React.FC = () => {
   const [showDeletedSuppliers, setShowDeletedSuppliers] = useState(false);
   const [viewMode, setViewMode] = useState<'card' | 'table'>('card');
   const [searchQuery, setSearchQuery] = useState('');
+  const [searchScope, setSearchScope] = useState<'all' | 'clients' | 'suppliers'>('all');
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
   const PAGE_SIZE = 20;
 
@@ -251,13 +260,17 @@ export const BindStatus: React.FC = () => {
   // from the SMPP bind sections so they are never reported as unbound.
   const allSmppSuppliers = suppliers.filter(s => s.connection_type === 'smpp');
   const allOttSuppliers = suppliers.filter(s => ['ott_whatsapp', 'ott_telegram'].includes(s.connection_type));
+  const allAndroidSuppliersAll = suppliers.filter(s => s.connection_type === 'android_SMS');
   const allSmscServer = allSmppSuppliers.filter(s => s.smpp_mode === 'smsc_server');
   const allEsmeClient = allSmppSuppliers.filter(s => s.smpp_mode === 'esme_client');
 
-  // Filtered for display (search applies)
-  const smppSuppliers = filterBySearch(allSmppSuppliers);
-  const ottSuppliers = filterBySearch(allOttSuppliers);
-  const filteredClients = filterBySearch(clients);
+  // Filtered for display (search applies + scope: all/clients/suppliers)
+  const scopeSuppliers = searchScope !== 'clients';
+  const scopeClients = searchScope !== 'suppliers';
+  const smppSuppliers = scopeSuppliers ? filterBySearch(allSmppSuppliers) : [];
+  const androidSuppliers = scopeSuppliers ? filterBySearch(allAndroidSuppliersAll) : [];
+  const ottSuppliers = scopeSuppliers ? filterBySearch(allOttSuppliers) : [];
+  const filteredClients = scopeClients ? filterBySearch(clients) : [];
 
   const smscServerSuppliers = smppSuppliers.filter(s => s.smpp_mode === 'smsc_server');
   const esmeClientSuppliers = smppSuppliers.filter(s => s.smpp_mode === 'esme_client');
@@ -351,6 +364,69 @@ export const BindStatus: React.FC = () => {
   };
 
   // ========== TABLE RENDERERS ==========
+
+  // Android SMS gateway table — includes device/SIM telemetry from heartbeats
+  const renderAndroidTable = (suppliersList: SupplierBindInfo[]) => (
+    <div className="overflow-x-auto">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="text-left text-xs text-gray-500 border-b bg-gray-50">
+            <th className="pb-2.5 pt-2 px-3 font-medium">Status</th>
+            <th className="pb-2.5 pt-2 px-3 font-medium">Code</th>
+            <th className="pb-2.5 pt-2 px-3 font-medium">Device</th>
+            <th className="pb-2.5 pt-2 px-3 font-medium">Android</th>
+            <th className="pb-2.5 pt-2 px-3 font-medium">Carrier</th>
+            <th className="pb-2.5 pt-2 px-3 font-medium">SIM Number</th>
+            <th className="pb-2.5 pt-2 px-3 font-medium">SIM Ready</th>
+            <th className="pb-2.5 pt-2 px-3 font-medium">Last Heartbeat</th>
+            <th className="pb-2.5 pt-2 px-3 font-medium">Failures</th>
+            <th className="pb-2.5 pt-2 px-3 font-medium">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {suppliersList.length === 0 ? (
+            <tr><td colSpan={10} className="py-8 text-center text-gray-400">No android gateways found</td></tr>
+          ) : suppliersList.map(supplier => {
+            const isConnected = supplier.session_state === 'connected';
+            const isBlocked = supplier.consecutive_failures >= 20;
+            return (
+              <tr key={supplier.id} className={`border-b border-gray-100 hover:bg-gray-50 transition-colors ${isBlocked ? 'bg-orange-50' : isConnected ? 'bg-green-50/30' : ''}`}>
+                <td className="py-2.5 px-3">
+                  <div className="flex items-center gap-1.5">
+                    {getStatusIcon(isConnected ? 'connected' : 'disconnected')}
+                    {getStatusBadge(isBlocked ? 'error' : isConnected ? 'connected' : 'disconnected', supplier.consecutive_failures)}
+                  </div>
+                </td>
+                <td className="py-2.5 px-3 font-medium text-gray-800">{supplier.supplier_code}</td>
+                <td className="py-2.5 px-3 text-gray-600 text-xs">{supplier.device_name || supplier.company_name}</td>
+                <td className="py-2.5 px-3 text-xs text-gray-600">{supplier.android_version || '—'}</td>
+                <td className="py-2.5 px-3 text-xs text-gray-600">{supplier.sim_carrier || '—'}</td>
+                <td className="py-2.5 px-3 font-mono text-xs text-gray-700">{supplier.sim_number || '—'}</td>
+                <td className="py-2.5 px-3">
+                  <Badge variant={supplier.sim_ready ? 'success' : 'danger'} size="sm">{supplier.sim_ready ? 'READY' : 'NO SIM'}</Badge>
+                </td>
+                <td className="py-2.5 px-3 text-xs text-gray-600 whitespace-nowrap">{formatTime(supplier.last_heartbeat_at)}</td>
+                <td className="py-2.5 px-3">
+                  <span className={`font-medium text-xs ${supplier.consecutive_failures > 10 ? 'text-red-600' : supplier.consecutive_failures > 0 ? 'text-yellow-600' : 'text-green-600'}`}>{supplier.consecutive_failures}</span>
+                </td>
+                <td className="py-2.5 px-3">
+                  {isConnected ? (
+                    <Button size="sm" variant="danger" className="text-xs px-2 py-1" onClick={() => handleUnbind('supplier', supplier.id)} disabled={bindingId === `supplier-${supplier.id}`}>
+                      {bindingId === `supplier-${supplier.id}` ? '...' : 'Disconnect'}
+                    </Button>
+                  ) : (
+                    <Button size="sm" variant="success" className="text-xs px-2 py-1" onClick={() => handleBind('supplier', supplier.id)} disabled={bindingId === `supplier-${supplier.id}`}>
+                      {bindingId === `supplier-${supplier.id}` ? '...' : 'Connect'}
+                    </Button>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
 
   const renderSupplierTable = (suppliersList: SupplierBindInfo[], showActions = true) => (
     <div className="overflow-x-auto">
@@ -515,7 +591,7 @@ export const BindStatus: React.FC = () => {
             <Search size={16} className="absolute left-3 top-2.5 text-gray-400" />
             <input
               type="text"
-              placeholder="Search gateways..."
+              placeholder="Search clients or suppliers..."
               value={searchQuery}
               onChange={e => setSearchQuery(e.target.value)}
               className="pl-9 pr-3 py-2 border border-gray-300 rounded-lg text-sm w-56 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
@@ -524,6 +600,15 @@ export const BindStatus: React.FC = () => {
               <button onClick={() => setSearchQuery('')} className="absolute right-3 top-2.5 text-gray-400 hover:text-gray-600">✕</button>
             )}
           </div>
+          <select
+            value={searchScope}
+            onChange={e => setSearchScope(e.target.value as 'all' | 'clients' | 'suppliers')}
+            className="px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+          >
+            <option value="all">All</option>
+            <option value="clients">Clients</option>
+            <option value="suppliers">Suppliers</option>
+          </select>
           <div className="flex items-center border border-gray-300 rounded-lg overflow-hidden">
             <button
               onClick={() => setViewMode('card')}
@@ -606,6 +691,10 @@ export const BindStatus: React.FC = () => {
         <div className="bg-white rounded-xl p-3 border text-center">
           <p className="text-xs text-gray-500">OTT</p>
           <p className="text-xl font-bold text-purple-600">{allOttSuppliers.length}</p>
+        </div>
+        <div className="bg-white rounded-xl p-3 border text-center">
+          <p className="text-xs text-gray-500">Android</p>
+          <p className="text-xl font-bold text-emerald-600">{allAndroidSuppliersAll.filter(s => s.session_state === 'connected').length}/{allAndroidSuppliersAll.length}</p>
         </div>
         {/* Asterisk Status */}
         <div className={`rounded-xl p-3 border text-center ${!asteriskStatus ? 'bg-gray-50' : asteriskStatus.service_active && asteriskStatus.ami_connected ? 'bg-green-50 border-green-200' : asteriskStatus.service_active ? 'bg-yellow-50 border-yellow-200' : 'bg-red-50 border-red-200'}`}>
@@ -720,6 +809,63 @@ export const BindStatus: React.FC = () => {
                 </div>
               </div>
             ))}
+          </div>
+        )}
+      </Card>
+
+      {/* Android SMS Gateway Devices */}
+      <Card title={`Android SMS Gateway Devices (${androidSuppliers.length})`} subtitle={searchQuery ? `Filtered from ${allAndroidSuppliersAll.length} total` : 'Android phones (7.0+) acting as SMS suppliers — status from live HTTP heartbeats every 5s'}>
+        {androidSuppliers.length === 0 ? (
+          <p className="text-gray-500 text-sm py-4">{searchScope === 'clients' ? 'Hidden by search scope (Suppliers only shown).' : 'No android gateways registered.'}</p>
+        ) : viewMode === 'table' ? (
+          renderAndroidTable(androidSuppliers)
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+            {androidSuppliers.map(supplier => {
+              const isConnected = supplier.session_state === 'connected';
+              const isBlocked = supplier.consecutive_failures >= 20;
+              return (
+                <div key={supplier.id}
+                  className={`p-4 rounded-xl border-2 transition-all ${
+                    isBlocked ? 'border-orange-200 bg-orange-50' :
+                    isConnected ? 'border-green-200 bg-green-50' : 'border-red-200 bg-red-50'
+                  }`}>
+                  <div className="flex items-start justify-between">
+                    <div className="flex items-center gap-3">
+                      <div className="p-2 rounded-lg bg-emerald-500">
+                        <span className="text-white text-lg">🤖</span>
+                      </div>
+                      <div>
+                        <p className="font-semibold text-gray-800 text-sm">{supplier.supplier_code}</p>
+                        <p className="text-xs text-gray-600">{supplier.device_name || supplier.company_name}</p>
+                      </div>
+                    </div>
+                    {getStatusBadge(isBlocked ? 'error' : isConnected ? 'connected' : 'disconnected', supplier.consecutive_failures)}
+                  </div>
+                  <div className="mt-3 space-y-1.5 text-xs">
+                    <div className="flex justify-between"><span className="text-gray-500">Android:</span><span className="font-medium text-gray-700">{supplier.android_version || '—'}</span></div>
+                    <div className="flex justify-between"><span className="text-gray-500">Carrier:</span><span className="font-medium text-gray-700">{supplier.sim_carrier || '—'}</span></div>
+                    <div className="flex justify-between"><span className="text-gray-500">SIM Number:</span><span className="font-mono text-gray-700">{supplier.sim_number || '—'}</span></div>
+                    <div className="flex justify-between"><span className="text-gray-500">SIM Ready:</span><Badge variant={supplier.sim_ready ? 'success' : 'danger'} size="sm">{supplier.sim_ready ? 'READY' : 'NO SIM'}</Badge></div>
+                    <div className="flex justify-between"><span className="text-gray-500">Last Heartbeat:</span><span className="text-gray-700">{formatTime(supplier.last_heartbeat_at)}</span></div>
+                    <div className="flex justify-between"><span className="text-gray-500">Failures:</span>
+                      <span className={`font-medium ${supplier.consecutive_failures > 10 ? 'text-red-600' : supplier.consecutive_failures > 0 ? 'text-yellow-600' : 'text-green-600'}`}>{supplier.consecutive_failures}</span>
+                    </div>
+                  </div>
+                  <div className="mt-3 flex gap-2">
+                    {isConnected ? (
+                      <Button size="sm" variant="danger" className="flex-1" onClick={() => handleUnbind('supplier', supplier.id)} disabled={bindingId === `supplier-${supplier.id}`}>
+                        {bindingId === `supplier-${supplier.id}` ? '...' : 'Disconnect'}
+                      </Button>
+                    ) : (
+                      <Button size="sm" variant="success" className="flex-1" onClick={() => handleBind('supplier', supplier.id)} disabled={bindingId === `supplier-${supplier.id}`}>
+                        {bindingId === `supplier-${supplier.id}` ? '...' : 'Connect'}
+                      </Button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
           </div>
         )}
       </Card>

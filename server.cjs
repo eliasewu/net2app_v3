@@ -34,17 +34,27 @@ const parsePgArray = (val) => {
   if (val === '{}') return [];
   const stripped = val.replace(/^{|}$/g, '');
   if (stripped === '') return [];
+  return stripped.split(',').map(v => v.trim()).filter(v => v !== '');
+};
+// Integer arrays: coerce numeric elements to numbers (route_ids, trunk_ids comparisons)
+const parsePgIntArray = (val) => {
+  if (val === null || val === undefined) return null;
+  if (typeof val !== 'string') return val;
+  if (val === '{}') return [];
+  const stripped = val.replace(/^{|}$/g, '');
+  if (stripped === '') return [];
   return stripped.split(',').map(v => {
     const trimmed = v.trim();
-    // Try number first, fallback to string
     const num = Number(trimmed);
     return isNaN(num) || trimmed === '' ? trimmed : num;
   });
 };
-// OIDs: 1007 = int4[], 1005 = int2[], 1016 = int8[], 1009 = text[], 1015 = varchar[]
-pg.types.setTypeParser(1007, parsePgArray);
-pg.types.setTypeParser(1005, parsePgArray);
-pg.types.setTypeParser(1016, parsePgArray);
+// OIDs: 1007 = int4[], 1005 = int2[], 1016 = int8[] → numeric coercion.
+// 1009 = text[], 1015 = varchar[] → ALWAYS strings (mccmnc_allowed '424' must stay
+// a string; coercing it to the number 424 crashed p.replace() in resolveRoute).
+pg.types.setTypeParser(1007, parsePgIntArray);
+pg.types.setTypeParser(1005, parsePgIntArray);
+pg.types.setTypeParser(1016, parsePgIntArray);
 pg.types.setTypeParser(1009, parsePgArray);
 pg.types.setTypeParser(1015, parsePgArray);
 
@@ -3207,7 +3217,8 @@ function supplierBindValue(requested, connType, status) {
 function normalizeSupplierBindStatus(row) {
     if (!row) return row;
     if (String(row.connection_type || 'smpp').toLowerCase() === 'smpp') return row;
-    const active = row.status === 'active';
+    // /api/bind/status aliases status as supplier_status — handle both.
+    const active = (row.supplier_status || row.status) === 'active';
     row.bind_status = active ? 'bound' : 'unbound';
     if ('session_state' in row) row.session_state = active ? 'connected' : 'disconnected';
     return row;
@@ -3738,11 +3749,22 @@ app.post('/api/suppliers/:id/bind', auth, async (req, res) => {
             // Inbound supplier: sync suppliers table to match real smpp_sessions state.
             // The Java Gateway manages the actual TCP connection. We just reflect reality
             // and reset any stale failure counters so the UI shows the correct state.
-            const sessR = await pool.query(
-                `SELECT status FROM smpp_sessions WHERE entity_type = 'supplier' AND entity_id = $1`,
-                [id]
-            );
-            const realStatus = sessR.rows.length > 0 ? sessR.rows[0].status : 'unbound';
+            let realStatus;
+            if (String(s.connection_type || '').toLowerCase() === 'android_sms') {
+                // Android SMS gateways connect over HTTP heartbeats (no SMPP session):
+                // derive bind status from last_heartbeat_at freshness (2 min window).
+                const hbR = await pool.query(
+                    `SELECT (last_heartbeat_at IS NOT NULL AND last_heartbeat_at > NOW() - INTERVAL '2 minutes') AS fresh FROM suppliers WHERE id = $1`,
+                    [id]
+                );
+                realStatus = (hbR.rows[0] && hbR.rows[0].fresh) ? 'bound' : 'unbound';
+            } else {
+                const sessR = await pool.query(
+                    `SELECT status FROM smpp_sessions WHERE entity_type = 'supplier' AND entity_id = $1`,
+                    [id]
+                );
+                realStatus = sessR.rows.length > 0 ? sessR.rows[0].status : 'unbound';
+            }
             // Sync suppliers.bind_status to match real session state + reset failures
             await pool.query(
                 `UPDATE suppliers SET bind_status = $1, consecutive_failures = 0, updated_at = NOW()
@@ -4810,7 +4832,14 @@ async function resolveRoute(client, destination) {
                 const trunksR = await pool.query('SELECT * FROM trunks WHERE id = ANY($1::int[]) AND is_active = true ORDER BY priority ASC', [route.trunk_ids]);
                 for (const trunk of trunksR.rows) {
                     const allowed = trunk.mccmnc_allowed || ['*'];
-                    const matches = allowed.some(p => p === '*' || (mcc && mcc.startsWith(p.replace('*', ''))));
+                    const matches = allowed.some(pt => {
+                        if (pt == null) return false;
+                        if (typeof pt !== 'string') {
+                            console.error('[ROUTE] Non-string mccmnc pattern on trunk', trunk.id, trunk.trunk_name, 'value:', JSON.stringify(pt), 'full array:', JSON.stringify(allowed));
+                            pt = String(pt);
+                        }
+                        return pt === '*' || (!!mcc && mcc.startsWith(pt.replace('*', '')));
+                    });
                     dbg(`${debugId}     Trunk '${trunk.trunk_name}' (prio=${trunk.priority}) allowed=${JSON.stringify(allowed)} mcc=${mcc} match=${matches}`);
                     if (matches && trunk.supplier_id) {
                         // Availability rule: SMPP suppliers need a real live bind ('bound');
@@ -5463,7 +5492,7 @@ app.post('/api/sms/send', auth, async (req, res) => {
             },
             message: rateLimited ? 'Queued (client approaching TPS limit)' : 'Queued for delivery'
         });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    } catch (e) { console.error('[SMS-SEND-DEBUG]', e.stack || e.message); res.status(500).json({ error: e.message }); }
 });
 
 // HTTP API endpoint for external clients (no JWT auth, uses API key)
@@ -9115,6 +9144,7 @@ app.get('/api/bind/status', auth, async (req, res) => {
             `SELECT s.id, s.supplier_code, s.company_name, s.bind_status, s.consecutive_failures,
                     s.max_failures,
                     s.smpp_host, s.smpp_port, s.smpp_username, s.connection_type, s.status as supplier_status, s.is_inbound, s.smpp_bind_type,
+                    s.last_heartbeat_at, s.device_name, s.android_version, s.sim_ready, s.sim_carrier, s.sim_number, s.battery_level, s.signal_strength,
        CASE WHEN s.is_inbound = true THEN 'smsc_server' ELSE 'esme_client' END as smpp_mode,
                     COALESCE(sess.system_id, client_sess.system_id) as session_system_id,
                     COALESCE(sess.connected_at, client_sess.connected_at) as connected_at,
@@ -9124,6 +9154,7 @@ app.get('/api/bind/status', auth, async (req, res) => {
           WHEN client_sess.id IS NOT NULL AND client_sess.status = 'bound' THEN 'connected'
           WHEN sess.id IS NOT NULL AND sess.status = 'bound' THEN 'connected'
           WHEN s.bind_status = 'bound' AND s.status = 'active' THEN 'connected'
+          WHEN s.connection_type = 'android_SMS' AND s.last_heartbeat_at > NOW() - INTERVAL '2 minutes' THEN 'connected'
           ELSE 'disconnected' 
         END as session_state
              FROM suppliers s
