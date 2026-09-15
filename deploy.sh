@@ -148,6 +148,28 @@ app_user_for() {
   printf '%s' "${owner:-root}"
 }
 
+# The user the app actually RUNS as, taken from the systemd unit that starts it.
+# The checkout owner is not a substitute: a tree created by root while the hub
+# unit runs as another user is the exact case this has to handle — trusting the
+# owner would chown runtime dirs to root and break the app's writes.
+app_runtime_user() {
+  local app_dir=$1 units unit user fallback='' exec_line
+  units=$(systemctl list-unit-files --type=service --no-legend --plain 2>/dev/null || true)
+  for unit in net2app-hub net2app pm2-net2app net2app-smpg; do
+    grep -qE "^${unit}(\.service)?[[:space:]]" <<< "$units" || continue
+    user=$(systemctl show "$unit" -p User --value 2>/dev/null || true)
+    [[ -z "$user" ]] && continue
+    # Read once instead of piping into grep -q: "set -o pipefail" would turn the
+    # SIGPIPE systemctl gets on an early match into a failed condition.
+    exec_line=$(systemctl show "$unit" -p ExecStart 2>/dev/null || true)
+    if grep -qF "$app_dir" <<< "$exec_line"; then
+      printf '%s' "$user"; return 0
+    fi
+    [[ -z "$fallback" ]] && fallback="$user"
+  done
+  printf '%s' "$fallback"
+}
+
 run_as_app() {
   local dir=$1 app_user=$2
   shift 2
@@ -198,7 +220,11 @@ frontend_source_fingerprint() {
   local APP_DIR=$1 out
   # "|| true" everywhere: a missing path (find exits non-zero) must not abort the
   # deploy through "set -e" on a command substitution.
-  out=$( cd "$APP_DIR" 2>/dev/null && { find src index.html vite.config.ts -type f -print0 2>/dev/null \
+  # public/ ships inside the bundle too (favicon, icons), so it belongs in the
+  # fingerprint — but its bulky artifacts (uploaded APKs, generated QR images) are
+  # not build inputs, and excluding them keeps an APK upload from forcing a rebuild.
+  out=$( cd "$APP_DIR" 2>/dev/null && { find src index.html vite.config.ts public \
+      -type f -not -name '*.apk' -not -path 'public/qr/*' -print0 2>/dev/null \
       | sort -z | xargs -0 md5sum 2>/dev/null | md5sum | cut -d' ' -f1; } ) || true
   printf '%s' "$out"
   return 0
@@ -401,8 +427,34 @@ self_heal() {
   fi
   info "applying post-deploy fixes in $APP_DIR"
 
+  # Prefer the user the hub unit actually runs as; fall back to the checkout
+  # owner only when no net2app unit is installed (bare/manual installs).
   local APP_USER
-  APP_USER="$(app_user_for "$APP_DIR")"
+  APP_USER="$(app_runtime_user "$APP_DIR")"
+  if [[ -z "$APP_USER" ]]; then
+    APP_USER="$(app_user_for "$APP_DIR")"
+    warn "no net2app systemd unit found — assuming the app runs as $APP_USER"
+  fi
+
+  # --- 0) Directories the app writes at runtime ----------------------------
+  # ottDeviceManager.mjs does mkdirSync(<app>/ott_sessions) at import time and
+  # the hub writes Telegram/WhatsApp session files there afterwards, so a
+  # root-owned directory gives either "EACCES" at init or silently dropped
+  # pairing. Same for the QR images written to public/qr and served by nginx.
+  # These are chowned to the RUNTIME user, never to the checkout owner.
+  local runtime_dir runtime_owner
+  for runtime_dir in ott_sessions public/qr; do
+    mkdir -p "$APP_DIR/$runtime_dir" 2>/dev/null || true
+    [[ -d "$APP_DIR/$runtime_dir" ]] || { warn "could not create $runtime_dir in $APP_DIR"; continue; }
+    runtime_owner=$(stat -c %U "$APP_DIR/$runtime_dir" 2>/dev/null || true)
+    if [[ -n "$runtime_owner" && "$runtime_owner" != "$APP_USER" ]]; then
+      if chown -R "$APP_USER:$APP_USER" "$APP_DIR/$runtime_dir" 2>/dev/null; then
+        ok "$runtime_dir made writable by $APP_USER (was $runtime_owner)"
+      else
+        warn "$runtime_dir is owned by $runtime_owner but the app runs as $APP_USER — OTT/QR writes will fail"
+      fi
+    fi
+  done
 
   # systemd unit list, read once. "systemctl list-unit-files | grep -q" would
   # SIGPIPE systemctl as soon as grep matched, and "set -o pipefail" turns that

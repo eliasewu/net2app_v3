@@ -69,7 +69,7 @@ public class DlrPusher {
             }
         }, 3, 5, TimeUnit.SECONDS);
 
-        log.error("DLR Pusher STARTED — polling dlr_outbox every 5s for SMPP client delivery");
+        log.info("DLR Pusher STARTED — polling dlr_outbox every 5s for SMPP client delivery");
     }
 
     /**
@@ -77,9 +77,10 @@ public class DlrPusher {
      */
     private void pollAndPush() {
         List<Database.PendingDlr> pending = Database.getPendingDlrs();
-        // First-cycle heartbeat: confirm pusher is alive (use error level for visibility)
+        // Idle heartbeat. This runs every 5s, so it must stay at DEBUG: logging it
+        // at ERROR buried real failures under ~100k "heartbeat" lines a day.
         if (pending.isEmpty()) {
-            log.error("DLR pusher heartbeat: no pending DLRs ({} sessions active)", smppServer.getSessions().size());
+            log.debug("DLR pusher heartbeat: no pending DLRs ({} sessions active)", smppServer.getSessions().size());
             return;
         }
 
@@ -101,7 +102,7 @@ public class DlrPusher {
         }
 
         if (pushed > 0 || skipped > 0) {
-            log.error("DLR pusher cycle: {} pushed, {} skipped ({} pending)",
+            log.info("DLR pusher cycle: {} pushed, {} skipped ({} pending)",
                 pushed, skipped, pending.size());
         }
     }

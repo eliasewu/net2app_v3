@@ -488,6 +488,12 @@ export const auditApi = {
 // ==================== DASHBOARD API ====================
 export const dashboardApi = {
   getTenantVolume: () => api.get<any[]>('/dashboard/tenant-volume'),
+  // Aggregated in PostgreSQL over the whole sms_logs table, so the dashboard
+  // charts describe all traffic (portal users are scoped server-side).
+  getStats: () => api.get<any>('/dashboard/stats'),
+  getTraffic: (hours = 24) => api.get<any[]>(`/dashboard/traffic?hours=${hours}`),
+  getRevenue: (days = 14) => api.get<any[]>(`/dashboard/revenue?days=${days}`),
+  getTopDestinations: (limit = 8) => api.get<any[]>(`/dashboard/top-destinations?limit=${limit}`),
 };
 
 // ==================== CAMPAIGNS API ====================

@@ -1,6 +1,5 @@
 import React, { createContext, useContext, useState, useCallback, useEffect, ReactNode } from 'react';
 import { Client, Supplier, Trunk, Route, RoutePlan, Rate, MCCMNC, Invoice, Payment, SMSLog, EmailTemplate, OTTDevice, APIConnector, User, DashboardStats, Notification, Campaign, Translation, VoiceOTPConfig, DLRQueue, SMTPConfig } from '../types';
-import { hourlyTrafficData, dailyRevenueData, topDestinations } from './mockData';
 import { api, clientsApi, suppliersApi, routingApi, smsApi } from '../services/api';
 import { useAuth } from './AuthContext';
 
@@ -11,7 +10,7 @@ interface DataContextType {
   ottDevices: OTTDevice[]; apiConnectors: APIConnector[]; users: User[];
   emailTemplates: EmailTemplate[]; notifications: Notification[]; campaigns: Campaign[];
   translations: Translation[]; voiceOTPConfigs: VoiceOTPConfig[];
-  dashboardStats: DashboardStats; hourlyTraffic: typeof hourlyTrafficData; dailyRevenue: typeof dailyRevenueData; topDest: typeof topDestinations;
+  dashboardStats: DashboardStats;
   addClient:(c:Omit<Client,'id'|'created_at'|'updated_at'>)=>Promise<void>; updateClient:(id:string,c:Partial<Client>)=>Promise<void>; deleteClient:(id:string)=>Promise<void>; restoreClient:(id:string)=>Promise<void>;
   addSupplier:(s:Omit<Supplier,'id'|'created_at'|'updated_at'>)=>Promise<void>; updateSupplier:(id:string,s:Partial<Supplier>)=>Promise<void>; deleteSupplier:(id:string)=>Promise<void>; restoreSupplier:(id:string)=>Promise<void>;
   addSMSLog:(log:Omit<SMSLog,'id'|'created_at'|'submit_time'>)=>void;
@@ -482,7 +481,7 @@ export const DataProvider:React.FC<{children:ReactNode}> = ({children}) => {
     active_binds:safeSuppliers.filter(s=>s.bind_status==='bound').length,total_binds:safeSuppliers.length,
   };
 
-  return (<DataContext.Provider value={{clients:safeClients,suppliers:safeSuppliers,trunks:safeTrunks,routes:safeRoutes,routePlans,rates,mccmnc,invoices,payments,smsLogs:safeSMSLogs,ottDevices,apiConnectors,users,emailTemplates,notifications,campaigns,translations,voiceOTPConfigs,dashboardStats,hourlyTraffic:hourlyTrafficData,dailyRevenue:dailyRevenueData,topDest:topDestinations,addClient,updateClient,deleteClient,restoreClient,addSupplier,updateSupplier,deleteSupplier,restoreSupplier,addSMSLog,addTrunk,updateTrunk,deleteTrunk,addRoute,updateRoute,deleteRoute,addRoutePlan,updateRoutePlan,deleteRoutePlan,addRate,updateRate,deleteRate,addMCCMNC,updateMCCMNC,deleteMCCMNC,addInvoice,updateInvoice,addPayment,addOTTDevice,updateOTTDevice,deleteOTTDevice,addApiConnector,updateApiConnector,deleteApiConnector,markNotificationRead,addCampaign,updateCampaign,deleteCampaign,addTranslation,updateTranslation,deleteTranslation,          getClientById,getSupplierById,getTrunkById,updateEmailTemplate,platformSettings,updatePlatformSetting,smtpConfig,updateSMTPConfig,dlrQueue,mccmncTotal,fetchMCCMNC,smsTotal,fetchSMSLogs}}>{children}</DataContext.Provider>);
+  return (<DataContext.Provider value={{clients:safeClients,suppliers:safeSuppliers,trunks:safeTrunks,routes:safeRoutes,routePlans,rates,mccmnc,invoices,payments,smsLogs:safeSMSLogs,ottDevices,apiConnectors,users,emailTemplates,notifications,campaigns,translations,voiceOTPConfigs,dashboardStats,addClient,updateClient,deleteClient,restoreClient,addSupplier,updateSupplier,deleteSupplier,restoreSupplier,addSMSLog,addTrunk,updateTrunk,deleteTrunk,addRoute,updateRoute,deleteRoute,addRoutePlan,updateRoutePlan,deleteRoutePlan,addRate,updateRate,deleteRate,addMCCMNC,updateMCCMNC,deleteMCCMNC,addInvoice,updateInvoice,addPayment,addOTTDevice,updateOTTDevice,deleteOTTDevice,addApiConnector,updateApiConnector,deleteApiConnector,markNotificationRead,addCampaign,updateCampaign,deleteCampaign,addTranslation,updateTranslation,deleteTranslation,          getClientById,getSupplierById,getTrunkById,updateEmailTemplate,platformSettings,updatePlatformSetting,smtpConfig,updateSMTPConfig,dlrQueue,mccmncTotal,fetchMCCMNC,smsTotal,fetchSMSLogs}}>{children}</DataContext.Provider>);
 };
 
 export const useData = () => { const c=useContext(DataContext); if(!c) throw new Error('useData required'); return c; };

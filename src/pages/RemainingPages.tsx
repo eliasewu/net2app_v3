@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { useAuth } from '../store/AuthContext';
 import { useData } from '../store/DataContext';
 import { Rate } from '../types';
@@ -275,7 +275,8 @@ export const PlatformSettings: React.FC = () => {
 // ==================== DATABASE & BACKUP ====================
 export const DatabasePage: React.FC = () => {
   const { user } = useAuth();
-  const isSuperOrAdmin = user?.role === 'super_admin' || user?.role === 'admin';
+  const isSuperAdmin = user?.role === 'super_admin';
+  // Super Admin only (route + sidebar are gated too; this is defence in depth).
   // The inventory used to be a hardcoded list ("sms_logs 125,000 rows / 45MB" and
   // a 54.9MB total) that had no relation to this node. Hooks run before the
   // access check below so the hook order stays stable for every user.
@@ -283,32 +284,40 @@ export const DatabasePage: React.FC = () => {
   const [dbStatus, setDbStatus] = useState<any>(null);
   const [dbLoading, setDbLoading] = useState(true);
   const [dbError, setDbError] = useState<string|null>(null);
+  const [updatedAt, setUpdatedAt] = useState<Date|null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const reqId = useRef(0);
 
+  const load = useCallback(async (fresh = false) => {
+    const id = ++reqId.current;
+    if (!isSuperAdmin) { setDbLoading(false); return; }
+    try {
+      const [statusRes, tablesRes]: any[] = await Promise.all([
+        api.get<any>(API_ENDPOINTS.SYSTEM.DATABASE_STATUS.path).catch(() => ({ success: false })),
+        api.get<any>(API_ENDPOINTS.SYSTEM.DATABASE_TABLES.path + (fresh ? '?fresh=1' : '')).catch(() => ({ success: false })),
+      ]);
+      if (id !== reqId.current) return; // a newer request already answered
+      const status = statusRes?.success ? (statusRes.data?.data || statusRes.data) : null;
+      const inventory = tablesRes?.success ? (tablesRes.data?.data || tablesRes.data) : null;
+      setDbStatus(status);
+      if (inventory?.tables) { setDbTables(inventory.tables); setDbError(null); }
+      else setDbError('Could not read the table inventory from this server.');
+      setUpdatedAt(new Date());
+    } catch (e: any) {
+      if (id === reqId.current) setDbError(e?.message || 'Failed to load database statistics.');
+    } finally {
+      if (id === reqId.current) { setDbLoading(false); setRefreshing(false); }
+    }
+  }, [isSuperAdmin]);
+
+  // Keep the page in sync with real usage: re-read this node every 15s while visible.
   useEffect(() => {
-    if (!isSuperOrAdmin) { setDbLoading(false); return; }
-    let cancelled = false;
-    (async () => {
-      try {
-        const [statusRes, tablesRes]: any[] = await Promise.all([
-          api.get<any>(API_ENDPOINTS.SYSTEM.DATABASE_STATUS.path).catch(() => ({ success: false })),
-          api.get<any>(API_ENDPOINTS.SYSTEM.DATABASE_TABLES.path).catch(() => ({ success: false })),
-        ]);
-        if (cancelled) return;
-        const status = statusRes?.success ? (statusRes.data?.data || statusRes.data) : null;
-        const inventory = tablesRes?.success ? (tablesRes.data?.data || tablesRes.data) : null;
-        setDbStatus(status);
-        if (inventory?.tables) setDbTables(inventory.tables);
-        else setDbError('Could not read the table inventory from this server.');
-      } catch (e: any) {
-        if (!cancelled) setDbError(e?.message || 'Failed to load database statistics.');
-      } finally {
-        if (!cancelled) setDbLoading(false);
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [isSuperOrAdmin]);
+    load();
+    const timer = setInterval(() => { if (!document.hidden) load(); }, 15000);
+    return () => clearInterval(timer);
+  }, [load]);
 
-  if (!isSuperOrAdmin) return <div className="p-12 text-center text-red-600 bg-red-50 rounded-xl border border-red-200"><Lock size={48} className="mx-auto mb-3"/><h2 className="text-xl font-bold">Access Denied</h2><p className="text-sm mt-1">Only Super Admin and Admin can view Database page.</p></div>;
+  if (!isSuperAdmin) return <div className="p-12 text-center text-red-600 bg-red-50 rounded-xl border border-red-200"><Lock size={48} className="mx-auto mb-3"/><h2 className="text-xl font-bold">Access Denied</h2><p className="text-sm mt-1">Only Super Admin can view the Database page.</p></div>;
 
   const formatBytes = (bytes: number) => {
     if (!bytes) return '0 B';
@@ -321,7 +330,7 @@ export const DatabasePage: React.FC = () => {
   const hasEstimates = dbTables.some(t => t.rows_estimated);
   const engineLabel = dbStatus?.version ? `PostgreSQL ${String(dbStatus.version).split(' ')[0]}` : 'PostgreSQL';
   const cols=[{key:'name',header:'Table',render:(t:any)=><span className="font-mono font-medium">{t.name}</span>},{key:'rows',header:'Rows',align:'right' as const,render:(t:any)=><span>{t.rows_estimated ? '~' : ''}{(t.rows||0).toLocaleString()}</span>},{key:'size',header:'Size',align:'right' as const,render:(t:any)=><span>{formatBytes(t.bytes)}</span>}];
-  return (<div className="space-y-6"><div className="flex items-center justify-between"><div><h1 className="text-2xl font-bold text-gray-800">Database</h1><p className="text-gray-500 mt-1">PostgreSQL tables and schema — read live from this node</p></div>{!dbLoading && !dbError && <span className="text-xs text-gray-400">Counts are exact{hasEstimates ? ', ~ marks planner estimates' : ''} · cached 60s</span>}</div>
+  return (<div className="space-y-6"><div className="flex items-center justify-between"><div><h1 className="text-2xl font-bold text-gray-800">Database</h1><p className="text-gray-500 mt-1">PostgreSQL tables and schema — read live from this node</p></div><div className="flex items-center gap-3">{!dbLoading && !dbError && <span className="text-xs text-gray-400" title="This page re-reads the node every 15 seconds">Counts are exact{hasEstimates ? ', ~ marks planner estimates' : ''}{updatedAt ? ` · updated ${updatedAt.toLocaleTimeString()}` : ''} · auto-sync 15s</span>}<button onClick={() => { setRefreshing(true); load(true); }} disabled={refreshing || dbLoading} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-gray-300 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"><RotateCcw size={14} className={refreshing ? 'animate-spin' : ''}/>{refreshing ? 'Refreshing…' : 'Refresh'}</button></div></div>
     {dbError && <div className="p-4 rounded-lg bg-red-50 border border-red-200 text-sm text-red-700">{dbError}</div>}
     <div className="grid grid-cols-1 md:grid-cols-4 gap-4"><div className="bg-white rounded-xl p-4 border"><Database size={24} className="text-blue-500 mb-1"/><p className="text-2xl font-bold">{dbLoading ? '—' : dbTables.length}</p><p className="text-sm text-gray-500">Tables</p></div><div className="bg-white rounded-xl p-4 border"><FileText size={24} className="text-green-500 mb-1"/><p className="text-2xl font-bold">{dbLoading ? '—' : `${hasEstimates ? '~' : ''}${totalRows.toLocaleString()}`}</p><p className="text-sm text-gray-500">Total Rows</p></div><div className="bg-white rounded-xl p-4 border"><HardDrive size={24} className="text-purple-500 mb-1"/><p className="text-2xl font-bold">{dbLoading ? '—' : formatBytes(totalBytes)}</p><p className="text-sm text-gray-500">Total Size</p></div><div className="bg-white rounded-xl p-4 border"><Database size={24} className="text-orange-500 mb-1"/><p className="text-2xl font-bold">{engineLabel}</p><p className="text-sm text-gray-500">Engine</p></div></div>
     <Card title="Database Tables" noPadding>{dbLoading

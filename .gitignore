@@ -13,6 +13,7 @@ server.log
 
 # Runtime and generated deployment state
 java-sms-gateway/target/
+java-sms-gateway/dependency-reduced-pom.xml
 ot_sessions/
 ott_sessions/
 public/qr/
@@ -25,3 +26,6 @@ android-gateway/android/app/release-signing.properties
 server.cjs.bak*
 server.cjs.backup*
 server.*.bak
+
+# Ops reference: holds SSH, DB and admin credentials — keep it out of git.
+SERVER_INFO.md

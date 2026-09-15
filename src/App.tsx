@@ -115,7 +115,7 @@ function AppRoutes() {
         <Route path="users/roles" element={<RolesPage />} />
         <Route path="system/settings" element={<PlatformSettings />} />
         <Route path="system/license" element={<SuperAdminRoute><License /></SuperAdminRoute>} />
-        <Route path="system/database" element={<DatabasePage />} />
+        <Route path="system/database" element={<SuperAdminRoute><DatabasePage /></SuperAdminRoute>} />
         <Route path="system/backup" element={<BackupPage />} />
         <Route path="system/api-docs" element={<ApiDocs />} />
       </Route>

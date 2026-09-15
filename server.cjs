@@ -2602,8 +2602,12 @@ app.post('/api/auth/refresh', async (req, res) => {
         const rawToken = req.cookies && req.cookies[REFRESH_COOKIE_NAME];
         if (!rawToken) return res.status(401).json({ error: 'No refresh token' });
         const tokenHash = hashRefreshToken(rawToken);
+        // NOTE: alias the session id. Selecting both s.id and u.id made node-pg
+        // collapse them into one "id" (the user's), so the FOR UPDATE guard below
+        // looked up the wrong row and every refresh returned "already used" —
+        // which silently logged users out on page reload.
         const sessionR = await pool.query(
-            `SELECT s.id, s.user_id, s.expires_at, u.id, u.username, u.role, u.is_active
+            `SELECT s.id AS session_id, s.user_id, s.expires_at, u.username, u.role, u.is_active
              FROM auth_refresh_sessions s JOIN users u ON u.id = s.user_id
              WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND s.expires_at > NOW() AND u.is_active = true`,
             [tokenHash]
@@ -2617,10 +2621,10 @@ app.post('/api/auth/refresh', async (req, res) => {
             await db.query('BEGIN');
             const locked = await db.query(
                 `SELECT id FROM auth_refresh_sessions WHERE id = $1 AND revoked_at IS NULL AND expires_at > NOW() FOR UPDATE`,
-                [sessionR.rows[0].id]
+                [sessionR.rows[0].session_id]
             );
             if (!locked.rows.length) { await db.query('ROLLBACK'); return res.status(401).json({ error: 'Refresh token already used' }); }
-            await db.query(`UPDATE auth_refresh_sessions SET revoked_at=NOW(), replaced_by_hash=$2, last_used_at=NOW() WHERE id=$1`, [sessionR.rows[0].id, replacementHash]);
+            await db.query(`UPDATE auth_refresh_sessions SET revoked_at=NOW(), replaced_by_hash=$2, last_used_at=NOW() WHERE id=$1`, [sessionR.rows[0].session_id, replacementHash]);
             await db.query(`INSERT INTO auth_refresh_sessions (user_id, token_hash, expires_at, ip_address, user_agent) VALUES ($1,$2,NOW()+INTERVAL '7 days',$3,$4)`, [u.user_id, replacementHash, req.ip || null, req.get('user-agent') || null]);
             await db.query('COMMIT');
         } catch (e) { await db.query('ROLLBACK').catch(() => {}); throw e; } finally { db.release(); }
@@ -9301,6 +9305,132 @@ app.get('/api/dashboard/tenant-volume', auth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ==================== DASHBOARD CHART DATA ====================
+// The dashboard charts used to be derived from the first page of /api/sms/logs,
+// so they only described the newest rows, and empty hourly buckets were filled
+// with Math.random(). These endpoints aggregate in PostgreSQL over the whole
+// table instead, so the charts describe this node's real traffic.
+//
+// Portal users are scoped exactly like /api/sms/logs: `auth` resolves
+// client_id/supplier_id from the token. Admins see the whole platform.
+function dashboardScope(req, alias = '') {
+    const pre = alias ? `${alias}.` : '';
+    const params = [];
+    const where = [`(${pre}is_deleted IS NULL OR ${pre}is_deleted = false)`];
+    if (req.user?.client_id) { params.push(req.user.client_id); where.push(`${pre}client_id = $${params.length}`); }
+    if (req.user?.supplier_id) { params.push(req.user.supplier_id); where.push(`${pre}supplier_id = $${params.length}`); }
+    return { clause: where.join(' AND '), params };
+}
+
+// Stat cards: today / this-month volume plus revenue, cost and profit.
+// Only billed rows are counted as money, matching the billing engine's flags.
+app.get('/api/dashboard/stats', auth, async (req, res) => {
+    try {
+        const { clause, params } = dashboardScope(req);
+        const result = await pool.query(
+            `SELECT
+                COUNT(*) FILTER (WHERE submit_time >= CURRENT_DATE)::int AS total_sms_today,
+                COUNT(*) FILTER (WHERE submit_time >= CURRENT_DATE AND status = 'delivered')::int AS delivered_today,
+                COUNT(*) FILTER (WHERE submit_time >= CURRENT_DATE AND status = 'failed')::int AS failed_today,
+                COUNT(*) FILTER (WHERE submit_time >= date_trunc('month', CURRENT_DATE))::int AS total_sms_month,
+                COUNT(*)::int AS total_sms,
+                COALESCE(SUM(client_rate * COALESCE(message_parts, 1)) FILTER (WHERE submit_time >= CURRENT_DATE AND is_billed), 0)::float8 AS revenue_today,
+                COALESCE(SUM(client_rate * COALESCE(message_parts, 1)) FILTER (WHERE submit_time >= date_trunc('month', CURRENT_DATE) AND is_billed), 0)::float8 AS revenue_month,
+                COALESCE(SUM(supplier_rate * COALESCE(message_parts, 1)) FILTER (WHERE submit_time >= CURRENT_DATE AND is_billed), 0)::float8 AS cost_today,
+                COALESCE(SUM(supplier_rate * COALESCE(message_parts, 1)) FILTER (WHERE submit_time >= date_trunc('month', CURRENT_DATE) AND is_billed), 0)::float8 AS cost_month,
+                COALESCE(SUM(profit) FILTER (WHERE submit_time >= CURRENT_DATE AND is_billed), 0)::float8 AS profit_today,
+                COALESCE(SUM(profit) FILTER (WHERE submit_time >= date_trunc('month', CURRENT_DATE) AND is_billed), 0)::float8 AS profit_month
+             FROM sms_logs
+             WHERE ${clause}`,
+            params
+        );
+        res.json({ success: true, data: result.rows[0] });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Hourly traffic: one row per hour (empty hours are real zeros, not random data).
+app.get('/api/dashboard/traffic', auth, async (req, res) => {
+    try {
+        const hours = Math.min(Math.max(parseInt(req.query.hours) || 24, 1), 168);
+        const { clause, params } = dashboardScope(req, 'sl');
+        const result = await pool.query(
+            `WITH series AS (
+                SELECT date_trunc('hour', NOW()) - (n * INTERVAL '1 hour') AS bucket
+                FROM generate_series(${hours - 1}, 0, -1) AS n
+             )
+             SELECT to_char(s.bucket, 'HH24:00') AS hour,
+                    to_char(s.bucket, 'YYYY-MM-DD HH24:00') AS slot,
+                    COUNT(sl.id)::int AS sent,
+                    COUNT(sl.id) FILTER (WHERE sl.status = 'delivered')::int AS delivered,
+                    COUNT(sl.id) FILTER (WHERE sl.status = 'failed')::int AS failed
+             FROM series s
+             LEFT JOIN sms_logs sl
+                    ON date_trunc('hour', COALESCE(sl.submit_time, sl.created_at)) = s.bucket
+                   AND ${clause}
+             GROUP BY s.bucket
+             ORDER BY s.bucket`,
+            params
+        );
+        res.json({ success: true, data: result.rows });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Daily revenue / cost / profit for the last `days` days (default 14).
+app.get('/api/dashboard/revenue', auth, async (req, res) => {
+    try {
+        const days = Math.min(Math.max(parseInt(req.query.days) || 14, 1), 90);
+        const { clause, params } = dashboardScope(req, 'sl');
+        const result = await pool.query(
+            `WITH series AS (
+                SELECT (CURRENT_DATE - (n * INTERVAL '1 day'))::date AS day
+                FROM generate_series(${days - 1}, 0, -1) AS n
+             )
+             SELECT to_char(s.day, 'YYYY-MM-DD') AS date,
+                    COUNT(sl.id)::int AS sms,
+                    COALESCE(SUM(sl.client_rate * COALESCE(sl.message_parts, 1)) FILTER (WHERE sl.is_billed), 0)::float8 AS revenue,
+                    COALESCE(SUM(sl.supplier_rate * COALESCE(sl.message_parts, 1)) FILTER (WHERE sl.is_billed), 0)::float8 AS cost,
+                    COALESCE(SUM(sl.profit) FILTER (WHERE sl.is_billed), 0)::float8 AS profit
+             FROM series s
+             LEFT JOIN sms_logs sl
+                    ON COALESCE(sl.submit_time, sl.created_at)::date = s.day
+                   AND ${clause}
+             GROUP BY s.day
+             ORDER BY s.day`,
+            params
+        );
+        res.json({ success: true, data: result.rows });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Top destinations by SMS volume, with each country's share of the total.
+app.get('/api/dashboard/top-destinations', auth, async (req, res) => {
+    try {
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 8, 1), 25);
+        const { clause, params } = dashboardScope(req);
+        const result = await pool.query(
+            `SELECT COALESCE(NULLIF(country, ''), 'Unknown') AS country,
+                    COUNT(*)::int AS count,
+                    SUM(COUNT(*)) OVER ()::int AS total
+             FROM sms_logs
+             WHERE ${clause}
+             GROUP BY COALESCE(NULLIF(country, ''), 'Unknown')
+             ORDER BY COUNT(*) DESC, country
+             LIMIT ${limit}`,
+            params
+        );
+        const total = result.rows.length ? Number(result.rows[0].total) : 0;
+        res.json({
+            success: true,
+            data: result.rows.map((row) => ({
+                country: row.country,
+                count: Number(row.count),
+                percentage: total > 0 ? Number(((Number(row.count) / total) * 100).toFixed(1)) : 0,
+            })),
+            total,
+        });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ==================== AUDIT LOGS ====================
 // Super Admin activity is intentionally invisible to Admin and lower roles.
 app.get('/api/system/audit-logs', superAuth, async (req, res) => {
@@ -9325,11 +9455,12 @@ const quoteIdent = (name) => '"' + String(name).replace(/"/g, '""') + '"';
 // Counting every table on each page load is wasteful, so results are cached and
 // an exact count is only taken while a table is small enough for count(*) to be
 // cheap; above that the planner's estimate is reported and flagged.
-const DB_TABLES_CACHE_MS = 60000;
+const DB_TABLES_CACHE_MS = 15000;
 const DB_TABLES_EXACT_COUNT_LIMIT = 100000;
 let dbTablesCache = { at: 0, payload: null };
 
-app.get('/api/system/database', adminAuth, async (req, res) => {
+// Super Admin only — the Database page is hidden from admins and other roles.
+app.get('/api/system/database', superAuth, async (req, res) => {
     try {
         const info = await pool.query(`
             SELECT current_database() AS database,
@@ -9353,10 +9484,12 @@ app.get('/api/system/database', adminAuth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/system/database/tables', adminAuth, async (req, res) => {
+app.get('/api/system/database/tables', superAuth, async (req, res) => {
     try {
         const now = Date.now();
-        if (dbTablesCache.payload && now - dbTablesCache.at < DB_TABLES_CACHE_MS) {
+        // ?fresh=1 (the page's Refresh button) skips the short cache
+        const force = req.query?.fresh === '1' || req.query?.fresh === 'true';
+        if (!force && dbTablesCache.payload && now - dbTablesCache.at < DB_TABLES_CACHE_MS) {
             return res.json({ success: true, data: dbTablesCache.payload });
         }
 

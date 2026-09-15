@@ -12,6 +12,8 @@ interface MenuItem {
   icon: React.ReactNode;
   path?: string;
   children?: MenuItem[];
+  /** Only rendered for the super_admin role (e.g. License, Database) */
+  superAdminOnly?: boolean;
 }
 
 const menuItems: MenuItem[] = [
@@ -111,8 +113,8 @@ const menuItems: MenuItem[] = [
     icon: <Settings size={20} />,
     children: [
       { label: 'Platform Settings', icon: <Settings size={16} />, path: '/system/settings' },
-      { label: 'License', icon: <Settings size={16} />, path: '/system/license' },
-      { label: 'Database', icon: <Database size={16} />, path: '/system/database' },
+      { label: 'License', icon: <Settings size={16} />, path: '/system/license', superAdminOnly: true },
+      { label: 'Database', icon: <Database size={16} />, path: '/system/database', superAdminOnly: true },
       { label: 'Backup', icon: <Settings size={16} />, path: '/system/backup' },
       { label: 'API Docs', icon: <BookOpen size={16} />, path: '/system/api-docs' },
     ]
@@ -286,12 +288,10 @@ export const Sidebar: React.FC<SidebarProps> = ({ isCollapsed, isMobileOpen, onC
       {/* Navigation */}
       <nav className="p-3 space-y-1 h-[calc(100vh-4rem)] overflow-y-auto scrollbar-thin">
         {activeMenuItems.map(item => {
-          // Hide License menu from non-super-admin users
-          if (item.label === 'System' && item.children && !isSuperAdmin()) {
-            const filteredItem = { ...item, children: item.children.filter(c => c.label !== 'License') };
-            return renderMenuItem(filteredItem);
-          }
-          return renderMenuItem(item);
+          // Hide super-admin-only entries (License, Database) from admins and other roles
+          if (!item.children) return renderMenuItem(item);
+          const filteredItem = { ...item, children: item.children.filter(c => !c.superAdminOnly || isSuperAdmin()) };
+          return renderMenuItem(filteredItem);
         })}
       </nav>
     </aside>

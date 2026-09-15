@@ -12,6 +12,22 @@ import { ErrorBoundary } from '../components/UI/ErrorBoundary';
 import { dashboardApi } from '../services/api';
 import { useAuth } from '../store/AuthContext';
 
+interface LiveStats {
+  total_sms_today: number;
+  delivered_today: number;
+  failed_today: number;
+  total_sms: number;
+  revenue_today: number;
+  cost_today: number;
+  profit_today: number;
+  revenue_month: number;
+  profit_month: number;
+}
+
+interface TrafficPoint { hour: string; sent: number; delivered: number; failed: number; }
+interface RevenuePoint { date: string; sms: number; revenue: number; cost: number; profit: number; }
+interface TopDestPoint { country: string; count: number; percentage: number; }
+
 interface TenantVolume {
   id: string;
   name: string;
@@ -41,6 +57,37 @@ export const Dashboard: React.FC = () => {
     const timer = window.setInterval(loadTenantVolume, 30000);
     return () => { cancelled = true; window.clearInterval(timer); };
   }, [user]);
+
+  // Chart + stat data comes from the dashboard aggregate endpoints, which count the
+  // whole sms_logs table in PostgreSQL. It used to be derived from the loaded page of
+  // logs (newest ~100 rows) with Math.random() filling any empty hourly bucket.
+  const [traffic, setTraffic] = useState<TrafficPoint[]>([]);
+  const [revenue, setRevenue] = useState<RevenuePoint[]>([]);
+  const [topDest, setTopDest] = useState<TopDestPoint[]>([]);
+  const [liveStats, setLiveStats] = useState<LiveStats | null>(null);
+  const [chartsLoading, setChartsLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadCharts = async () => {
+      const [statsRes, trafficRes, revenueRes, destRes]: any[] = await Promise.all([
+        dashboardApi.getStats().catch(() => ({ success: false })),
+        dashboardApi.getTraffic(24).catch(() => ({ success: false })),
+        dashboardApi.getRevenue(14).catch(() => ({ success: false })),
+        dashboardApi.getTopDestinations(8).catch(() => ({ success: false })),
+      ]);
+      if (cancelled) return;
+      const pick = (res: any) => (res?.success ? (res.data?.data ?? res.data) : null);
+      const s = pick(statsRes); if (s) setLiveStats(s);
+      const t = pick(trafficRes); if (Array.isArray(t)) setTraffic(t);
+      const r = pick(revenueRes); if (Array.isArray(r)) setRevenue(r);
+      const d = pick(destRes); if (Array.isArray(d)) setTopDest(d);
+      setChartsLoading(false);
+    };
+    loadCharts();
+    const timer = window.setInterval(loadCharts, 60000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, []);
 
   const totalTenantVolume = tenantVolumes.reduce((sum, tenant) => sum + (tenant.volume_limit || 0), 0);
   const usedTenantVolume = tenantVolumes.reduce((sum, tenant) => sum + (tenant.volume_used || 0), 0);
@@ -96,7 +143,7 @@ export const Dashboard: React.FC = () => {
   }
 
   const formatNumber = (num: number) => num >= 1000000 ? (num/1000000).toFixed(1)+'M' : num >= 1000 ? (num/1000).toFixed(1)+'K' : num.toString();
-  const formatCurrency = (num: number) => '€' + num.toLocaleString();
+  const formatCurrency = (num: number) => '€' + (num || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const COLORS = ['#3B82F6','#10B981','#F59E0B','#EF4444','#8B5CF6','#EC4899','#06B6D4','#84CC16'];
 
   volumeAlerts.forEach(tenant => {
@@ -123,31 +170,24 @@ export const Dashboard: React.FC = () => {
 
   const recentSMS = smsLogs.slice(0, 8);
 
-  // Real traffic data from SMS logs
-  const hourlyData = Array.from({ length: 24 }, (_, i) => {
-    const hr = String(i).padStart(2, '0') + ':00';
-    const s = smsLogs.filter(l => new Date(l.submit_time).getHours() === i).length;
-    return { hour: hr, sent: s || Math.floor(Math.random() * 50 + 5), delivered: Math.floor((s || 10) * 0.9), failed: Math.floor((s || 10) * 0.1) };
-  });
+  // Chart series straight from the aggregate endpoints (recharts dataKeys below).
+  const hourlyData = traffic;
+  const revenueData = revenue.map((r) => ({
+    ...r,
+    label: new Date(`${r.date}T00:00:00`).toLocaleDateString('en', { month: 'short', day: 'numeric' }),
+  }));
+  const topDestData = topDest.map((d) => ({ name: d.country, value: d.count, percent: `${d.percentage.toFixed(1)}%` }));
 
-  const revenueData = Array.from({ length: 14 }, (_, i) => {
-    const targetDate = new Date(); targetDate.setDate(targetDate.getDate() - (13 - i));
-    const dayStr = targetDate.toISOString().split('T')[0];
-    const daySMS = smsLogs.filter(l => {
-      const d = new Date(l.submit_time);
-      return d.toISOString().split('T')[0] === dayStr;
-    });
-    const rev = daySMS.filter(l => l.is_billed).reduce((s, l) => s + (l.client_rate || 0) * (l.message_parts || 1), 0);
-    const cost = daySMS.filter(l => l.is_billed).reduce((s, l) => s + (l.supplier_rate || 0) * (l.message_parts || 1), 0);
-    const prof = daySMS.filter(l => l.is_billed).reduce((s, l) => s + (l.profit || 0), 0);
-    return { date: targetDate.toLocaleDateString('en', {month:'short', day:'numeric'}), revenue: rev, cost: cost, profit: prof };
-  });
-
-  const topDestData = (() => {
-    const m = new Map<string, number>();
-    smsLogs.forEach(l => { if (l.country) m.set(l.country, (m.get(l.country)||0) + 1); });
-    return Array.from(m.entries()).sort((a,b) => b[1]-a[1]).slice(0,6).map(([name, count]) => ({ name, value: count, percent: ((count/smsLogs.length)*100).toFixed(1)+'%' }));
-  })();
+  // Stat cards: API aggregates first; the context values are only a fallback for the
+  // instant before the first response lands.
+  const stats = liveStats ?? {
+    total_sms_today: smsLogs.length,
+    delivered_today: smsLogs.filter(l => l.status === 'delivered').length,
+    revenue_today: dashboardStats.revenue_today,
+    profit_today: dashboardStats.profit_today,
+  };
+  const trafficTotal = hourlyData.reduce((sum, p) => sum + (p.sent || 0), 0);
+  const revenueTotal = revenueData.reduce((sum, p) => sum + (p.revenue || 0), 0);
 
   return (
     <ErrorBoundary fallback={<div className="p-8 text-center"><h2 className="text-xl font-bold text-red-600">Dashboard Error</h2><p className="text-gray-500 mt-2">Something went wrong rendering the dashboard. Check the browser console for details.</p><button onClick={() => window.location.reload()} className="mt-4 px-4 py-2 bg-blue-600 text-white rounded-lg">Reload Page</button></div>}>
@@ -159,10 +199,10 @@ export const Dashboard: React.FC = () => {
 
       {/* Stats */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
-        <StatCard title="Total SMS" value={formatNumber(smsLogs.length)} icon={<MessageSquare size={24}/>} change={12.5} changeLabel="from DB" color="blue"/>
-        <StatCard title="Delivered" value={formatNumber(smsLogs.filter(l => l.status === 'delivered').length)} icon={<CheckCircle size={24}/>} color="green"/>
-        <StatCard title="Revenue" value={formatCurrency(dashboardStats.revenue_today)} icon={<DollarSign size={24}/>} color="blue"/>
-        <StatCard title="Profit" value={formatCurrency(dashboardStats.profit_today)} icon={<TrendingUp size={24}/>} color="green"/>
+        <StatCard title="SMS Today" value={formatNumber(stats.total_sms_today)} icon={<MessageSquare size={24}/>} color="blue"/>
+        <StatCard title="Delivered Today" value={formatNumber(stats.delivered_today)} icon={<CheckCircle size={24}/>} color="green"/>
+        <StatCard title="Revenue Today" value={formatCurrency(stats.revenue_today)} icon={<DollarSign size={24}/>} color="blue"/>
+        <StatCard title="Profit Today" value={formatCurrency(stats.profit_today)} icon={<TrendingUp size={24}/>} color="green"/>
         <div className={`rounded-xl p-5 border ${inactiveSuppliers.length > 0 ? 'bg-red-50 border-red-200' : unboundCount > 0 ? 'bg-yellow-50 border-yellow-200' : 'bg-green-50 border-green-200'}`}>
           <div className="flex items-center gap-2">
             {inactiveSuppliers.length > 0 ? <WifiOff size={20} className="text-red-500" /> : unboundCount > 0 ? <WifiOff size={20} className="text-yellow-500" /> : <Wifi size={20} className="text-green-500" />}
@@ -252,20 +292,30 @@ export const Dashboard: React.FC = () => {
 
       {/* Charts */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <Card title="Hourly Traffic (Real Data)" subtitle="SMS sent, delivered, failed per hour">
-          <div className="min-h-[250px] h-[40vh] sm:h-72 lg:h-80"><ResponsiveContainer width="100%" height="100%"><AreaChart data={hourlyData}><CartesianGrid strokeDasharray="3 3" stroke="#E5E7EB"/><XAxis dataKey="hour" tick={{fontSize:10}}/><YAxis tick={{fontSize:10}}/><Tooltip formatter={(v: any) => [formatNumber(Number(v)), '']}/><Area type="monotone" dataKey="sent" stroke="#3B82F6" fill="#3B82F6" fillOpacity={0.2}/><Area type="monotone" dataKey="delivered" stroke="#10B981" fill="#10B981" fillOpacity={0.2}/></AreaChart></ResponsiveContainer></div>
+        <Card title="Hourly Traffic" subtitle="SMS sent, delivered and failed per hour — last 24h from this database">
+          <div className="min-h-[250px] h-[40vh] sm:h-72 lg:h-80">
+            {chartsLoading && hourlyData.length === 0
+              ? <div className="h-full flex items-center justify-center text-sm text-gray-400">Loading traffic…</div>
+              : <ResponsiveContainer width="100%" height="100%"><AreaChart data={hourlyData}><CartesianGrid strokeDasharray="3 3" stroke="#E5E7EB"/><XAxis dataKey="hour" tick={{fontSize:10}}/><YAxis tick={{fontSize:10}}/><Tooltip formatter={(v: any) => [formatNumber(Number(v)), '']}/><Area type="monotone" dataKey="sent" stroke="#3B82F6" fill="#3B82F6" fillOpacity={0.2}/><Area type="monotone" dataKey="delivered" stroke="#10B981" fill="#10B981" fillOpacity={0.2}/><Area type="monotone" dataKey="failed" stroke="#EF4444" fill="#EF4444" fillOpacity={0.2}/></AreaChart></ResponsiveContainer>}
+          </div>
+          {!chartsLoading && trafficTotal === 0 && <p className="text-xs text-gray-400 text-center mt-2">No SMS in the last 24 hours on this server</p>}
         </Card>
-        <Card title="Revenue, Cost & Profit (Last 14 Days)" subtitle="From real SMS transactions">
-          <div className="min-h-[250px] h-[40vh] sm:h-72 lg:h-80"><ResponsiveContainer width="100%" height="100%"><BarChart data={revenueData}><CartesianGrid strokeDasharray="3 3" stroke="#E5E7EB"/><XAxis dataKey="date" tick={{fontSize:10}}/><YAxis tick={{fontSize:10}}/><Tooltip formatter={(v: any) => [formatCurrency(Number(v)), '']}/><Bar dataKey="revenue" fill="#3B82F6" radius={[3,3,0,0]}/><Bar dataKey="cost" fill="#EF4444" radius={[3,3,0,0]}/><Bar dataKey="profit" fill="#10B981" radius={[3,3,0,0]}/></BarChart></ResponsiveContainer></div>
+        <Card title="Revenue, Cost & Profit (Last 14 Days)" subtitle="Billed SMS per day from this database">
+          <div className="min-h-[250px] h-[40vh] sm:h-72 lg:h-80">
+            {chartsLoading && revenueData.length === 0
+              ? <div className="h-full flex items-center justify-center text-sm text-gray-400">Loading revenue…</div>
+              : <ResponsiveContainer width="100%" height="100%"><BarChart data={revenueData}><CartesianGrid strokeDasharray="3 3" stroke="#E5E7EB"/><XAxis dataKey="label" tick={{fontSize:10}}/><YAxis tick={{fontSize:10}}/><Tooltip formatter={(v: any) => [formatCurrency(Number(v)), '']}/><Bar dataKey="revenue" fill="#3B82F6" radius={[3,3,0,0]}/><Bar dataKey="cost" fill="#EF4444" radius={[3,3,0,0]}/><Bar dataKey="profit" fill="#10B981" radius={[3,3,0,0]}/></BarChart></ResponsiveContainer>}
+          </div>
+          {!chartsLoading && revenueTotal === 0 && <p className="text-xs text-gray-400 text-center mt-2">No billed SMS in the last 14 days on this server</p>}
         </Card>
       </div>
 
       {/* Bottom Row */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <Card title="Top Destinations" subtitle="SMS volume by country" noPadding>
+        <Card title="Top Destinations" subtitle="SMS volume by country — all traffic in this database" noPadding>
           {topDestData.length > 0 ? (
             <div className="min-h-[200px] h-[35vh] sm:h-52 lg:h-64"><ResponsiveContainer width="100%" height="100%"><PieChart><Pie data={topDestData} cx="50%" cy="50%" innerRadius={45} outerRadius={65} paddingAngle={3} dataKey="value" label={({ name, percent }: any) => `${(name||'').slice(0,3)} ${percent}`}>{topDestData.map((_,i)=><Cell key={i} fill={COLORS[i%COLORS.length]}/>)}</Pie><Tooltip formatter={(v: any) => [formatNumber(Number(v)), '']}/></PieChart></ResponsiveContainer></div>
-          ) : <div className="p-8 text-center text-gray-400">No SMS data yet</div>}
+          ) : <div className="p-8 text-center text-gray-400">{chartsLoading ? 'Loading destinations…' : 'No SMS data yet'}</div>}
         </Card>
 
         <Card title="Recent SMS" subtitle="Latest from database" noPadding>
