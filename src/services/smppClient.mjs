@@ -32,6 +32,53 @@ const resolveInterfaceVersion = (raw) => {
   return 0x34;
 };
 
+// DLR keyword vocabulary — these are protocol field names / status words,
+// never message ids. Filtering them keeps the candidate list to real ids.
+const DLR_KEYWORDS = new Set([
+  'sub', 'dlvrd', 'submit', 'done', 'stat', 'err', 'text', 'id', 'msgid', 'message_id',
+  'receipt_id', 'transaction_id', 'date', 'dates', 'submit_date', 'done_date',
+  'delivrd', 'undeliv', 'expired', 'rejectd', 'accepted', 'unknown', 'enroute',
+  'deleted', 'skipped', 'delivered', 'success', 'failed', 'failure', 'message', 'delivery',
+]);
+
+// "submit date:2609132221" style stamps: YYMMDDhhmm. Not an id.
+const isDlrDateStamp = (s) => /^\d{10}$/.test(s)
+  && /^(2[0-9]|3[0-9])(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])([01][0-9]|2[0-3])[0-5][0-9]$/.test(s);
+
+/**
+ * Collect every plausible message-id form from an SMPP DLR receipt.
+ *
+ * Suppliers are inconsistent about the `id:` field: some echo the id we sent
+ * ("id:SMPP1789360442207"), others return their own SMSC id
+ * ("id:c3f0e-e-a5f8-a5f804f41"), and chain-forwarding gateways rewrite it.
+ * Instead of assuming one format, gather every token that could be an id and
+ * let SQL test them all against the known id columns at once.
+ *
+ * @returns {string[]} candidate ids, most reliable first
+ */
+export const collectDlrIds = (rawMessage, primaryId) => {
+  const raw = String(rawMessage == null ? '' : rawMessage);
+  const ids = new Set();
+  const add = (v) => {
+    const s = String(v == null ? '' : v).trim();
+    if (!s || s.length > 64) return;
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(s)) return;
+    if (DLR_KEYWORDS.has(s.toLowerCase())) return;
+    if (/^\d{1,3}$/.test(s)) return;          // sub:001 / dlvrd:000 / err:69 counters
+    if (/^\d{12}$/.test(s) || /^\d{14}$/.test(s) || isDlrDateStamp(s)) return;
+    ids.add(s);
+  };
+  add(primaryId);
+  // Explicit key:value pairs first — id:, message_id:, transaction_id:, ...
+  for (const m of raw.matchAll(/\b(?:id|msgid|message_id|receipt_id|transaction_id)\s*:\s*([^\s,;]+)/gi)) add(m[1]);
+  // Then every standalone token, in case the supplier invents a new format.
+  // The free-text `text:` payload is human prose and never carries an id, so
+  // it is dropped before tokenising to avoid extracting words as ids.
+  const body = raw.split(/\btext\s*:/i)[0];
+  for (const token of body.split(/\s+/)) add(token.replace(/^[A-Za-z_]+:/, ''));
+  return [...ids];
+};
+
 const getDataCoding = (message) => {
     if (!message) return 0;
     const GSM7 = new Set('@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞ\x1BÆæßÉ !"#¤%&\'()*+,-./0123456789:;<=>?¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà\f^{}\\[~]|€');
@@ -281,21 +328,44 @@ class SmppClient {
         console.log(`[SMPP-CLIENT] ${supplier.supplier_code}: DLR parsed — ${dlrMessageId} → stat=${finalDlr} err=${dlrError} delivered=${isDelivered}`);
 
         try {
-          // Update sms_outbox — use dlr_match_ids to match against ANY known ID.
-          // This array stores: our message_id, SMSC's connector_transaction_id,
-          // and any gateway-forwarded IDs (e.g. GWT...). A single query covers all.
+          // Match the receipt against EVERY known id form, in one statement.
+          // Suppliers quote different ids for the same message (our message_id,
+          // their SMSC id, or a rewritten forwarded id), and chain-forwarded
+          // gateways invent new ones — so test the whole candidate set against
+          // every id column instead of assuming one field. The quoted id is also
+          // merged into dlr_match_ids so later DLRs for this message hit the
+          // array predicate even if the supplier switches id type mid-flight.
+          const candidateIds = collectDlrIds(rawMessage, dlrMessageId);
           let outboxR = await this.pool.query(
             `UPDATE sms_outbox SET
                dlr_status = $1,
                dlr_received_at = NOW(),
                dlr_confirmed_at = NOW(),
                status = $2,
-               completed_at = NOW()
-             WHERE $3 = ANY(dlr_match_ids)
-             RETURNING id, message_id, client_id, client_code, supplier_id, destination, sender_id, source, queued_at,
+               completed_at = NOW(),
+               dlr_match_ids = (SELECT array_agg(DISTINCT x)
+                                  FROM unnest(COALESCE(dlr_match_ids, ARRAY[]::TEXT[]) || ARRAY[$4]::TEXT[]) AS t(x)
+                                 WHERE x IS NOT NULL AND x <> '')
+             WHERE id = (SELECT id FROM sms_outbox
+                          WHERE message_id = ANY($3::TEXT[])
+                             OR connector_transaction_id = ANY($3::TEXT[])
+                             OR dlr_match_ids && $3::TEXT[]
+                          ORDER BY (dlr_status IS NULL OR dlr_status IN ('PENDING', 'UNDELIV')) DESC NULLS LAST,
+                                   queued_at DESC NULLS LAST
+                          LIMIT 1)
+             RETURNING id, message_id, connector_transaction_id, dlr_match_ids,
+                       client_id, client_code, supplier_id, destination, sender_id, source, queued_at,
                        client_rate, supplier_rate, message_parts, billing_mode, supplier_billing_mode`,
-            [finalDlr, finalStatus, dlrMessageId]
+            [finalDlr, finalStatus, candidateIds, dlrMessageId]
           );
+
+          if (outboxR.rows.length > 0) {
+            const r = outboxR.rows[0];
+            const matchedBy = dlrMessageId === r.message_id ? 'our-in-id'
+              : (dlrMessageId === r.connector_transaction_id ? 'supplier-out-id'
+              : (Array.isArray(r.dlr_match_ids) && r.dlr_match_ids.includes(dlrMessageId) ? 'dlr_match_ids' : 'id-from-receipt'));
+            console.log(`[SMPP-CLIENT] ${supplier.supplier_code}: ✅ DLR id matched by ${matchedBy} — quoted="${dlrMessageId}" our_id=${r.message_id} supplier_id=${r.connector_transaction_id || '-'} (${candidateIds.length} id form(s) tested) → result=${finalDlr} err=${dlrError}`);
+          }
 
           // Fallback: chain-forwarded gateways assign NEW IDs not in dlr_match_ids.
           // Try extracting all IDs from the receipt text and match against dlr_match_ids.
@@ -441,7 +511,7 @@ class SmppClient {
               } catch (e) { /* non-critical */ }
             }
           } else {
-            console.warn(`[SMPP-CLIENT] ${supplier.supplier_code}: DLR id "${dlrMessageId}" not found in outbox (not in any dlr_match_ids)`);
+            console.warn(`[SMPP-CLIENT] ${supplier.supplier_code}: DLR id "${dlrMessageId}" did not match any outbox id (tested every id form against message_id, connector_transaction_id and dlr_match_ids)`);
           }
 
           console.log(`[SMPP-CLIENT] ${supplier.supplier_code}: DLR processed ✓ — ${dlrMessageId} → sms_outbox=${finalStatus}, sms_logs=${finalDlr}`);

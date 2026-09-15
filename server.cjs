@@ -10476,7 +10476,9 @@ app.post('/api/supplier/dlr', async (req, res) => {
             [finalDlr, finalStatus, String(message_id)]
         );
 
-        // Fallback: match by connector_transaction_id
+        // Fallback: match by any known id column — the SMSC's own id
+        // (connector_transaction_id) or our own message_id, since suppliers
+        // differ in which one they send back in the DLR.
         if (outboxR.rows.length === 0) {
             const fallbackR = await pool.query(
                 `UPDATE sms_outbox SET
@@ -10485,7 +10487,7 @@ app.post('/api/supplier/dlr', async (req, res) => {
                    dlr_confirmed_at = NOW(),
                    status = $2,
                    completed_at = NOW()
-                 WHERE connector_transaction_id = $3
+                 WHERE (connector_transaction_id = $3 OR message_id = $3)
                    AND status IN ('submitted', 'dead_letter')
                  RETURNING id, message_id, client_id, client_code, supplier_id, destination,
                            sender_id, source, queued_at,

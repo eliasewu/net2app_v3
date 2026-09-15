@@ -611,15 +611,19 @@ class SMSQueueManager {
 
     if (result && result.success) {
       // Save connector transaction_id for DLR polling (Voice OTP / HTTP connectors)
-      // Also append to dlr_match_ids so DLR matching can find it by any known ID
+      // and seed dlr_match_ids with BOTH ids: our message_id + the SMSC's own id.
+      // Suppliers are inconsistent about which one they quote in the DLR `id:`
+      // field, so both must be matchable from the very first lookup.
       if (result.transaction_id) {
         const txId = String(result.transaction_id);
         await this.pool.query(
           `UPDATE sms_outbox SET 
              connector_transaction_id = $1,
-             dlr_match_ids = array_append(COALESCE(dlr_match_ids, ARRAY[]::TEXT[]), $2)
+             dlr_match_ids = (SELECT array_agg(DISTINCT x)
+                                FROM unnest(COALESCE(dlr_match_ids, ARRAY[]::TEXT[]) || ARRAY[$1, $2]::TEXT[]) AS t(x)
+                               WHERE x IS NOT NULL AND x <> '')
            WHERE id = $3`,
-          [txId, txId, id]
+          [txId, String(message_id), id]
         ).catch(err => console.error(`[QueueManager] Failed to save tx_id for ${message_id}:`, err.message));
       }
       // Mark as submitted (not delivered — wait for real DLR)
