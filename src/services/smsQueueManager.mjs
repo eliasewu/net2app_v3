@@ -29,6 +29,12 @@ class SMSQueueManager {
   constructor(pool, options = {}) {
     this.pool = pool;
     this.connectionPoolMgr = options.connectionPoolMgr || null;
+    /**
+     * Force/Push DLR timeout resolver, injected by server.cjs so the push-DLR
+     * window has a single source of truth (fixed / random_0_5 / random_1_5 / ...).
+     * Signature: (mode, timeoutSeconds) => seconds
+     */
+    this.resolveForceDlrTimeout = options.resolveForceDlrTimeout || ((mode, t) => parseInt(t) || 0);
     this.workers = [];
     this.running = false;
 
@@ -39,6 +45,15 @@ class SMSQueueManager {
      *   sender_id, status, client_code, queued_at }
      */
     this.onDlr = null;
+
+    /**
+     * Billing callback: invoked on successful submit for parties whose
+     * billing_mode is 'submit' (On Submit = charge on send, whatever the
+     * delivery outcome). Wired to the unified applyBilling() in server.cjs so
+     * this module never touches balances directly.
+     * Signature: (params) => Promise where params match applyBilling() args.
+     */
+    this.onBilling = null;
 
     this.stats = {
       processed: 0,
@@ -640,11 +655,14 @@ class SMSQueueManager {
       // Determine source label for UI display
       const smsSource = job.source || 'smpp_client';
 
-      // is_client_billed / is_supplier_billed: set to true if submit-mode billing
-      // already deducted that party's balance. DLR-mode parties stay false.
-      const isClientBilled = (billing_mode || 'dlr') === 'submit';
-      const isSupplierBilled = (job.supplier_billing_mode || 'dlr') === 'submit';
-      const isBilled = isClientBilled && (isSupplierBilled || !supplier_id);
+      // Billing flags are NEVER guessed from the mode here: applyBilling() owns
+      // them via its atomic claim-first UPDATE, and it is the only code that
+      // also moves a balance. Writing true here without a deduction used to
+      // make submit-mode messages look billed while nothing was ever charged
+      // (and blocked the claim, so they could never be charged later either).
+      const isClientBilled = false;
+      const isSupplierBilled = false;
+      const isBilled = false;
       await this.pool.query(
         `INSERT INTO sms_logs (
           message_id, client_id, client_code, supplier_id, supplier_code,
@@ -679,8 +697,103 @@ class SMSQueueManager {
         // Don't throw — SMS was submitted successfully. sms_logs can be backfilled later.
       });
 
-      // DLR billing, webhook, and DLR push are deferred to real DLR confirmation
-      // (HTTP DLR poll in server.cjs or SMPP DLR handler in smppServer.mjs)
+      // On Submit billing: charge every party whose mode is 'submit' right here,
+      // for EVERY message handed to a supplier — delivered, undelivered or
+      // dead-lettered later. This is the only submit-billing site for messages
+      // ingested through the SMPP server (they never pass the API ingest path),
+      // and it is idempotent: applyBilling()'s claim finds the flags already set
+      // by an earlier submit-time charge and does nothing.
+      const submitModeClient = (billing_mode || 'dlr') === 'submit';
+      const submitModeSupplier = (job.supplier_billing_mode || 'dlr') === 'submit';
+      if (this.onBilling && (submitModeClient || submitModeSupplier)) {
+        try {
+          await this.onBilling({
+            messageId: message_id,
+            clientId: client_id || null,
+            supplierId: supplier_id || null,
+            clientCost: parseFloat(((client_rate || 0) * (job.message_parts || 1)).toFixed(6)),
+            supplierCost: parseFloat(((supplier_rate || 0) * (job.message_parts || 1)).toFixed(6)),
+            clientBillingMode: billing_mode || 'dlr',
+            supplierBillingMode: job.supplier_billing_mode || 'dlr',
+            isSubmit: true,
+            dlrStatus: null,
+          });
+        } catch (e) {
+          console.error(`[QueueManager] Submit billing failed for ${message_id}: ${e.message}`);
+        }
+      }
+
+      // Push DLR (force DLR): when the client or the supplier has it enabled and
+      // no real receipt arrives, generate the receipt inside the configured
+      // window (default random 0-5s), charge the client, keep the supplier payout
+      // isolated unless the supplier also forced, and push the DLR back to the
+      // origin. Applies to messages ingested over SMPP, which never pass the API
+      // ingest path where this was previously implemented only.
+      if (job.client_force_dlr === true || job.supplier_force_dlr === true) {
+        const clientSec = job.client_force_dlr === true
+          ? this.resolveForceDlrTimeout(job.client_force_dlr_timeout_mode, job.client_force_dlr_timeout)
+          : 0;
+        const supplierSec = job.supplier_force_dlr === true
+          ? this.resolveForceDlrTimeout(job.supplier_force_dlr_timeout_mode, job.supplier_force_dlr_timeout)
+          : 0;
+        const forceSec = Math.max(clientSec, supplierSec);
+        setTimeout(() => {
+          (async () => {
+            try {
+              // A real receipt must always win — only flip rows still awaiting one.
+              const upd = await this.pool.query(
+                `UPDATE sms_logs SET dlr_status = 'DELIVRD', status = 'delivered',
+                 delivery_time = NOW(), dlr_timestamp = NOW(),
+                 is_force_dlr = true, dlr_source = 'FORCE_TIMEOUT'
+                 WHERE message_id = $1 AND dlr_status = 'PENDING'`,
+                [message_id]
+              );
+              if (upd.rowCount === 0) return;
+              await this.pool.query(
+                `UPDATE sms_outbox SET dlr_status = 'DELIVRD', status = 'delivered',
+                 dlr_confirmed_at = NOW(), completed_at = NOW()
+                 WHERE message_id = $1 AND dlr_status = 'PENDING'`,
+                [message_id]
+              ).catch(() => {});
+              if (this.onBilling) {
+                await this.onBilling({
+                  messageId: message_id,
+                  clientId: client_id || null,
+                  supplierId: supplier_id || null,
+                  clientCost: parseFloat(((client_rate || 0) * (job.message_parts || 1)).toFixed(6)),
+                  supplierCost: parseFloat(((supplier_rate || 0) * (job.message_parts || 1)).toFixed(6)),
+                  clientBillingMode: billing_mode || 'dlr',
+                  supplierBillingMode: job.supplier_billing_mode || 'dlr',
+                  isSubmit: false,
+                  dlrStatus: 'DELIVRD',
+                  clientForceDlr: job.client_force_dlr === true,
+                  supplierForceDlr: job.supplier_force_dlr === true,
+                  isForceDlrBilling: true,
+                });
+              }
+              if (this.onDlr) {
+                await this.onDlr({
+                  client_id: client_id || null,
+                  message_id,
+                  destination,
+                  sender_id: sender_id || '',
+                  status: 'DELIVRD',
+                  client_code: job.client_code || '',
+                  queued_at: job.queued_at || new Date().toISOString(),
+                  submit_time: new Date().toISOString(),
+                  source: smsSource,
+                });
+              }
+              console.log(`[QueueManager] ⚡ Push DLR: ${message_id} forced DELIVRD after ${forceSec}s (client=${job.client_force_dlr === true}, supplier=${job.supplier_force_dlr === true})`);
+            } catch (e) {
+              console.error(`[QueueManager] Push DLR failed for ${message_id}: ${e.message}`);
+            }
+          })();
+        }, forceSec * 1000);
+      }
+
+      // DLR-mode billing, webhook and DLR push stay deferred to real DLR
+      // confirmation (HTTP DLR poll in server.cjs or SMPP DLR handler).
 
       this.stats.processed++;
       this._recordProcessed();

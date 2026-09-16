@@ -105,7 +105,7 @@ export const AddSupplier: React.FC = () => {
     api_method: (s?.api_method || 'POST') as 'GET' | 'POST',
     force_dlr: s?.force_dlr || false,
     force_dlr_timeout: (s as any)?.force_dlr_timeout || (s as any)?.dlr_timeout || 150,
-    force_dlr_timeout_mode: ((s as any)?.force_dlr_timeout_mode || 'fixed'),
+    force_dlr_timeout_mode: ((s as any)?.force_dlr_timeout_mode || 'random_0_5'),
     balance: s?.balance || 0,
     credit_limit: s?.credit_limit || 0,
     currency: (s?.currency || 'EUR') as Currency,
@@ -545,7 +545,7 @@ export const AddSupplier: React.FC = () => {
     </label>
   </div>
   {(formData as any).force_dlr && (<>
-    <Select label="Force DLR Timeout Mode" value={(formData as any).force_dlr_timeout_mode || 'fixed'} onChange={e => updateField('force_dlr_timeout_mode', e.target.value)} options={[{value:'fixed',label:'Fixed'},{value:'random_1_5',label:'Random 1-5s'},{value:'random_1_10',label:'Random 1-10s'}]} />
+    <Select label="Push DLR Timeout Mode" value={(formData as any).force_dlr_timeout_mode || 'random_0_5'} onChange={e => updateField('force_dlr_timeout_mode', e.target.value)} options={[{value:'random_0_5',label:'Random 0-5s (default)'},{value:'fixed',label:'Fixed'},{value:'random_1_5',label:'Random 1-5s'},{value:'random_1_10',label:'Random 1-10s'}]} />
     <Input label="Force DLR Timeout (sec)" type="number" value={(formData as any).force_dlr_timeout || 150} onChange={e => updateField('force_dlr_timeout', parseInt(e.target.value)||0)} hint="For fixed mode: exact seconds. Random modes use this as upper bound." min={0} />
   </>)}
         </div></Card>

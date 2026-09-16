@@ -412,6 +412,9 @@ export default class SmppServer {
             let routeData = { supplier_id: null, supplier_code: null, supplier_rate: 0,
               client_rate: 0, mcc: '', mnc: '', operator: '', country: '',
               route_name: 'SMPP', trunk_name: 'SMPP', billing_mode: 'dlr' };
+            // Kept outside the lookup block so the job can carry the client's
+            // Push DLR (force DLR) settings to the queue.
+            let clientRow = null;
 
             if (this.resolveRoute) {
               try {
@@ -420,6 +423,7 @@ export default class SmppServer {
                 );
                 if (clientLookup.rows.length) {
                   const cl = clientLookup.rows[0];
+                  clientRow = cl;
                   // Tenant expiry check — block if tenant licence expired
                   if (cl.tenant_id) {
                     const tR = await db.query('SELECT expiry_date, code FROM tenants WHERE id = $1 AND expiry_date IS NOT NULL AND expiry_date < NOW()', [cl.tenant_id]);
@@ -460,6 +464,14 @@ export default class SmppServer {
               billing_mode: routeData.billing_mode || 'dlr',
               webhook_url: '',
               source: 'smpp_client',
+              // Push DLR (force DLR) — the queue schedules the forced receipt and
+              // the forced charge for SMS ingested over SMPP too.
+              client_force_dlr: clientRow?.force_dlr === true || clientRow?.force_dlr === 'true',
+              client_force_dlr_timeout: clientRow?.force_dlr_timeout || 0,
+              client_force_dlr_timeout_mode: clientRow?.force_dlr_timeout_mode || 'random_0_5',
+              supplier_force_dlr: routeData.supplier_force_dlr === true || routeData.supplier_force_dlr === 'true',
+              supplier_force_dlr_timeout: routeData.supplier_force_dlr_timeout || 0,
+              supplier_force_dlr_timeout_mode: routeData.supplier_force_dlr_timeout_mode || 'random_0_5',
             };
 
             // If rate-limited, add delay to the job

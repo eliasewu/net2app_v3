@@ -255,9 +255,25 @@ let _wsBroadcast = null; // WebSocket broadcast function (set after server start
             bufferFlushMs: 30,           // Flush every 30ms max
             overloadThreshold: 20000,    // Alert when queue depth > 20k
             connectionPoolMgr,
+            resolveForceDlrTimeout,     // single source of truth for the push-DLR window
         });
 
         await queueManager.initialize();
+
+        // Wire On Submit billing into the queue. Messages that reach a supplier are
+        // charged on send for every party whose mode is 'submit' — including
+        // everything ingested over SMPP, which never passes the API ingest path and
+        // previously only got the billing FLAGS written (billed on paper, never
+        // deducted, and unclaimable afterwards). applyBilling()'s atomic claim keeps
+        // this idempotent with the ingest-time charge.
+        queueManager.onBilling = async (params) => {
+            try {
+                return await applyBilling(params);
+            } catch (e) {
+                console.error('[QueueManager-BILLING] applyBilling failed for ' + (params.messageId || '?') + ': ' + e.message);
+                return { clientBilled: false, supplierBilled: false };
+            }
+        };
 
         // Wire up inbound supplier delivery via Java SMPP gateway REST bridge.
         // When the queue manager tries to deliver to an inbound supplier (GSM gateway
@@ -1708,8 +1724,8 @@ let _wsBroadcast = null; // WebSocket broadcast function (set after server start
                         // Uses resolveForceDlrTimeout() for fixed/random modes per Excel matrix.
                         const hasForceDlr = (client.force_dlr || route.supplier_force_dlr);
                         if (hasForceDlr) {
-                            const clientTimeoutMode = (client.force_dlr_timeout_mode || 'fixed');
-                            const supplierTimeoutMode = (route.supplier_force_dlr_timeout_mode || 'fixed');
+                            const clientTimeoutMode = (client.force_dlr_timeout_mode || 'random_0_5');
+                            const supplierTimeoutMode = (route.supplier_force_dlr_timeout_mode || 'random_0_5');
                             const clientTimeoutSec = client.force_dlr
                                 ? resolveForceDlrTimeout(clientTimeoutMode, parseInt(client.force_dlr_timeout) || 0)
                                 : 0;
@@ -3063,7 +3079,7 @@ app.post('/api/clients', auth, async (req, res) => {
                 b.client_code, b.company_name, b.contact_person || '', b.email || '', b.phone || '', b.address || '', b.country || '',
                 b.smpp_username, b.smpp_password, b.smpp_ip || '0.0.0.0', b.smpp_port || 2775, b.system_type || 'SMPP', b.max_tps || 100,
                 b.billing_mode || 'dlr', b.currency || 'EUR', b.balance || 0, b.credit_limit || 0,
-                b.api_enabled || false, b.webhook_url || '', b.force_dlr !== undefined ? b.force_dlr : true, b.force_dlr_timeout || 0, b.force_dlr_timeout_mode || 'fixed', b.routing_plan_id || null, b.rate_plan_id || null, portalAccess, b.status || 'active',
+                b.api_enabled || false, b.webhook_url || '', forceDlrEnabled(b.force_dlr), b.force_dlr_timeout || 0, b.force_dlr_timeout_mode || 'random_0_5', b.routing_plan_id || null, b.rate_plan_id || null, portalAccess, b.status || 'active',
                 b.api_key || genClientApiKey(b.client_code)
             ]
         );
@@ -3180,7 +3196,7 @@ app.post('/api/clients/bulk', auth, async (req, res) => {
                         client_code, company_name, row.contact_person || '', row.email || '', row.phone || '', row.address || '', row.country || '',
                         row.smpp_username || client_code, row.smpp_password || '', row.smpp_ip || '0.0.0.0', parseInt(row.smpp_port) || 2775, row.system_type || 'SMPP', parseInt(row.max_tps) || 100,
                         row.billing_mode || 'dlr', row.currency || 'EUR', parseFloat(row.balance) || 0, parseFloat(row.credit_limit) || 0,
-                        row.api_enabled === 'true' || row.api_enabled === true, row.webhook_url || '', row.force_dlr !== 'false', row.force_dlr_timeout || 0, row.force_dlr_timeout_mode || 'fixed', row.routing_plan_id || null, row.rate_plan_id || null, row.status || 'active',
+                        row.api_enabled === 'true' || row.api_enabled === true, row.webhook_url || '', row.force_dlr === true || row.force_dlr === 'true', row.force_dlr_timeout || 0, row.force_dlr_timeout_mode || 'random_0_5', row.routing_plan_id || null, row.rate_plan_id || null, row.status || 'active',
                         row.api_key || genClientApiKey(client_code)
                     ]
                 );
@@ -3368,13 +3384,13 @@ app.post('/api/suppliers', auth, async (req, res) => {
                 b.billing_mode || 'dlr',
                 supplierBindValue(b.bind_status, b.connection_type, b.status),
                 b.consecutive_failures || 0,
-                b.force_dlr !== undefined ? b.force_dlr : false,
+                forceDlrEnabled(b.force_dlr),
                 b.status || 'active',
                 b.portal_access !== undefined ? b.portal_access : false,
                 b.dlr_timeout ?? 150,
                 b.max_queue_size ?? 1000,
                 b.force_dlr_timeout ?? 0,
-                b.force_dlr_timeout_mode || 'fixed',
+                b.force_dlr_timeout_mode || 'random_0_5',
                 b.max_failures !== undefined && b.max_failures !== null && b.max_failures !== '' ? parseInt(b.max_failures) || 20 : null
             ]
         );
@@ -3546,7 +3562,7 @@ app.post('/api/suppliers/bulk', auth, async (req, res) => {
                         row.api_connector_id || null, row.voice_otp_config_id || null,
                         row.whatsapp_device_ids || null, row.telegram_device_ids || null,
                         parseFloat(row.balance) || 0, parseFloat(row.credit_limit) || 0, row.currency || 'EUR', row.billing_mode || 'dlr',
-                        supplierBindValue(row.bind_status, row.connection_type, row.status), parseInt(row.consecutive_failures) || 0, row.force_dlr !== 'false',
+                        supplierBindValue(row.bind_status, row.connection_type, row.status), parseInt(row.consecutive_failures) || 0, row.force_dlr === true || row.force_dlr === 'true',
                         row.status || 'active'
                     ]
                 );
@@ -4501,8 +4517,31 @@ app.get('/api/rates/history', auth, async (req, res) => {
     await pool.query('ALTER TABLE sms_outbox ADD COLUMN IF NOT EXISTS supplier_billing_mode VARCHAR(20) DEFAULT \'dlr\'').catch(() => {});
     await pool.query('ALTER TABLE clients ADD COLUMN IF NOT EXISTS force_dlr_timeout INTEGER DEFAULT 0').catch(() => {});
     await pool.query('ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS force_dlr_timeout INTEGER DEFAULT 0').catch(() => {});
-    await pool.query('ALTER TABLE clients ADD COLUMN IF NOT EXISTS force_dlr_timeout_mode VARCHAR(20) DEFAULT \'fixed\'').catch(() => {});
-    await pool.query('ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS force_dlr_timeout_mode VARCHAR(20) DEFAULT \'fixed\'').catch(() => {});
+    await pool.query('ALTER TABLE clients ADD COLUMN IF NOT EXISTS force_dlr_timeout_mode VARCHAR(20) DEFAULT \'random_0_5\'').catch(() => {});
+    await pool.query('ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS force_dlr_timeout_mode VARCHAR(20) DEFAULT \'random_0_5\'').catch(() => {});
+    // Widen the allowed push-DLR windows to include the 0-5s default. The original
+    // CHECK only allowed fixed / 1-5s / 1-10s, so storing the new 'random_0_5' mode
+    // was rejected and client/supplier create+update failed. Idempotent: the
+    // constraint is only rewritten when it does not already allow the new value, so
+    // a normal boot never re-locks these tables.
+    for (const tbl of ['clients', 'suppliers']) {
+        await pool.query(`
+          DO $$
+          DECLARE def text;
+          BEGIN
+            SELECT pg_get_constraintdef(c.oid) INTO def
+              FROM pg_constraint c
+              JOIN pg_class t ON t.oid = c.conrelid
+             WHERE c.conname = '${tbl}_force_dlr_timeout_mode_check'
+               AND t.relname = '${tbl}';
+            IF def IS NULL OR def NOT LIKE '%random_0_5%' THEN
+              ALTER TABLE ${tbl} DROP CONSTRAINT IF EXISTS ${tbl}_force_dlr_timeout_mode_check;
+              ALTER TABLE ${tbl} ADD CONSTRAINT ${tbl}_force_dlr_timeout_mode_check
+                CHECK (force_dlr_timeout_mode IN ('random_0_5','fixed','random_1_5','random_1_10'));
+            END IF;
+          END $$;
+        `).catch((e) => console.error(`[MIGRATION] ${tbl} force_dlr_timeout_mode constraint: ${e.message}`));
+    }
     await pool.query('ALTER TABLE sms_logs ADD COLUMN IF NOT EXISTS dlr_source VARCHAR(20) DEFAULT \'REAL\'').catch(() => {});
     await pool.query('ALTER TABLE invoices ADD COLUMN IF NOT EXISTS force_dlr_charge DECIMAL(15,4) DEFAULT 0').catch(() => {});
     await pool.query('ALTER TABLE invoices ADD COLUMN IF NOT EXISTS net_profit DECIMAL(15,4) DEFAULT 0').catch(() => {});
@@ -4511,19 +4550,40 @@ app.get('/api/rates/history', auth, async (req, res) => {
 // ======== FORCE DLR TIMEOUT RESOLVER ========
 // Computes the actual timeout in seconds based on the timeout_mode setting.
 // Modes:
+//   'random_0_5'   → random between 0 and 5 seconds (push-DLR default)
 //   'fixed'        → use force_dlr_timeout value directly (seconds)
 //   'random_1_5'   → random between 1 and 5 seconds
 //   'random_1_10'  → random between 1 and 10 seconds
 function resolveForceDlrTimeout(mode, timeoutValue) {
     const t = parseInt(timeoutValue) || 0;
+    // Push/force DLR default: a receipt that lands somewhere in a 0-5s window,
+    // so the forced "send success + delivery success" looks like a supplier
+    // answer that arrived at a plausible moment instead of instantly.
+    if (mode === 'random_0_5' || mode === 'random_0_5s') {
+        return Math.floor(Math.random() * 6);
+    }
     if (mode === 'random_1_5') {
         return Math.floor(Math.random() * 5) + 1;
     }
     if (mode === 'random_1_10') {
         return Math.floor(Math.random() * 10) + 1;
     }
-    // 'fixed' or any other value → use the configured timeout directly
+    // 'fixed': honour the configured value. A configured 0 (or negative) is
+    // treated as "use the default window" instead of pinning the receipt to the
+    // same tick as the submit response — which is what it used to do.
+    if (t <= 0) {
+        return Math.floor(Math.random() * 6);
+    }
     return t;
+}
+
+// ======== FORCE / PUSH DLR FLAG NORMALIZER ========
+// Push DLR is strictly OPT-IN: only an explicit true/'true' enables it.
+// NULL, undefined, 0, 'false' and anything else all mean OFF — this is what
+// keeps an opted-out account from being force-reported as delivered (and
+// charged) just because the column is empty.
+function forceDlrEnabled(value) {
+    return value === true || value === 'true' || value === 1 || value === '1';
 }
 
 // ======== UNIVERSAL BILLING HELPER ========
@@ -4779,7 +4839,7 @@ async function resolveRoute(client, destination) {
     const debugId = `[ROUTE:${client.client_code || client.id}→${maskedDest}]`;
     const dbg = (...args) => { if (DEBUG_ROUTE) console.error(...args); };
     if (DEBUG_ROUTE) dbg(`${debugId} Starting route resolution (raw dest: ${destination})`);
-    let supplier_id = null, supplier_code = null, supplier_rate = null, supplier_billing_mode = 'dlr', supplier_force_dlr = false, supplier_force_dlr_timeout = 0, supplier_force_dlr_timeout_mode = 'fixed';
+    let supplier_id = null, supplier_code = null, supplier_rate = null, supplier_billing_mode = 'dlr', supplier_force_dlr = false, supplier_force_dlr_timeout = 0, supplier_force_dlr_timeout_mode = 'random_0_5';
     let route_name = null, trunk_name = null, trunk_type = null, mcc = '', mnc = '', operator = '', country = '';
     let voice_otp_config_id = null;  // resolved from route > trunk > supplier
 
@@ -4864,7 +4924,7 @@ async function resolveRoute(client, destination) {
                             supplier_billing_mode = supR.rows[0].billing_mode || 'dlr';
                             supplier_force_dlr = supR.rows[0].force_dlr || false;
                             supplier_force_dlr_timeout = parseInt(supR.rows[0].force_dlr_timeout) || 0;
-                            supplier_force_dlr_timeout_mode = supR.rows[0].force_dlr_timeout_mode || 'fixed';
+                            supplier_force_dlr_timeout_mode = supR.rows[0].force_dlr_timeout_mode || 'random_0_5';
                             dbg(`${debugId}     ✅ Supplier: ${supplier_code} (ID=${supplier_id})`);
                             // Voice OTP config priority: route > trunk > supplier
                             voice_otp_config_id = route.voice_otp_config_id
@@ -4919,7 +4979,7 @@ async function resolveRoute(client, destination) {
             supplier_billing_mode = fallbackR.rows[0].billing_mode || 'dlr';
             supplier_force_dlr = fallbackR.rows[0].force_dlr || false;
             supplier_force_dlr_timeout = parseInt(fallbackR.rows[0].force_dlr_timeout) || 0;
-            supplier_force_dlr_timeout_mode = fallbackR.rows[0].force_dlr_timeout_mode || 'fixed';
+            supplier_force_dlr_timeout_mode = fallbackR.rows[0].force_dlr_timeout_mode || 'random_0_5';
             route_name = 'fallback';
             trunk_name = 'fallback';
             trunk_type = null;
@@ -5266,8 +5326,8 @@ app.post('/api/sms/send', auth, async (req, res) => {
             supplierForceDlr: route.supplier_force_dlr || false,
             clientForceDlrTimeout: parseInt(c.force_dlr_timeout) || 0,
             supplierForceDlrTimeout: route.supplier_force_dlr_timeout || 0,
-            clientForceDlrTimeoutMode: c.force_dlr_timeout_mode || 'fixed',
-            supplierForceDlrTimeoutMode: route.supplier_force_dlr_timeout_mode || 'fixed'
+            clientForceDlrTimeoutMode: c.force_dlr_timeout_mode || 'random_0_5',
+            supplierForceDlrTimeoutMode: route.supplier_force_dlr_timeout_mode || 'random_0_5'
         };
 
         // 6. Generate message_id and enqueue for async processing
@@ -5463,6 +5523,23 @@ app.post('/api/sms/send', auth, async (req, res) => {
                             supplierForceDlr: billingContext.supplierForceDlr,
                             isForceDlrBilling: true
                         });
+                        // Push the forced receipt back to the origin / external client over the
+                        // same path a real DLR takes (webhook + SMPP outbox + WS broadcast), so
+                        // the forced "send success + delivery success" is delivered now instead of
+                        // waiting for the next RETRO-DLR scan to notice it.
+                        if (queueManager && queueManager.onDlr) {
+                            queueManager.onDlr({
+                                client_id: billingContext.client_id,
+                                message_id: msgId,
+                                destination,
+                                sender_id: sender_id || '',
+                                status: 'DELIVRD',
+                                client_code: c.client_code || '',
+                                queued_at: new Date().toISOString(),
+                                submit_time: new Date().toISOString(),
+                                source: customSource || 'external_api'
+                            }).catch(() => {});
+                        }
                         console.error(`[FORCE-DLR] ⚡ ${msgId}: Auto-DLR set to DELIVRD after ${timeoutSec}s (force_dlr override, client=${billingContext.clientForceDlr}, supplier=${billingContext.supplierForceDlr}, modes=${billingContext.clientForceDlrTimeoutMode}/${billingContext.supplierForceDlrTimeoutMode})`);
                     } else {
                         console.error(`[FORCE-DLR] ⏭ ${msgId}: Force DLR skipped — real DLR already arrived (not PENDING)`);
@@ -6079,7 +6156,7 @@ app.post('/api/dlr-queue', auth, async (req, res) => {
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),$9) RETURNING *`,
             [b.message_id, b.smpp_message_id || null, b.destination, b.status || 'pending',
              b.retry_count || 0, b.max_retries || 3,
-             b.force_dlr !== false, b.dlr_timeout || 300, b.channel || 'sms']
+             forceDlrEnabled(b.force_dlr), b.dlr_timeout || 300, b.channel || 'sms']
         );
         res.json({ success: true, data: result.rows[0] });
     } catch (error) {

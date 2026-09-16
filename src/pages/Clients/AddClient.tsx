@@ -18,7 +18,7 @@ export const AddClient: React.FC = () => {
     client_code: '', company_name: '', contact_person: '', email: '', phone: '', address: '', country: '',
     smpp_username: '', smpp_password: '', smpp_ip: '', smpp_port: 2775, system_type: 'SMPP', max_tps: 100,
     billing_mode: 'dlr' as BillingMode, currency: 'EUR' as Currency, balance: 0, credit_limit: 0,
-    api_enabled: false, webhook_url: '', force_dlr: true, force_dlr_timeout: 150, force_dlr_timeout_mode: 'fixed',
+    api_enabled: false, webhook_url: '', force_dlr: false, force_dlr_timeout: 150, force_dlr_timeout_mode: 'random_0_5',
     routing_plan_id: '', rate_plan_id: '',
     portal_access: false,
     api_key: '',
@@ -35,8 +35,8 @@ export const AddClient: React.FC = () => {
     billing_mode: existingClient.billing_mode, currency: existingClient.currency,
     balance: existingClient.balance, credit_limit: existingClient.credit_limit,
     api_enabled: existingClient.api_enabled, webhook_url: existingClient.webhook_url,
-    force_dlr: existingClient.force_dlr, force_dlr_timeout: (existingClient as any).force_dlr_timeout || (existingClient as any).dlr_timeout || 150,
-    force_dlr_timeout_mode: (existingClient as any).force_dlr_timeout_mode || 'fixed',
+    force_dlr: existingClient.force_dlr || false, force_dlr_timeout: (existingClient as any).force_dlr_timeout || (existingClient as any).dlr_timeout || 150,
+    force_dlr_timeout_mode: (existingClient as any).force_dlr_timeout_mode || 'random_0_5',
     routing_plan_id: existingClient.routing_plan_id || '',
     rate_plan_id: existingClient.rate_plan_id || '', portal_access: (existingClient as any).portal_access || false,
     api_key: (existingClient as any).api_key || '',
@@ -413,13 +413,14 @@ export const AddClient: React.FC = () => {
 
         {/* Force DLR Settings */}
         {formData.force_dlr && (
-          <Card title="⚡ Force DLR Timeout Settings" subtitle="Configures when a fake DELIVRD is generated if no real DLR arrives. Client is charged on timeout but supplier is NOT (100% margin protection).">
+          <Card title="⚡ Push DLR (Force DLR) Settings" subtitle="When no real DLR arrives, a DELIVRD is generated automatically at a random moment inside the configured window (default 0-5s) and pushed back to the client. Client is charged on timeout but supplier is NOT (100% margin protection).">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               <Select
                 label="Timeout Mode"
-                value={(formData as any).force_dlr_timeout_mode || 'fixed'}
+                value={(formData as any).force_dlr_timeout_mode || 'random_0_5'}
                 onChange={(e) => updateField('force_dlr_timeout_mode', e.target.value)}
                 options={[
+                  { value: 'random_0_5', label: 'Random 0-5 seconds (default)' },
                   { value: 'fixed', label: 'Fixed (use value below)' },
                   { value: 'random_1_5', label: 'Random 1-5 seconds' },
                   { value: 'random_1_10', label: 'Random 1-10 seconds' },

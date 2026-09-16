@@ -675,7 +675,7 @@ SELECT key, value FROM (VALUES
     ('invoice_prefix', 'INV-2024-'),
     ('payment_prefix', 'PAY-2024-'),
     ('default_tax_rate', '19.00'),
-    ('force_dlr_default', 'true'),
+    ('force_dlr_default', 'false'),
     ('dlr_timeout_default', '150'),
     ('auto_block_failures', '20'),
     ('max_retry_attempts', '4'),

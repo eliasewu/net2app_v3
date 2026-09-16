@@ -299,7 +299,7 @@ export const ClientDetail: React.FC = () => {
                 <p className="text-[10px] text-gray-400 mt-1">Used as <code className="font-mono">x-api-key</code> in the HTTP API and by client Test SMS / Reporting / portal settings.</p>
               </div>
               <div><p className="text-gray-500">Force DLR</p><Badge variant={client.force_dlr ? 'success' : 'default'}>{client.force_dlr ? 'Yes' : 'No'}</Badge></div>
-              {client.force_dlr && <div><p className="text-gray-500">Force DLR Timeout</p><p className="font-mono text-xs">{(client as any).force_dlr_timeout_mode || 'fixed'} / {(client as any).force_dlr_timeout || 150}s</p></div>}
+              {client.force_dlr && <div><p className="text-gray-500">Force DLR Timeout</p><p className="font-mono text-xs">{(client as any).force_dlr_timeout_mode || 'random_0_5'} / {(client as any).force_dlr_timeout || 150}s</p></div>}
               {client.webhook_url && <div className="col-span-2"><p className="text-gray-500">Webhook</p><p className="text-xs font-mono">{client.webhook_url}</p></div>}
             </div>
           </Card>
